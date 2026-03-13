@@ -58,8 +58,9 @@ class _TickListener(SubscriptionListener):
                 if event:
                     self._loop.call_soon_threadsafe(event.set)
                 # Fire tick callbacks (for real-time entry triggers)
+                # Pass bid, offer, mid so triggers can use the correct side
                 for cb in self._tick_callbacks.get(self._epic, []):
-                    self._loop.call_soon_threadsafe(cb, mid)
+                    self._loop.call_soon_threadsafe(cb, mid, float(bid), float(ofr))
         except Exception as e:
             logger.debug(f"Tick update error ({self._epic}): {e}")
 

@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
+from dax_bot import config
 from shared.ig_session import IGSharedSession
 from shared.ig_stream import IGStreamManager
 
@@ -199,22 +200,35 @@ class IGBroker:
         """Register async callback for tick-triggered fills."""
         self._on_trigger_callbacks.append(callback)
 
-    def _on_tick(self, price: float):
+    def _on_tick(self, mid: float, bid: float = 0.0, ofr: float = 0.0):
         """Called on every tick from Lightstreamer (runs on event loop thread).
-        Checks bracket levels instantly instead of 5s polling.
+        Checks bracket levels using bid/offer (not mid) for accurate triggering.
+        BUY triggers on offer (what you pay), SELL triggers on bid (what you get).
         """
         if not self._pending_bracket or not self._pending_bracket.get("active"):
             return
         if self._tick_trigger_active:
             return  # Already processing a trigger
 
+        # Max spread check — skip if spread is too wide (> 3pts)
+        spread = ofr - bid if (bid > 0 and ofr > 0) else 0
+        if spread > config.MAX_SPREAD_PTS:
+            return
+
         bracket = self._pending_bracket
         triggered_dir = None
 
-        if price >= bracket["buy_price"]:
+        # Use offer for BUY (price you pay), bid for SELL (price you receive)
+        if ofr > 0 and ofr >= bracket["buy_price"]:
             triggered_dir = "BUY"
-        elif price <= bracket["sell_price"]:
+        elif bid > 0 and bid <= bracket["sell_price"]:
             triggered_dir = "SELL"
+        # Fallback to mid if bid/offer not available
+        elif bid == 0 or ofr == 0:
+            if mid >= bracket["buy_price"]:
+                triggered_dir = "BUY"
+            elif mid <= bracket["sell_price"]:
+                triggered_dir = "SELL"
 
         if not triggered_dir:
             return
@@ -223,7 +237,8 @@ class IGBroker:
         # with check_trigger_levels() polling in monitor_cycle
         self._tick_trigger_active = True
         bracket["active"] = False
-        logger.info(f"Tick trigger: {triggered_dir} @ {price}")
+        trigger_price = ofr if triggered_dir == "BUY" else bid
+        logger.info(f"Tick trigger: {triggered_dir} @ {trigger_price:.1f} (bid={bid:.1f} ofr={ofr:.1f} spread={spread:.1f})")
 
         # Schedule async order placement on event loop
         loop = asyncio.get_event_loop()
@@ -304,16 +319,28 @@ class IGBroker:
         if self._tick_trigger_active:
             return None  # Tick callback already handling this
 
-        price = await self.get_current_price()
-        if price is None:
+        # Use bid/offer for accurate trigger detection
+        bid = self._stream._prices.get(f"{self.epic}_bid")
+        ofr = self._stream._prices.get(f"{self.epic}_ofr")
+
+        if bid is None or ofr is None:
+            price = await self.get_current_price()
+            if price is None:
+                return None
+            bid = ofr = price  # Fallback to mid
+
+        # Spread check
+        spread = ofr - bid
+        if spread > config.MAX_SPREAD_PTS:
+            logger.warning(f"Spread too wide ({spread:.1f}pts) — skipping trigger check")
             return None
 
         bracket = self._pending_bracket
         triggered_dir = None
 
-        if price >= bracket["buy_price"]:
+        if ofr >= bracket["buy_price"]:
             triggered_dir = "BUY"
-        elif price <= bracket["sell_price"]:
+        elif bid <= bracket["sell_price"]:
             triggered_dir = "SELL"
 
         if not triggered_dir:
@@ -329,7 +356,8 @@ class IGBroker:
         except Exception as e:
             logger.warning("Pre-entry position check failed: %s — proceeding", e)
 
-        logger.info(f"Bracket triggered: {triggered_dir} @ {price}")
+        trigger_price = ofr if triggered_dir == "BUY" else bid
+        logger.info(f"Bracket triggered: {triggered_dir} @ {trigger_price:.1f} (bid={bid:.1f} ofr={ofr:.1f} spread={spread:.1f})")
         result = await self.place_market_order(action=triggered_dir, qty=bracket["qty"])
 
         if "error" in result:
