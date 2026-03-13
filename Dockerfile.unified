@@ -1,0 +1,24 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Install dependencies (superset of both bots)
+COPY requirements.txt .
+COPY requirements.ftse.txt requirements.ftse.txt
+RUN pip install --no-cache-dir -r requirements.txt -r requirements.ftse.txt
+
+# Copy all bot code
+COPY shared/ shared/
+COPY dax_bot/ dax_bot/
+COPY ftse_bot/ ftse_bot/
+COPY gold_bot/ gold_bot/
+COPY telegram_cmd.py .
+COPY run_all.py .
+
+# Create data directory
+RUN mkdir -p data
+
+HEALTHCHECK --interval=60s --timeout=10s --retries=3 \
+    CMD python -c "import os, signal; pid=int(open('/tmp/asrs.pid').read()); os.kill(pid, 0)" || exit 1
+
+CMD ["python", "run_all.py"]

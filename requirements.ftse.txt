@@ -1,0 +1,8 @@
+pandas>=2.2
+numpy>=1.24
+httpx>=0.27
+python-dotenv>=1.0
+apscheduler>=3.10
+holidays>=0.40
+trading-ig>=0.0.22
+munch>=4.0
