@@ -47,6 +47,7 @@ class SessionState:
     stake: float = 0.0
     initial_risk: float = 0.0
     entry_time: Optional[datetime] = None
+    breakeven_moved: bool = False
 
 
 @dataclass
@@ -64,6 +65,7 @@ class WeeklyState:
     target_level: float = 0.0
     stake: float = 0.0
     initial_risk: float = 0.0
+    breakeven_moved: bool = False
 
     def save(self):
         """Persist to JSON so weekly range survives bot restarts."""
@@ -406,6 +408,65 @@ class ORBStrategy:
     def _manage_position(self, bar, state, ts, sess_end_mins):
         t_mins = ts.hour * 60 + ts.minute
 
+        # Breakeven: move stop to entry once profit >= BREAKEVEN_R * initial_risk
+        if not state.breakeven_moved and state.entry_price > 0 and state.initial_risk > 0:
+            if state.direction == "BUY":
+                current_profit = bar["High"] - state.entry_price
+            else:
+                current_profit = state.entry_price - bar["Low"]
+
+            be_threshold = config.BREAKEVEN_R * state.initial_risk
+            if current_profit >= be_threshold:
+                state.breakeven_moved = True
+                state.stop_level = state.entry_price
+                logger.info("[%s/%s] BREAKEVEN: profit=%.2f >= %.2fR, stop moved to entry %.2f",
+                            self.name, state.session_name, current_profit,
+                            config.BREAKEVEN_R, state.entry_price)
+                if state.deal_id:
+                    return {
+                        "action": "AMEND_STOP",
+                        "instrument": self.name,
+                        "deal_id": state.deal_id,
+                        "new_stop": state.entry_price,
+                        "sess_key": ts.strftime("%Y-%m-%d") + "_" + state.session_name,
+                    }
+
+        # Candle trail: after breakeven, trail stop to prior bar's low/high
+        if state.breakeven_moved and len(self._bars) >= 2:
+            prev = self._bars[-2]
+            if state.direction == "BUY":
+                new_stop = prev["Low"]
+            else:
+                new_stop = prev["High"]
+
+            # Only move stop if it ratchets tighter (never widen)
+            if state.direction == "BUY" and new_stop > state.stop_level:
+                old_stop = state.stop_level
+                state.stop_level = new_stop
+                logger.info("[%s/%s] TRAIL: stop %.2f -> %.2f (prev bar low)",
+                            self.name, state.session_name, old_stop, new_stop)
+                if state.deal_id:
+                    return {
+                        "action": "AMEND_STOP",
+                        "instrument": self.name,
+                        "deal_id": state.deal_id,
+                        "new_stop": new_stop,
+                        "sess_key": ts.strftime("%Y-%m-%d") + "_" + state.session_name,
+                    }
+            elif state.direction == "SELL" and new_stop < state.stop_level:
+                old_stop = state.stop_level
+                state.stop_level = new_stop
+                logger.info("[%s/%s] TRAIL: stop %.2f -> %.2f (prev bar high)",
+                            self.name, state.session_name, old_stop, new_stop)
+                if state.deal_id:
+                    return {
+                        "action": "AMEND_STOP",
+                        "instrument": self.name,
+                        "deal_id": state.deal_id,
+                        "new_stop": new_stop,
+                        "sess_key": ts.strftime("%Y-%m-%d") + "_" + state.session_name,
+                    }
+
         # Close 15 mins before session end
         if t_mins >= sess_end_mins - 15:
             logger.info("[%s/%s] Session ending -- closing",
@@ -462,6 +523,63 @@ class ORBStrategy:
 
         # Manage existing weekly position
         if self.weekly.deal_id:
+            # Breakeven for weekly
+            if not self.weekly.breakeven_moved and self.weekly.entry_price > 0 and self.weekly.initial_risk > 0:
+                if self.weekly.direction == "BUY":
+                    current_profit = bar["High"] - self.weekly.entry_price
+                else:
+                    current_profit = self.weekly.entry_price - bar["Low"]
+
+                be_threshold = config.BREAKEVEN_R * self.weekly.initial_risk
+                if current_profit >= be_threshold:
+                    self.weekly.breakeven_moved = True
+                    self.weekly.stop_level = self.weekly.entry_price
+                    self.weekly.save()
+                    logger.info("[%s/WEEKLY] BREAKEVEN: profit=%.2f >= %.2fR, stop moved to entry %.2f",
+                                self.name, current_profit, config.BREAKEVEN_R, self.weekly.entry_price)
+                    return {
+                        "action": "AMEND_STOP",
+                        "instrument": self.name,
+                        "deal_id": self.weekly.deal_id,
+                        "new_stop": self.weekly.entry_price,
+                        "sess_key": "WEEKLY_" + self.weekly.week_key,
+                    }
+
+            # Candle trail for weekly (after breakeven)
+            if self.weekly.breakeven_moved and len(self._bars) >= 2:
+                prev = self._bars[-2]
+                if self.weekly.direction == "BUY":
+                    new_stop = prev["Low"]
+                else:
+                    new_stop = prev["High"]
+
+                if self.weekly.direction == "BUY" and new_stop > self.weekly.stop_level:
+                    old_stop = self.weekly.stop_level
+                    self.weekly.stop_level = new_stop
+                    self.weekly.save()
+                    logger.info("[%s/WEEKLY] TRAIL: stop %.2f -> %.2f",
+                                self.name, old_stop, new_stop)
+                    return {
+                        "action": "AMEND_STOP",
+                        "instrument": self.name,
+                        "deal_id": self.weekly.deal_id,
+                        "new_stop": new_stop,
+                        "sess_key": "WEEKLY_" + self.weekly.week_key,
+                    }
+                elif self.weekly.direction == "SELL" and new_stop < self.weekly.stop_level:
+                    old_stop = self.weekly.stop_level
+                    self.weekly.stop_level = new_stop
+                    self.weekly.save()
+                    logger.info("[%s/WEEKLY] TRAIL: stop %.2f -> %.2f",
+                                self.name, old_stop, new_stop)
+                    return {
+                        "action": "AMEND_STOP",
+                        "instrument": self.name,
+                        "deal_id": self.weekly.deal_id,
+                        "new_stop": new_stop,
+                        "sess_key": "WEEKLY_" + self.weekly.week_key,
+                    }
+
             # Close on Friday after 17:00 UTC
             if ts.weekday() == 4 and ts.hour >= 17:
                 logger.info("[%s/WEEKLY] Friday close", self.name)

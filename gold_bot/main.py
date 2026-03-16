@@ -355,6 +355,29 @@ async def _execute_action(instrument: str, strategy: ORBStrategy, action: dict):
                     f"Error: {e}"
                 )
 
+    elif action["action"] == "AMEND_STOP":
+        try:
+            result = await broker_shared.rest_call(
+                broker_shared.ig.update_open_position,
+                limit_level=None,
+                stop_level=action["new_stop"],
+                deal_id=action["deal_id"],
+            )
+            logger.info("[%s] Breakeven stop amended: deal=%s stop=%.2f",
+                        name, action["deal_id"], action["new_stop"])
+            await _tg_send(
+                f"[S2] BREAKEVEN GOLD\n"
+                f"Deal: {action['deal_id']}\n"
+                f"Stop moved to entry: {action['new_stop']:.2f}"
+            )
+        except Exception as e:
+            logger.error("[%s] Amend stop failed: %s", name, e)
+            await _tg_send(
+                f"[S2] ❌ BREAKEVEN FAILED GOLD\n"
+                f"Deal: {action['deal_id']}\n"
+                f"Error: {e}"
+            )
+
     elif action["action"] == "CLOSE":
         try:
             result = await broker_shared.rest_call(

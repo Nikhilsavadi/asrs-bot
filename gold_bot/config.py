@@ -34,6 +34,7 @@ CONFIRMS_REQUIRED       = 2
 CONFIRM_BODY_RATIO      = 0.6
 CONFIRM_RANGE_MULT      = 1.5
 TARGET_R                = 2.0
+BREAKEVEN_R             = 0.5       # Move stop to entry after 0.5R profit
 MAX_TRADES_PER_SESSION  = 2
 EXCLUSION_BARS          = 1         # Skip first bar after range (15 mins)
 MAX_DAILY_LOSS_R        = 6.0
