@@ -361,8 +361,9 @@ async def _execute_action(instrument: str, strategy: ORBStrategy, action: dict):
                 broker_shared.ig.close_open_position,
                 deal_id=action["deal_id"],
                 direction=action["direction"],
+                epic=None, expiry="DFB", level=None,
+                order_type="MARKET", quote_id=None,
                 size=action["stake"],
-                order_type="MARKET",
             )
             deal_ref = result.get("dealReference")
             if deal_ref:
@@ -431,8 +432,9 @@ async def graceful_shutdown():
                         broker_shared.ig.close_open_position,
                         deal_id=state.deal_id,
                         direction=close_dir,
+                        epic=None, expiry="DFB", level=None,
+                        order_type="MARKET", quote_id=None,
                         size=state.stake,
-                        order_type="MARKET",
                     )
                     logger.info("[%s] Shutdown: closed session %s", name, state.deal_id)
                 except Exception as e:
@@ -446,8 +448,9 @@ async def graceful_shutdown():
                     broker_shared.ig.close_open_position,
                     deal_id=strategy.weekly.deal_id,
                     direction=close_dir,
+                    epic=None, expiry="DFB", level=None,
+                    order_type="MARKET", quote_id=None,
                     size=strategy.weekly.stake,
-                    order_type="MARKET",
                 )
                 logger.info("[%s] Shutdown: closed weekly %s",
                             name, strategy.weekly.deal_id)

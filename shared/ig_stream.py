@@ -83,6 +83,7 @@ class _CandleListener(SubscriptionListener):
         self._bars = bars
         self._callbacks = callbacks
         self._loop = loop
+        self._last_bar_time = None  # Deduplicate CONS_END=1 bursts
 
     def onItemUpdate(self, update):
         try:
@@ -117,6 +118,11 @@ class _CandleListener(SubscriptionListener):
             end_time = now_cet.replace(hour=snap_hour, minute=snap_min_mod,
                                        second=0, microsecond=0)
             start_time = end_time - timedelta(minutes=5)
+
+            # Deduplicate: Lightstreamer sends CONS_END=1 on every tick after bar closes
+            if self._last_bar_time == start_time:
+                return
+            self._last_bar_time = start_time
 
             bar = {
                 "time": start_time,
