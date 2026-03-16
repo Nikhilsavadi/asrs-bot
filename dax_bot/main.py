@@ -151,7 +151,14 @@ async def collect_overnight_bars():
         _overnight_bars_cache["date"] = today_str
         _overnight_bars_cache["bars"] = []
 
-    price = await broker.get_current_price() if broker else None
+    # Try streaming price first (more reliable overnight), REST fallback
+    price = None
+    from shared.ig_session import shared_session
+    if shared_session and shared_session.stream:
+        price = shared_session.stream.get_price_sync(config.IG_EPIC)
+    if not price or price <= 0:
+        price = await broker.get_current_price() if broker else None
+
     if price and price > 0:
         _overnight_bars_cache["bars"].append({
             "time": now_cet,
@@ -385,6 +392,20 @@ async def health_check():
     price_str = f"{price}" if price else "N/A"
     stream_bars = broker.get_streaming_bar_count() if broker else 0
 
+    # Overnight range from cached samples
+    on_samples = len(_overnight_bars_cache.get("bars", []))
+    on_str = "NO DATA"
+    if on_samples > 0:
+        bars = _overnight_bars_cache["bars"]
+        on_high = max(b["High"] for b in bars)
+        on_low = min(b["Low"] for b in bars)
+        on_range = on_high - on_low
+        on_mid = (on_high + on_low) / 2
+        bias_str = ""
+        if price and price > 0:
+            bias_str = "LONG bias" if price > on_mid else "SHORT bias"
+        on_str = f"H: {on_high:.1f} | L: {on_low:.1f} | Size: {on_range:.1f}\n   {bias_str}"
+
     msg = (
         f"🩺 <b>ASRS Health Check</b> [{mode}]\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -394,6 +415,9 @@ async def health_check():
         f"💹 DAX: {price_str}\n"
         f"📡 Streaming bars today: {stream_bars}\n"
         f"📦 {config.INSTRUMENT} x{config.NUM_CONTRACTS}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌙 Overnight ({on_samples} samples):\n"
+        f"   {on_str}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"⏰ Morning routine at {config.MORNING_HOUR:02d}:{config.MORNING_MINUTE:02d}\n"
         f"<i>Session kept alive for morning routine</i>"
