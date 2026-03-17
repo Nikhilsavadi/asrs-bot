@@ -242,7 +242,7 @@ class IGBroker:
 
         # Schedule async order placement on event loop
         loop = asyncio.get_event_loop()
-        loop.create_task(self._execute_tick_trigger(triggered_dir, price, bracket))
+        loop.create_task(self._execute_tick_trigger(triggered_dir, trigger_price, bracket))
 
     async def _execute_tick_trigger(self, direction: str, price: float, bracket: dict):
         """Execute the market order triggered by a tick."""
