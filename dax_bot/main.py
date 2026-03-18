@@ -151,14 +151,8 @@ async def collect_overnight_bars():
         _overnight_bars_cache["date"] = today_str
         _overnight_bars_cache["bars"] = []
 
-    # Try streaming price first (more reliable overnight), REST fallback
-    price = None
-    from shared.ig_session import IGSharedSession
-    session = IGSharedSession.get_instance()
-    if session and session.stream:
-        price = session.stream.get_price_sync(config.IG_EPIC)
-    if not price or price <= 0:
-        price = await broker.get_current_price() if broker else None
+    # Streaming price first (via broker which checks stream then REST)
+    price = await broker.get_current_price() if broker else None
 
     if price and price > 0:
         _overnight_bars_cache["bars"].append({
