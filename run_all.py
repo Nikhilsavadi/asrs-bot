@@ -232,6 +232,21 @@ async def main():
         from zoneinfo import ZoneInfo
         tz_et = ZoneInfo("America/New_York")
 
+        dax_scheduler.add_job(spx_main.health_check, "cron",
+            day_of_week="mon-fri", hour=9, minute=0,
+            id="spx_health", misfire_grace_time=120,
+            timezone=tz_et)
+
+        dax_scheduler.add_job(spx_main.pre_trade_warmup, "cron",
+            day_of_week="mon-fri", hour=9, minute=20,
+            id="spx_prewarm", misfire_grace_time=120,
+            timezone=tz_et)
+
+        dax_scheduler.add_job(spx_main.stream_alive_check, "cron",
+            day_of_week="mon-fri", hour=9, minute=40,
+            id="spx_stream_check", misfire_grace_time=120,
+            timezone=tz_et)
+
         dax_scheduler.add_job(spx_main.morning_routine, "cron",
             day_of_week="mon-fri", hour=9, minute=51,
             id="spx_morning", misfire_grace_time=120,

@@ -72,11 +72,115 @@ class SPXDailyState(DailyState):
 
 async def init(shared_session, stream_manager, tg_send=None):
     """Initialize SPX broker. Called by run_all.py."""
-    global broker, _tg_send
+    global broker, _tg_send, _shared_session
 
     broker = IGBroker(shared_session, stream_manager, config.IG_EPIC, "GBP")
     _tg_send = tg_send
+    _shared_session = shared_session
     logger.info(f"SPX bot initialized: {config.IG_EPIC}")
+
+
+_shared_session = None
+
+
+async def health_check():
+    """14:00 UK — SPX health check before US open."""
+    now = datetime.now(config.TZ_ET)
+    if now.weekday() >= 5:
+        return
+
+    logger.info("═══ SPX HEALTH CHECK ═══")
+    mode = "DEMO" if config.IG_DEMO else "LIVE"
+
+    price = None
+    status = "Unknown"
+    if broker:
+        try:
+            price = await broker.get_current_price()
+            status = "Connected" if price else "No price"
+        except Exception:
+            status = "Unreachable"
+
+    price_str = f"{price:.1f}" if price else "N/A"
+    stream_bars = broker.get_streaming_bar_count() if broker else 0
+
+    msg = (
+        f"<b>SPX Health Check</b> [{mode}]\n"
+        f"{now.strftime('%Y-%m-%d %H:%M')} ET\n"
+        f"IG: {status}\n"
+        f"Epic: {config.IG_EPIC}\n"
+        f"SPX: {price_str}\n"
+        f"Streaming bars: {stream_bars}\n"
+        f"Morning routine at {config.MORNING_HOUR}:{config.MORNING_MINUTE:02d} ET"
+    )
+    await _alert(msg)
+    logger.info(f"Health check: IG={status}, SPX={price_str}, bars={stream_bars}")
+
+
+async def pre_trade_warmup():
+    """14:20 UK (09:20 ET) — Verify connections before bar 4 window."""
+    now = datetime.now(config.TZ_ET)
+    if now.weekday() >= 5:
+        return
+
+    logger.info("═══ SPX PRE-TRADE WARMUP ═══")
+    issues = []
+
+    # REST check
+    if _shared_session:
+        try:
+            await _shared_session.keepalive()
+            logger.info("Pre-warm: REST session alive")
+        except Exception as e:
+            issues.append(f"REST check failed: {e}")
+
+    # Stream check
+    if broker and _shared_session:
+        try:
+            stream_ok = await _shared_session.check_stream_health(
+                broker._stream, config.IG_EPIC
+            )
+            if stream_ok:
+                logger.info("Pre-warm: Lightstreamer alive")
+            else:
+                issues.append("Lightstreamer stale — resubscribed")
+        except Exception as e:
+            issues.append(f"Stream check failed: {e}")
+
+    bar_count = broker.get_streaming_bar_count() if broker else 0
+    logger.info(f"Pre-warm: {bar_count} streaming bars")
+
+    if issues:
+        await _alert(
+            "<b>Pre-trade warmup</b>\n"
+            + "\n".join(f"- {i}" for i in issues) +
+            "\nRecovery attempted. ~30 min to morning routine."
+        )
+    else:
+        logger.info("Pre-warm: all systems OK")
+
+
+async def stream_alive_check():
+    """14:40 UK (09:40 ET) — Check bars are flowing before bar 4 closes."""
+    now = datetime.now(config.TZ_ET)
+    if now.weekday() >= 5:
+        return
+
+    bar_count = broker.get_streaming_bar_count() if broker else 0
+    if bar_count == 0:
+        logger.warning("Stream check: No SPX bars — attempting recovery")
+        if broker and _shared_session:
+            recovered = await _shared_session.check_stream_health(
+                broker._stream, config.IG_EPIC
+            )
+            if not recovered:
+                await _alert(
+                    "<b>Stream check FAILED</b>\n"
+                    "No SPX bars + recovery failed.\n"
+                    "Morning routine will use REST fallback."
+                )
+    else:
+        logger.info(f"Stream check: {bar_count} SPX bars — OK")
 
 
 async def morning_routine():
