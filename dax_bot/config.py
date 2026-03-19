@@ -33,7 +33,8 @@ CURRENCY     = os.getenv("CURRENCY", "EUR")
 BUFFER_PTS    = int(os.getenv("BUFFER_PTS", "2"))
 NARROW_RANGE  = int(os.getenv("NARROW_RANGE", "15"))
 WIDE_RANGE    = int(os.getenv("WIDE_RANGE", "40"))
-MAX_ENTRIES   = int(os.getenv("MAX_ENTRIES", "3"))   # entry + flip + re-entry
+MAX_ENTRIES   = int(os.getenv("MAX_ENTRIES", "2"))   # entry + re-entry (no flips)
+ENABLE_FLIPS  = os.getenv("ENABLE_FLIPS", "false").lower() == "true"
 NUM_CONTRACTS = int(os.getenv("NUM_CONTRACTS", "1"))   # £1/pt to start — scale up later
 MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "5"))   # Hard ceiling regardless of scaling ladder
 NARROW_STD_MULTIPLIER = int(os.getenv("NARROW_STD_MULTIPLIER", "2"))  # 2x size on STANDARD+NARROW days
@@ -45,7 +46,7 @@ MAX_SPREAD_PTS     = float(os.getenv("MAX_SPREAD_PTS", "10.0"))   # Skip entry i
 # Always use bar 4. Bar 5 disabled — backtest showed bar 5 rules reduced P&L
 # by £6.5k over 624 days (overfit to earlier data).
 DEFAULT_SIGNAL_BAR = int(os.getenv("DEFAULT_SIGNAL_BAR", "4"))
-BAR5_RULES_STR = os.getenv("BAR5_RULES", "")  # Empty = always bar 4
+BAR5_RULES_STR = os.getenv("BAR5_RULES", "NORMAL,WIDE")  # Bar 5 for NORMAL+WIDE ranges
 BAR5_RULES = [r.strip() for r in BAR5_RULES_STR.split(",") if r.strip()]
 
 # ── Partial Exit TPs (3-contract mode) ───────────────────────────────────────
@@ -71,6 +72,10 @@ ADD_EMA_TOUCH_ZONE     = float(os.getenv("ADD_EMA_TOUCH_ZONE", "0.003"))
 ADD_STRENGTH_ENABLED   = os.getenv("ADD_STRENGTH_ENABLED", "true").lower() == "true"
 ADD_STRENGTH_TRIGGER   = float(os.getenv("ADD_STRENGTH_TRIGGER", "25"))   # pts profit before add
 ADD_STRENGTH_MAX       = int(os.getenv("ADD_STRENGTH_MAX", "2"))          # max extra positions
+
+# ── SPX Regime Filter ─────────────────────────────────────────────────────────
+SPX_REGIME_ENABLED = os.getenv("SPX_REGIME_ENABLED", "true").lower() == "true"
+SPX_EPIC           = os.getenv("SPX_EPIC", "IX.D.SPTRD.DAILY.IP")  # S&P 500 DFB on IG
 
 # ── Telegram ───────────────────────────────────────────────────────────────────
 TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")

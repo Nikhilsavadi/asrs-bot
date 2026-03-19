@@ -119,6 +119,30 @@ async def main():
         except Exception:
             pass
 
+    # ══════════════════════════════════════════════════════════════
+    # STRATEGY 3: SPX ASRS (scheduler-driven, US market hours)
+    # Same ASRS rules as DAX, adapted for S&P 500.
+    # RTH: 09:30-16:00 ET, bar 4 at 09:50 ET
+    # ══════════════════════════════════════════════════════════════
+    spx_main = None
+    enable_spx = os.getenv("ENABLE_SPX", "true").lower() == "true"
+
+    if enable_spx:
+        try:
+            import spx_bot.config as spx_config
+            import spx_bot.main as _spx_main
+
+            # Subscribe to SPX streaming
+            await stream_mgr.subscribe_ticks(spx_config.IG_EPIC)
+            await stream_mgr.subscribe_candles(spx_config.IG_EPIC)
+
+            # Initialize SPX bot
+            await _spx_main.init(shared, stream_mgr, tg_send=telegram_cmd._send)
+            spx_main = _spx_main
+            logger.info("Strategy 3 (SPX ASRS) initialized")
+        except Exception as e:
+            logger.error("Strategy 3 (SPX) init failed: %s", e, exc_info=True)
+
     # ── Graceful shutdown ─────────────────────────────────────────
     dax_scheduler = AsyncIOScheduler(timezone=dax_config.TZ_UK)
     dax_main.scheduler = dax_scheduler
@@ -203,6 +227,26 @@ async def main():
         day_of_week="mon-fri", hour="23,0-7", minute=0,
         id="overnight_bars", misfire_grace_time=300)
 
+    # ── SPX schedule (US/Eastern times, converted to UTC for scheduler) ──
+    if spx_main is not None:
+        from zoneinfo import ZoneInfo
+        tz_et = ZoneInfo("America/New_York")
+
+        dax_scheduler.add_job(spx_main.morning_routine, "cron",
+            day_of_week="mon-fri", hour=9, minute=51,
+            id="spx_morning", misfire_grace_time=120,
+            timezone=tz_et)
+
+        dax_scheduler.add_job(spx_main.monitor_cycle, "cron",
+            day_of_week="mon-fri", hour="9-16", minute="*",
+            id="spx_monitor", misfire_grace_time=30,
+            timezone=tz_et)
+
+        dax_scheduler.add_job(spx_main.end_of_day, "cron",
+            day_of_week="mon-fri", hour=16, minute=5,
+            id="spx_eod", misfire_grace_time=120,
+            timezone=tz_et)
+
     # ── Session keepalive every 10 minutes ────────────────────────
     async def keepalive_with_stream_check():
         await shared.keepalive()
@@ -236,20 +280,24 @@ async def main():
     except Exception:
         pass
 
-    # ── Startup alert via Telegram (single combined message) ──
-    await send_startup_alert(telegram_cmd._send, gold_str=gold_str)
+    spx_str = "disabled"
+    if spx_main is not None:
+        spx_str = f"ASRS bar4/5 ({spx_main.config.IG_EPIC})"
 
-    logger.info("Bot started: DAX=%s, S3 ORB=%s, mode=%s",
-                dax_config.IG_EPIC, gold_str, ig_mode)
+    # ── Startup alert via Telegram (single combined message) ──
+    await send_startup_alert(telegram_cmd._send, gold_str=gold_str, spx_str=spx_str)
+
+    logger.info("Bot started: DAX=%s, S3 ORB=%s, SPX=%s, mode=%s",
+                dax_config.IG_EPIC, gold_str, spx_str, ig_mode)
 
     print("")
     print("=" * 52)
-    print("  ASRS Trading Bot (DAX + Gold ORB)")
+    print("  ASRS Trading Bot (DAX + SPX)")
     print("  IG Markets - Streaming Edition")
     print("=" * 52)
     print("  Broker:     IG %s" % ig_mode)
     print("  S1 DAX:     %s" % dax_config.IG_EPIC)
-    print("  S3 ORB:     %s" % gold_str)
+    print("  S3 SPX:     %s" % spx_str)
     print("  Telegram:   Commands active")
     print("-" * 52)
     print("  DAX:  08:21 Morning -> 17:35 EOD (UK time)")

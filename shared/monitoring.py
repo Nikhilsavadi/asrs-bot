@@ -102,13 +102,13 @@ async def heartbeat_ping():
 
 # ── Startup Alert ─────────────────────────────────────────────────────────
 
-async def send_startup_alert(send_func, gold_str: str = "disabled"):
+async def send_startup_alert(send_func, gold_str: str = "disabled", spx_str: str = "disabled"):
     """Send single combined Telegram alert on container start."""
     now = datetime.now(TZ_UK)
     msg = (
         f"🔄 <b>BOT STARTED</b>  {now.strftime('%Y-%m-%d %H:%M:%S')} UK\n"
         f"S1 DAX: ASRS active\n"
-        f"S2 Gold: {gold_str}\n"
+        f"S3 SPX: {spx_str}\n"
         f"<i>All schedules active.</i>"
     )
     await send_func(msg)

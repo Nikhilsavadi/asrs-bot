@@ -12,6 +12,7 @@ COPY shared/ shared/
 COPY dax_bot/ dax_bot/
 COPY ftse_bot/ ftse_bot/
 COPY gold_bot/ gold_bot/
+COPY spx_bot/ spx_bot/
 COPY telegram_cmd.py .
 COPY run_all.py .
 

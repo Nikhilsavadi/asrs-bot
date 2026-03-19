@@ -567,6 +567,38 @@ async def morning_routine():
     logger.info(f"Step 5: Overnight {overnight_result.range_low}-{overnight_result.range_high}, "
                 f"bias={overnight_result.bias.value}")
 
+    # ── SPX regime filter: override bias based on previous day SPX close ──
+    if config.SPX_REGIME_ENABLED:
+        logger.info("Step 5b: Checking SPX regime filter...")
+        try:
+            from shared.ig_session import IGSharedSession
+            session = IGSharedSession.get_instance()
+            if session and session.ig:
+                spx_prices = session.ig.fetch_historical_prices_by_epic_and_num_points(
+                    config.SPX_EPIC, "DAY", 2
+                )
+                if spx_prices and "prices" in spx_prices:
+                    prices = spx_prices["prices"]
+                    if len(prices) >= 2:
+                        prev_close = float(prices[-2]["closePrice"]["bid"])
+                        prev_open = float(prices[-2]["openPrice"]["bid"])
+                        spx_dir = "UP" if prev_close > prev_open else "DOWN"
+                        if spx_dir == "UP":
+                            state.overnight_bias = "LONG_ONLY"
+                        else:
+                            state.overnight_bias = "SHORT_ONLY"
+                        overnight_result.bias = OvernightBias(state.overnight_bias)
+                        state.save()
+                        logger.info(f"Step 5b: SPX prev day {spx_dir} → bias overridden to {state.overnight_bias}")
+                    else:
+                        logger.warning("Step 5b: SPX insufficient price data")
+                else:
+                    logger.warning("Step 5b: SPX price fetch returned no data")
+            else:
+                logger.warning("Step 5b: No IG session for SPX regime check")
+        except Exception as e:
+            logger.warning(f"Step 5b: SPX regime filter failed (non-fatal): {e}")
+
     # ── Calculate levels (bar selection uses gap_dir + overnight_bias) ──
     logger.info("Step 6: Calculating levels...")
     events = calculate_levels(state, df)
