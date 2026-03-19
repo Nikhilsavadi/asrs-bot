@@ -246,38 +246,60 @@ async def morning_routine():
     state.overnight_bias = overnight_result.bias.value
     state.save()
 
-    # Calculate levels (uses config module — need to temporarily swap)
-    # We patch the config reference in strategy module
-    original_config = _strat.config
-    _strat.config = config
-    try:
-        events = calculate_levels(state, df)
-    finally:
-        _strat.config = original_config
+    # Calculate levels directly — streaming bars are in CET, US open is 14:30 CET
+    # We can't use DAX's candle_number() which is hardcoded to 09:00 CET
+    from zoneinfo import ZoneInfo
+    cet = ZoneInfo("Europe/Berlin")
+    now_cet = datetime.now(cet)
+    us_open_cet = now_cet.replace(hour=14, minute=30, second=0, microsecond=0)
 
-    logger.info(f"Level events: {events}")
+    # Filter bars from US open onwards
+    us_bars = df[df.index >= us_open_cet].sort_index()
+    logger.info(f"US30 bars from 14:30 CET: {len(us_bars)} bars")
 
-    if "LEVELS_SET" not in events and "WAITING_FOR_BAR5" not in events:
-        await _alert(f"US30 ASRS ERROR\nCannot calculate levels: {events}")
+    if len(us_bars) < 4:
+        await _alert(f"US30 ASRS ERROR\nOnly {len(us_bars)} bars since US open (need 4)")
         return
 
-    if "WAITING_FOR_BAR5" in events:
-        logger.info("Waiting for bar 5...")
-        await asyncio.sleep(300)
-        df = broker.get_streaming_bars_df()
-        if df.empty:
-            df = await broker.get_5min_bars("1 D")
-        _strat.config = config
-        try:
-            events = calculate_levels(state, df)
-        finally:
-            _strat.config = original_config
-        if "LEVELS_SET" not in events:
-            await _alert(f"US30 Bar 5 not available: {events}")
-            return
+    # Bar 4 = 4th bar from US open
+    bar4 = us_bars.iloc[3]
+    bar4_range = bar4["High"] - bar4["Low"]
 
+    # Hybrid: bar 4 for narrow, bar 5 for normal/wide
+    if bar4_range > config.NARROW_RANGE and len(us_bars) >= 5:
+        signal_bar = us_bars.iloc[4]
+        state.bar_number = 5
+        logger.info(f"Using bar 5 (bar4 range {bar4_range:.1f} > NARROW {config.NARROW_RANGE})")
+    else:
+        signal_bar = bar4
+        state.bar_number = 4
+
+    state.bar_high = round(signal_bar["High"], 1)
+    state.bar_low = round(signal_bar["Low"], 1)
+    state.bar_range = round(signal_bar["High"] - signal_bar["Low"], 1)
+
+    if state.bar_range < 3:
+        await _alert(f"US30 ASRS: Bar range too small ({state.bar_range}pts)")
+        return
+
+    # Range flag
+    if state.bar_range <= config.NARROW_RANGE:
+        state.range_flag = "NARROW"
+    elif state.bar_range >= config.WIDE_RANGE:
+        state.range_flag = "WIDE"
+    else:
+        state.range_flag = "NORMAL"
+
+    # Set levels
+    state.buy_level = round(state.bar_high + config.BUFFER_PTS, 1)
+    state.sell_level = round(state.bar_low - config.BUFFER_PTS, 1)
+    state.phase = Phase.LEVELS_SET
+    state.oca_group = f"US30_{state.date}_1"
+    state.save()
+
+    events = ["LEVELS_SET"]
     logger.info(f"Levels: Buy={state.buy_level} Sell={state.sell_level} "
-                f"Bar={state.bar_number} Range={state.bar_range}")
+                f"Bar={state.bar_number} Range={state.bar_range} ({state.range_flag})")
 
     # Position sizing
     state.position_size = min(config.NUM_CONTRACTS, config.MAX_CONTRACTS)
