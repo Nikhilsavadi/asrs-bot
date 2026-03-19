@@ -120,7 +120,7 @@ async def main():
             pass
 
     # ══════════════════════════════════════════════════════════════
-    # STRATEGY 3: SPX ASRS (scheduler-driven, US market hours)
+    # STRATEGY 3: US30 ASRS (scheduler-driven, US market hours)
     # Same ASRS rules as DAX, adapted for S&P 500.
     # RTH: 09:30-16:00 ET, bar 4 at 09:50 ET
     # ══════════════════════════════════════════════════════════════
@@ -132,16 +132,16 @@ async def main():
             import spx_bot.config as spx_config
             import spx_bot.main as _spx_main
 
-            # Subscribe to SPX streaming
+            # Subscribe to US30 streaming
             await stream_mgr.subscribe_ticks(spx_config.IG_EPIC)
             await stream_mgr.subscribe_candles(spx_config.IG_EPIC)
 
-            # Initialize SPX bot
+            # Initialize US30 bot
             await _spx_main.init(shared, stream_mgr, tg_send=telegram_cmd._send)
             spx_main = _spx_main
-            logger.info("Strategy 3 (SPX ASRS) initialized")
+            logger.info("Strategy 3 (US30 ASRS) initialized")
         except Exception as e:
-            logger.error("Strategy 3 (SPX) init failed: %s", e, exc_info=True)
+            logger.error("Strategy 3 (US30) init failed: %s", e, exc_info=True)
 
     # ── Graceful shutdown ─────────────────────────────────────────
     dax_scheduler = AsyncIOScheduler(timezone=dax_config.TZ_UK)
@@ -227,7 +227,7 @@ async def main():
         day_of_week="mon-fri", hour="23,0-7", minute=0,
         id="overnight_bars", misfire_grace_time=300)
 
-    # ── SPX schedule (US/Eastern times, converted to UTC for scheduler) ──
+    # ── US30 schedule (US/Eastern times, converted to UTC for scheduler) ──
     if spx_main is not None:
         from zoneinfo import ZoneInfo
         tz_et = ZoneInfo("America/New_York")
@@ -307,7 +307,7 @@ async def main():
 
     print("")
     print("=" * 52)
-    print("  ASRS Trading Bot (DAX + SPX)")
+    print("  ASRS Trading Bot (DAX + US30)")
     print("  IG Markets - Streaming Edition")
     print("=" * 52)
     print("  Broker:     IG %s" % ig_mode)

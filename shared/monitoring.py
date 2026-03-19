@@ -108,7 +108,7 @@ async def send_startup_alert(send_func, gold_str: str = "disabled", spx_str: str
     msg = (
         f"🔄 <b>BOT STARTED</b>  {now.strftime('%Y-%m-%d %H:%M:%S')} UK\n"
         f"S1 DAX: ASRS active\n"
-        f"S3 SPX: {spx_str}\n"
+        f"S3 US30: {spx_str}\n"
         f"<i>All schedules active.</i>"
     )
     await send_func(msg)
