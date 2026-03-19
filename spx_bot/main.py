@@ -1,6 +1,6 @@
 """
-SPX Bot main — S&P 500 ASRS strategy.
-Reuses DAX bot logic with SPX-specific config.
+US30 Bot main — S&P 500 ASRS strategy.
+Reuses DAX bot logic with US30-specific config.
 """
 
 import logging
@@ -8,7 +8,7 @@ import asyncio
 from datetime import datetime
 
 # Monkey-patch: make dax_bot code use spx_bot.config instead of dax_bot.config
-# This is done by creating SPX-specific instances with the right config.
+# This is done by creating US30-specific instances with the right config.
 from spx_bot import config
 from dax_bot.strategy import (
     DailyState, Phase, calculate_levels, update_trail, process_stop_hit,
@@ -19,7 +19,7 @@ from dax_bot.broker_ig import IGBroker
 import httpx
 from dax_bot.overnight import calculate_overnight_range, OvernightBias, OvernightResult
 
-logger = logging.getLogger("SPX_ASRS")
+logger = logging.getLogger("US30_ASRS")
 
 # Module-level state (initialized by run_all.py)
 broker: IGBroker = None
@@ -28,34 +28,34 @@ _tg_send = None  # Telegram send function, set by init()
 
 
 async def _alert(text: str):
-    """Send Telegram alert with [S3 SPX] prefix."""
+    """Send Telegram alert with [S3 US30] prefix."""
     if _tg_send:
-        await _tg_send("[S3 SPX] " + text)
+        await _tg_send("[S3 US30] " + text)
     else:
         logger.info(f"ALERT (no TG): {text}")
 
-# Override STATE_FILE for SPX
+# Override STATE_FILE for US30
 import dax_bot.strategy as _strat
-_SPX_STATE_FILE = config.STATE_FILE
+_US30_STATE_FILE = config.STATE_FILE
 
 
-class SPXDailyState(DailyState):
-    """DailyState that uses SPX state file."""
+class US30DailyState(DailyState):
+    """DailyState that uses US30 state file."""
 
     def save(self):
         import os, json
         from dataclasses import asdict
-        os.makedirs(os.path.dirname(_SPX_STATE_FILE), exist_ok=True)
-        with open(_SPX_STATE_FILE, "w") as f:
+        os.makedirs(os.path.dirname(_US30_STATE_FILE), exist_ok=True)
+        with open(_US30_STATE_FILE, "w") as f:
             json.dump(asdict(self), f, indent=2)
 
     @classmethod
-    def load(cls) -> "SPXDailyState":
+    def load(cls) -> "US30DailyState":
         import os, json
         today = datetime.now(config.TZ_UK).strftime("%Y-%m-%d")
         try:
-            if os.path.exists(_SPX_STATE_FILE):
-                with open(_SPX_STATE_FILE) as f:
+            if os.path.exists(_US30_STATE_FILE):
+                with open(_US30_STATE_FILE) as f:
                     data = json.load(f)
                 if data.get("date") == today:
                     state = cls()
@@ -71,25 +71,25 @@ class SPXDailyState(DailyState):
 
 
 async def init(shared_session, stream_manager, tg_send=None):
-    """Initialize SPX broker. Called by run_all.py."""
+    """Initialize US30 broker. Called by run_all.py."""
     global broker, _tg_send, _shared_session
 
     broker = IGBroker(shared_session, stream_manager, config.IG_EPIC, "GBP")
     _tg_send = tg_send
     _shared_session = shared_session
-    logger.info(f"SPX bot initialized: {config.IG_EPIC}")
+    logger.info(f"US30 bot initialized: {config.IG_EPIC}")
 
 
 _shared_session = None
 
 
 async def health_check():
-    """14:00 UK — SPX health check before US open."""
+    """14:00 UK — US30 health check before US open."""
     now = datetime.now(config.TZ_ET)
     if now.weekday() >= 5:
         return
 
-    logger.info("═══ SPX HEALTH CHECK ═══")
+    logger.info("═══ US30 HEALTH CHECK ═══")
     mode = "DEMO" if config.IG_DEMO else "LIVE"
 
     price = None
@@ -105,16 +105,16 @@ async def health_check():
     stream_bars = broker.get_streaming_bar_count() if broker else 0
 
     msg = (
-        f"<b>SPX Health Check</b> [{mode}]\n"
+        f"<b>US30 Health Check</b> [{mode}]\n"
         f"{now.strftime('%Y-%m-%d %H:%M')} ET\n"
         f"IG: {status}\n"
         f"Epic: {config.IG_EPIC}\n"
-        f"SPX: {price_str}\n"
+        f"US30: {price_str}\n"
         f"Streaming bars: {stream_bars}\n"
         f"Morning routine at {config.MORNING_HOUR}:{config.MORNING_MINUTE:02d} ET"
     )
     await _alert(msg)
-    logger.info(f"Health check: IG={status}, SPX={price_str}, bars={stream_bars}")
+    logger.info(f"Health check: IG={status}, US30={price_str}, bars={stream_bars}")
 
 
 async def pre_trade_warmup():
@@ -123,7 +123,7 @@ async def pre_trade_warmup():
     if now.weekday() >= 5:
         return
 
-    logger.info("═══ SPX PRE-TRADE WARMUP ═══")
+    logger.info("═══ US30 PRE-TRADE WARMUP ═══")
     issues = []
 
     # REST check
@@ -168,7 +168,7 @@ async def stream_alive_check():
 
     bar_count = broker.get_streaming_bar_count() if broker else 0
     if bar_count == 0:
-        logger.warning("Stream check: No SPX bars — attempting recovery")
+        logger.warning("Stream check: No US30 bars — attempting recovery")
         if broker and _shared_session:
             recovered = await _shared_session.check_stream_health(
                 broker._stream, config.IG_EPIC
@@ -176,11 +176,11 @@ async def stream_alive_check():
             if not recovered:
                 await _alert(
                     "<b>Stream check FAILED</b>\n"
-                    "No SPX bars + recovery failed.\n"
+                    "No US30 bars + recovery failed.\n"
                     "Morning routine will use REST fallback."
                 )
     else:
-        logger.info(f"Stream check: {bar_count} SPX bars — OK")
+        logger.info(f"Stream check: {bar_count} US30 bars — OK")
 
 
 async def morning_routine():
@@ -189,8 +189,8 @@ async def morning_routine():
     if now.weekday() >= 5:
         return
 
-    logger.info("═══ SPX MORNING ROUTINE ═══")
-    state = SPXDailyState.load()
+    logger.info("═══ US30 MORNING ROUTINE ═══")
+    state = US30DailyState.load()
     if state.phase != Phase.IDLE:
         logger.info("Already processed today")
         return
@@ -208,7 +208,7 @@ async def morning_routine():
             logger.error(f"Failed to get bars: {e}")
 
     if df.empty:
-        await _alert("ASRS ERROR\nNo bar data available for SPX.\nCheck logs.")
+        await _alert("ASRS ERROR\nNo bar data available for US30.\nCheck logs.")
         return
 
     today_date = now.date()
@@ -258,7 +258,7 @@ async def morning_routine():
     logger.info(f"Level events: {events}")
 
     if "LEVELS_SET" not in events and "WAITING_FOR_BAR5" not in events:
-        await _alert(f"SPX ASRS ERROR\nCannot calculate levels: {events}")
+        await _alert(f"US30 ASRS ERROR\nCannot calculate levels: {events}")
         return
 
     if "WAITING_FOR_BAR5" in events:
@@ -273,7 +273,7 @@ async def morning_routine():
         finally:
             _strat.config = original_config
         if "LEVELS_SET" not in events:
-            await _alert(f"SPX Bar 5 not available: {events}")
+            await _alert(f"US30 Bar 5 not available: {events}")
             return
 
     logger.info(f"Levels: Buy={state.buy_level} Sell={state.sell_level} "
@@ -287,7 +287,7 @@ async def morning_routine():
 
     # Send signal
     await _alert(
-        f"<b>SPX ASRS Signal</b>\n"
+        f"<b>US30 ASRS Signal</b>\n"
         f"Bar {state.bar_number}: H={state.bar_high:.1f} L={state.bar_low:.1f}\n"
         f"Range: {state.bar_range:.1f} ({state.range_flag})\n"
         f"Buy: {state.buy_level:.1f} | Sell: {state.sell_level:.1f}\n"
@@ -312,7 +312,7 @@ async def morning_routine():
 
     result = await broker.place_oca_bracket(
         buy_price=buy_price, sell_price=sell_price,
-        qty=qty, oca_group=f"SPX_{state.date}_1",
+        qty=qty, oca_group=f"US30_{state.date}_1",
     )
 
     if "error" not in result:
@@ -320,14 +320,14 @@ async def morning_routine():
         state.sell_order_id = result.get("sell_order_id", "")
         state.phase = Phase.ORDERS_PLACED
         state.save()
-        logger.info("Orders placed — SPX morning routine complete")
+        logger.info("Orders placed — US30 morning routine complete")
     else:
-        await _alert(f"SPX ORDER FAILED: {result['error']}")
+        await _alert(f"US30 ORDER FAILED: {result['error']}")
 
 
 async def monitor_cycle():
     """Every minute during RTH — check triggers, manage positions."""
-    state = SPXDailyState.load()
+    state = US30DailyState.load()
     if state.phase == Phase.IDLE or state.phase == Phase.DONE:
         return
 
@@ -343,7 +343,7 @@ async def monitor_cycle():
             # Check for trigger
             result = await broker.check_trigger_levels()
             if result:
-                logger.info(f"SPX trigger: {result}")
+                logger.info(f"US30 trigger: {result}")
 
         elif state.phase in (Phase.LONG_ACTIVE, Phase.SHORT_ACTIVE):
             # Trail stop update
@@ -361,11 +361,11 @@ async def monitor_cycle():
             if pos and pos["direction"] == "FLAT" and state.contracts_active > 0:
                 exit_price = await broker.get_fill_price(state.stop_order_id) or state.trailing_stop
                 events = process_stop_hit(state, exit_price)
-                logger.info(f"SPX stop hit: {events}")
+                logger.info(f"US30 stop hit: {events}")
 
                 trade = state.trades[-1] if state.trades else {}
                 await _alert(
-                    f"<b>SPX EXIT</b>\n"
+                    f"<b>US30 EXIT</b>\n"
                     f"Direction: {trade.get('direction', '?')}\n"
                     f"Entry: {trade.get('entry', '?')} | Exit: {exit_price}\n"
                     f"PnL: {trade.get('pnl_pts', 0):.1f} pts\n"
@@ -385,7 +385,7 @@ async def monitor_cycle():
                     result = await broker.place_oca_bracket(
                         buy_price=state.buy_level, sell_price=state.sell_level,
                         qty=state.position_size or config.NUM_CONTRACTS,
-                        oca_group=f"SPX_{state.date}_{state.entries_used + 1}",
+                        oca_group=f"US30_{state.date}_{state.entries_used + 1}",
                     )
                     if "error" not in result:
                         state.buy_order_id = result.get("buy_order_id", "")
@@ -393,7 +393,7 @@ async def monitor_cycle():
                         state.phase = Phase.ORDERS_PLACED
                         state.save()
                         await _alert(
-                            f"RE-ENTRY ARMED SPX\n"
+                            f"RE-ENTRY ARMED US30\n"
                             f"Direction: {state.reentry_direction}\n"
                             f"Trigger: {state.reentry_price}"
                         )
@@ -410,7 +410,7 @@ async def monitor_cycle():
                             fill_price = add_result.get("avg_price", price)
                             process_add_fill(state, fill_price)
                             await _alert(
-                                f"ADD TO WINNERS SPX\n"
+                                f"ADD TO WINNERS US30\n"
                                 f"{state.direction} +1 @ {fill_price}\n"
                                 f"Add #{state.adds_used} | Total: {state.contracts_active}"
                             )
@@ -424,15 +424,15 @@ async def end_of_day():
     if now.weekday() >= 5:
         return
 
-    state = SPXDailyState.load()
+    state = US30DailyState.load()
     if state.phase in (Phase.IDLE, Phase.DONE):
         return
 
-    logger.info("SPX end of day — closing positions")
+    logger.info("US30 end of day — closing positions")
     if state.phase in (Phase.LONG_ACTIVE, Phase.SHORT_ACTIVE):
         close_action = "SELL" if state.direction == "LONG" else "BUY"
         await broker.place_market_order(close_action, state.contracts_active)
-        await _alert("SPX END OF DAY — positions closed")
+        await _alert("US30 END OF DAY — positions closed")
 
     state.phase = Phase.DONE
     state.save()
