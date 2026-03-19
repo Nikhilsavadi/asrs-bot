@@ -101,6 +101,10 @@ class DailyState:
     overnight_bias:    str = ""       # SHORT_ONLY, LONG_ONLY, STANDARD, NO_DATA
     bar4_vs_overnight: str = ""       # ABOVE, BELOW, INSIDE, PARTIAL_ABOVE, PARTIAL_BELOW
 
+    # Re-entry after profitable exit
+    reentry_direction: str = ""        # LONG or SHORT — same as profitable exit
+    reentry_price:     float = 0.0     # Exit price — re-enter if price resumes through here
+
     # Trade log
     trades:            list = field(default_factory=list)
 
@@ -437,23 +441,25 @@ def update_trail(state: DailyState, df: pd.DataFrame) -> list[str]:
                 events.append("BREAKEVEN_HIT")
 
     # ── Candle trail: ratchet stop to candle low/high ──
+    # After +TRAIL_TIGHT_THRESHOLD pts, use candle close (tighter) instead of low/high
     if state.direction == "LONG":
-        # Trail to candle low, only if it moves UP
-        new_stop = candle["low"]
+        current_profit = candle["close"] - state.entry_price
+        use_tight = current_profit >= config.TRAIL_TIGHT_THRESHOLD
+        new_stop = candle["close"] if use_tight else candle["low"]
         if new_stop > state.trailing_stop:
             state.trailing_stop = new_stop
-            events.append("TRAIL_UPDATED")
+            events.append("TRAIL_TIGHT" if use_tight else "TRAIL_UPDATED")
 
-        # Track MFE
         if candle["high"] > state.max_favourable:
             state.max_favourable = candle["high"]
 
     elif state.direction == "SHORT":
-        # Trail to candle high, only if it moves DOWN
-        new_stop = candle["high"]
+        current_profit = state.entry_price - candle["close"]
+        use_tight = current_profit >= config.TRAIL_TIGHT_THRESHOLD
+        new_stop = candle["close"] if use_tight else candle["high"]
         if new_stop < state.trailing_stop:
             state.trailing_stop = new_stop
-            events.append("TRAIL_UPDATED")
+            events.append("TRAIL_TIGHT" if use_tight else "TRAIL_UPDATED")
 
         if candle["low"] < state.max_favourable:
             state.max_favourable = candle["low"]
@@ -495,7 +501,9 @@ def check_add_to_winners(state: DailyState, current_price: float) -> list[str]:
 
 
 def process_add_fill(state: DailyState, fill_price: float) -> list[str]:
-    """Called when an add-to-winners market order fills."""
+    """Called when an add-to-winners market order fills.
+    Also ratchets trailing stop to lock profit on existing contracts.
+    """
     events = []
     state.adds_used += 1
     state.contracts_active += 1
@@ -505,6 +513,21 @@ def process_add_fill(state: DailyState, fill_price: float) -> list[str]:
         "time": datetime.now(config.TZ_UK).strftime("%H:%M"),
     })
     events.append("ADD_FILLED")
+
+    # Lock profit: move stop to entry + half the profit at add time
+    # e.g. entry 23100, add at 23075 (SHORT +25pts) → stop moves to 23088 (lock ~12pts)
+    if state.direction == "LONG":
+        lock_stop = state.entry_price + (fill_price - state.entry_price) * 0.5
+        if lock_stop > state.trailing_stop:
+            state.trailing_stop = round(lock_stop, 1)
+            events.append("ADD_STOP_RATCHETED")
+    elif state.direction == "SHORT":
+        lock_stop = state.entry_price - (state.entry_price - fill_price) * 0.5
+        if lock_stop < state.trailing_stop:
+            state.trailing_stop = round(lock_stop, 1)
+            events.append("ADD_STOP_RATCHETED")
+
+    state.breakeven_hit = True  # Force breakeven since we're locking profit
     state.save()
     return events
 
@@ -610,9 +633,10 @@ def process_stop_hit(state: DailyState, exit_price: float) -> list[str]:
         state.trades[-1]["exit_reason"] = exit_reason
 
     state.contracts_active = 0
+    prev_direction = state.direction
     events.append(f"{state.direction}_STOPPED")
 
-    # Can flip?
+    # Can we re-enter or flip?
     if state.entries_used < config.MAX_ENTRIES:
         state.phase = Phase.LEVELS_SET
         state.direction = ""
@@ -625,7 +649,15 @@ def process_stop_hit(state: DailyState, exit_price: float) -> list[str]:
         state.add_positions = []
         state.last_add_price = 0.0
         state.oca_group = f"ASRS_{state.date}_{state.entries_used + 1}"
-        events.append("CAN_FLIP")
+
+        # Profitable exit → re-enter same direction on trend continuation
+        # Loss exit → flip to opposite direction
+        if pnl_per_contract > 0 and exit_reason == "TRAILED_STOP":
+            state.reentry_direction = prev_direction
+            state.reentry_price = exit_price
+            events.append("CAN_REENTER")
+        else:
+            events.append("CAN_FLIP")
     else:
         state.phase = Phase.DONE
         state.direction = ""

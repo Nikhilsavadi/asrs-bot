@@ -33,7 +33,7 @@ CURRENCY     = os.getenv("CURRENCY", "EUR")
 BUFFER_PTS    = int(os.getenv("BUFFER_PTS", "2"))
 NARROW_RANGE  = int(os.getenv("NARROW_RANGE", "15"))
 WIDE_RANGE    = int(os.getenv("WIDE_RANGE", "40"))
-MAX_ENTRIES   = int(os.getenv("MAX_ENTRIES", "2"))
+MAX_ENTRIES   = int(os.getenv("MAX_ENTRIES", "3"))   # entry + flip + re-entry
 NUM_CONTRACTS = int(os.getenv("NUM_CONTRACTS", "1"))   # £1/pt to start — scale up later
 MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "5"))   # Hard ceiling regardless of scaling ladder
 NARROW_STD_MULTIPLIER = int(os.getenv("NARROW_STD_MULTIPLIER", "2"))  # 2x size on STANDARD+NARROW days
@@ -57,6 +57,7 @@ TP2_PTS        = float(os.getenv("TP2_PTS", "50"))     # Contract 2 fixed TP
 # ── Trailing Stop ──────────────────────────────────────────────────────────────
 TRAIL_MIN_MOVE = float(os.getenv("TRAIL_MIN_MOVE", "3"))  # Min pts to bother alerting
 TRAIL_BREAKEVEN_PTS = float(os.getenv("TRAIL_BREAKEVEN_PTS", "15"))  # Move stop to entry after +Xpts
+TRAIL_TIGHT_THRESHOLD = float(os.getenv("TRAIL_TIGHT_THRESHOLD", "100"))  # Switch to tight trail after +Xpts
 
 # ── EMA Trail & Add to Winners ───────────────────────────────────────────────
 TRAIL_EMA_PERIOD       = int(os.getenv("TRAIL_EMA_PERIOD", "10"))

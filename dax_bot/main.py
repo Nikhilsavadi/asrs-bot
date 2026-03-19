@@ -1019,7 +1019,34 @@ async def _handle_fill_event(data):
                 journal.append_trade(trade_log, state)
                 trade_log["journaled"] = True
 
-            if "CAN_FLIP" in events:
+            if "CAN_REENTER" in events:
+                if _check_daily_loss_limit():
+                    state.phase = Phase.DONE
+                    state.save()
+                    return
+                try:
+                    if state.reentry_direction == "LONG":
+                        state.buy_level = state.reentry_price
+                        state.sell_level = 0.01
+                    else:
+                        state.buy_level = 999999.0
+                        state.sell_level = state.reentry_price
+                    state.save()
+                    await place_bracket_orders(state)
+                    state = DailyState.load()
+                    if state.phase == Phase.ORDERS_PLACED:
+                        await alerts.send(
+                            f"🔄 <b>RE-ENTRY ARMED</b>\n"
+                            f"Direction: {state.reentry_direction}\n"
+                            f"Trigger: {state.reentry_price}\n"
+                            f"<i>Trend continuation — same direction as profitable exit</i>"
+                        )
+                except Exception as re_err:
+                    logger.error(f"Re-entry bracket failed: {re_err}")
+                    state.phase = Phase.DONE
+                    state.save()
+
+            elif "CAN_FLIP" in events:
                 if _check_daily_loss_limit():
                     state.phase = Phase.DONE
                     state.save()
@@ -1212,7 +1239,34 @@ async def _monitor_cycle_inner():
                 journal.append_trade(trade, state)
                 trade["journaled"] = True
 
-            if "CAN_FLIP" in events:
+            if "CAN_REENTER" in events:
+                if _check_daily_loss_limit():
+                    state.phase = Phase.DONE
+                    state.save()
+                    return
+                try:
+                    if state.reentry_direction == "LONG":
+                        state.buy_level = state.reentry_price
+                        state.sell_level = 0.01
+                    else:
+                        state.buy_level = 999999.0
+                        state.sell_level = state.reentry_price
+                    state.save()
+                    await place_bracket_orders(state)
+                    state = DailyState.load()
+                    if state.phase == Phase.ORDERS_PLACED:
+                        await alerts.send(
+                            f"🔄 <b>RE-ENTRY ARMED</b>\n"
+                            f"Direction: {state.reentry_direction}\n"
+                            f"Trigger: {state.reentry_price}\n"
+                            f"<i>Trend continuation — same direction as profitable exit</i>"
+                        )
+                except Exception as re_err:
+                    logger.error(f"Re-entry bracket failed: {re_err}")
+                    state.phase = Phase.DONE
+                    state.save()
+
+            elif "CAN_FLIP" in events:
                 if _check_daily_loss_limit():
                     state.phase = Phase.DONE
                     state.save()
@@ -1309,11 +1363,13 @@ async def _monitor_cycle_inner():
                                 state.stop_order_id = result["order_id"]
                                 state.save()
 
+                        locked_pts = abs(state.entry_price - state.trailing_stop)
                         await alerts.send(
                             f"➕ <b>ADD TO WINNERS</b>\n"
                             f"{state.direction} +1 contract @ {fill_price}\n"
                             f"Add #{state.adds_used} | Total contracts: {state.contracts_active}\n"
-                            f"Trail stop: {state.trailing_stop}"
+                            f"Trail stop: {state.trailing_stop}\n"
+                            f"🔒 Profit locked: {locked_pts:.1f} pts"
                         )
                         logger.info(f"Add #{state.adds_used}: {add_action} 1 @ {fill_price}, "
                                      f"total contracts={state.contracts_active}")
