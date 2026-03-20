@@ -105,13 +105,25 @@ async def on_tick_trigger(trigger: dict):
     state.entries_used += 1
     state.stop_order_id = order_id
     state.last_add_price = fill_price
+    state.max_favourable = fill_price  # Will be updated by trail
+    intended = state.sell_level if direction == "SHORT" else state.buy_level
     state.trades.append({
         "entry": fill_price,
-        "entry_intended": state.sell_level if direction == "SHORT" else state.buy_level,
+        "exit": 0,
+        "exit_intended": 0,
+        "entry_intended": intended,
         "direction": direction,
         "entry_time": datetime.now(config.TZ_ET).strftime("%H:%M:%S"),
-        "entry_slippage": round(abs(fill_price - (state.sell_level if direction == "SHORT" else state.buy_level)), 1),
-        "slippage_total": round(abs(fill_price - (state.sell_level if direction == "SHORT" else state.buy_level)), 1),
+        "entry_slippage": round(abs(fill_price - intended), 1),
+        "exit_slippage": 0,
+        "slippage_total": round(abs(fill_price - intended), 1),
+        "pnl_pts": 0,
+        "pnl_per_contract": 0,
+        "mfe": 0,
+        "exit_reason": "",
+        "contracts_stopped": 0,
+        "tp1_filled": False,
+        "tp2_filled": False,
     })
     state.save()
     logger.info(f"US30 tick trigger fill: {direction} @ {fill_price}")
@@ -430,10 +442,16 @@ async def monitor_cycle():
             if not df.empty:
                 events = update_trail(state, df)
                 if "TRAIL_UPDATED" in events or "TRAIL_TIGHT" in events:
-                    try:
-                        await broker.modify_stop(state.stop_order_id, state.trailing_stop)
-                    except Exception:
-                        pass
+                    # Update stop on ALL open deal IDs (original + adds)
+                    all_deal_ids = [state.stop_order_id]
+                    for add in state.add_positions:
+                        if isinstance(add, dict) and add.get("deal_id"):
+                            all_deal_ids.append(add["deal_id"])
+                    for deal_id in all_deal_ids:
+                        try:
+                            await broker.modify_stop(deal_id, state.trailing_stop)
+                        except Exception as e:
+                            logger.warning(f"Stop update failed for {deal_id}: {e}")
 
             # Check if stopped out
             pos = await broker.get_position()
@@ -493,11 +511,23 @@ async def monitor_cycle():
                         add_result = await broker.place_market_order(add_action, 1)
                         if "order_id" in add_result:
                             fill_price = add_result.get("avg_price", price)
+                            deal_id = add_result.get("order_id", "")
                             process_add_fill(state, fill_price)
+                            # Store deal_id on the add position for stop management
+                            if state.add_positions:
+                                state.add_positions[-1]["deal_id"] = deal_id
+                                state.save()
+                            # Set stop on the new position immediately
+                            try:
+                                await broker.modify_stop(deal_id, state.trailing_stop)
+                                logger.info(f"US30 add stop set on {deal_id} @ {state.trailing_stop}")
+                            except Exception as e:
+                                logger.error(f"US30 add stop FAILED on {deal_id}: {e}")
                             await _alert(
                                 f"ADD TO WINNERS US30\n"
                                 f"{state.direction} +1 @ {fill_price}\n"
-                                f"Add #{state.adds_used} | Total: {state.contracts_active}"
+                                f"Add #{state.adds_used} | Total: {state.contracts_active}\n"
+                                f"Stop: {state.trailing_stop}"
                             )
     finally:
         _strat.config = original_config
