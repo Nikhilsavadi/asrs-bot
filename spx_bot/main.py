@@ -382,6 +382,12 @@ async def monitor_cycle():
             pos = await broker.get_position()
             if pos and pos["direction"] == "FLAT" and state.contracts_active > 0:
                 exit_price = await broker.get_fill_price(state.stop_order_id) or state.trailing_stop
+                # Ensure contracts_active reflects what was actually stopped
+                if state.contracts_active == 0:
+                    state.contracts_active = 1 + len(state.add_positions)
+                    logger.warning(f"contracts_active was 0 at stop processing — restored to {state.contracts_active}")
+                logger.info(f"US30 stop processing: exit={exit_price}, trailing_stop={state.trailing_stop}, "
+                            f"entry={state.entry_price}, contracts={state.contracts_active}, adds={len(state.add_positions)}")
                 events = process_stop_hit(state, exit_price)
                 logger.info(f"US30 stop hit: {events}")
 

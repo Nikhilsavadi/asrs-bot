@@ -364,6 +364,7 @@ def _simulate_entry(post_bars, buy_level, sell_level, bias, bar4_range,
                     add_entries.append(add_price)
                     last_add_price = add_price
                     contracts += 1
+                    # Lock profit: move stop to entry - 50% of profit
                     lock_stop = entry_price - (entry_price - add_price) * 0.5
                     if lock_stop < stop_level:
                         stop_level = lock_stop

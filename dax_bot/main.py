@@ -1260,6 +1260,13 @@ async def _monitor_cycle_inner():
 
             # Use actual fill price from stop order if available
             exit_price = await broker.get_fill_price(state.stop_order_id) or state.trailing_stop
+            # Ensure contracts_active reflects what was actually stopped
+            # (trade stream events may have already decremented it)
+            if state.contracts_active == 0:
+                state.contracts_active = 1 + len(state.add_positions)
+                logger.warning(f"contracts_active was 0 at stop processing — restored to {state.contracts_active}")
+            logger.info(f"Stop processing: exit={exit_price}, trailing_stop={state.trailing_stop}, "
+                        f"entry={state.entry_price}, contracts={state.contracts_active}, adds={len(state.add_positions)}")
             events = process_stop_hit(state, exit_price)
             logger.info(f"Stop hit: {events}")
 
