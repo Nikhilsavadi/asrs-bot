@@ -1366,6 +1366,17 @@ async def _monitor_cycle_inner():
             logger.info(f"Breakeven hit: stop → {state.entry_price}")
 
         if "TRAIL_UPDATED" in events:
+            # Update stop on ALL open positions (original + adds)
+            all_deal_ids = [state.stop_order_id]
+            for add in state.add_positions:
+                if isinstance(add, dict) and add.get("deal_id"):
+                    all_deal_ids.append(add["deal_id"])
+            for did in all_deal_ids:
+                try:
+                    await broker.modify_stop(did, state.trailing_stop)
+                except Exception:
+                    pass
+            # Verify at least the original stop was set
             success = await broker.modify_stop(state.stop_order_id, state.trailing_stop)
             if not success:
                 if not await _place_stop_with_retry(state):
@@ -1388,24 +1399,26 @@ async def _monitor_cycle_inner():
                         logger.error(f"Add-to-winners order FAILED: {add_result}")
                     else:
                         fill_price = add_result.get("avg_price", price)
+                        add_deal_id = add_result.get("order_id", "")
                         process_add_fill(state, fill_price)
 
-                        # Update stop order qty to include the new contract
-                        success = await broker.modify_stop_qty(
-                            state.stop_order_id, state.contracts_active
-                        )
-                        if not success:
-                            # Re-place stop with new qty
-                            await broker.cancel_order(state.stop_order_id)
-                            stop_action = "SELL" if state.direction == "LONG" else "BUY"
-                            result = await broker.place_stop_order(
-                                action=stop_action,
-                                qty=state.contracts_active,
-                                stop_price=state.trailing_stop,
-                            )
-                            if "order_id" in result:
-                                state.stop_order_id = result["order_id"]
-                                state.save()
+                        # Store deal_id on add position for multi-position stop management
+                        if state.add_positions:
+                            state.add_positions[-1]["deal_id"] = add_deal_id
+                            state.save()
+
+                        # Set stop on the NEW position (IG creates separate positions with force_open=True)
+                        try:
+                            await broker.modify_stop(add_deal_id, state.trailing_stop)
+                            logger.info(f"Add stop set on {add_deal_id} @ {state.trailing_stop}")
+                        except Exception as e:
+                            logger.error(f"Add stop FAILED on {add_deal_id}: {e}")
+
+                        # Also update stop on original position
+                        try:
+                            await broker.modify_stop(state.stop_order_id, state.trailing_stop)
+                        except Exception:
+                            pass
 
                         locked_pts = abs(state.entry_price - state.trailing_stop)
                         await alerts.send(
