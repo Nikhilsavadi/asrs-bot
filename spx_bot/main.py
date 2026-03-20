@@ -75,12 +75,61 @@ async def init(shared_session, stream_manager, tg_send=None):
     global broker, _tg_send, _shared_session
 
     broker = IGBroker(shared_session, stream_manager, config.IG_EPIC, "GBP")
+    broker.register_trigger_callback(on_tick_trigger)
     _tg_send = tg_send
     _shared_session = shared_session
     logger.info(f"US30 bot initialized: {config.IG_EPIC}")
 
 
 _shared_session = None
+
+
+async def on_tick_trigger(trigger: dict):
+    """Called instantly when a tick crosses bracket levels (sub-second).
+    Handles fill processing, stop placement, Telegram alert."""
+    state = US30DailyState.load()
+    if state.phase != Phase.ORDERS_PLACED:
+        return
+
+    direction = trigger["direction"]
+    fill_price = trigger["fill_price"]
+    order_id = trigger.get("order_id", "")
+
+    # Update state
+    state.phase = Phase.LONG_ACTIVE if direction == "LONG" else Phase.SHORT_ACTIVE
+    state.direction = direction
+    state.entry_price = fill_price
+    state.initial_stop = state.buy_level if direction == "SHORT" else state.sell_level
+    state.trailing_stop = state.initial_stop
+    state.contracts_active = state.position_size
+    state.entries_used += 1
+    state.stop_order_id = order_id
+    state.last_add_price = fill_price
+    state.trades.append({
+        "entry": fill_price,
+        "entry_intended": state.sell_level if direction == "SHORT" else state.buy_level,
+        "direction": direction,
+        "entry_time": datetime.now(config.TZ_ET).strftime("%H:%M:%S"),
+        "entry_slippage": round(abs(fill_price - (state.sell_level if direction == "SHORT" else state.buy_level)), 1),
+        "slippage_total": round(abs(fill_price - (state.sell_level if direction == "SHORT" else state.buy_level)), 1),
+    })
+    state.save()
+    logger.info(f"US30 tick trigger fill: {direction} @ {fill_price}")
+
+    # Place stop on IG
+    try:
+        await broker.modify_stop(order_id, state.trailing_stop)
+        logger.info(f"US30 stop set @ {state.trailing_stop}")
+    except Exception as e:
+        logger.error(f"US30 stop placement failed: {e}")
+
+    # Telegram alert
+    await _alert(
+        f"📈 <b>US30 {direction}</b>\n"
+        f"Entry: {fill_price}\n"
+        f"Stop: {state.trailing_stop}\n"
+        f"Range: {state.bar_range:.1f}pts ({state.range_flag})\n"
+    )
 
 
 async def health_check():

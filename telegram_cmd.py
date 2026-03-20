@@ -133,6 +133,26 @@ async def handle_status(dax_broker, **kwargs):
 
     pause_str = "PAUSED" if paused else "ACTIVE"
 
+    # US30 state
+    us30_phase = "N/A"
+    us30_pos = "FLAT"
+    us30_pnl = ""
+    us30_bars = 0
+    try:
+        from spx_bot.main import broker as us30_broker
+        from spx_bot.strategy import US30DailyState
+        us30_state = US30DailyState.load()
+        us30_phase = str(us30_state.phase)
+        if us30_state.direction:
+            us30_pos = f"{us30_state.direction} @ {us30_state.entry_price}"
+        if hasattr(us30_state, 'trades') and us30_state.trades:
+            total_us = sum(t.get("pnl_pts", 0) for t in us30_state.trades if isinstance(t.get("pnl_pts"), (int, float)))
+            us30_pnl = f"{'+' if total_us >= 0 else ''}{round(total_us, 1)} pts"
+        if us30_broker:
+            us30_bars = us30_broker.get_streaming_bar_count()
+    except Exception:
+        pass
+
     msg = (
         f"📊 <b>BOT STATUS</b> [{mode}]\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -144,6 +164,12 @@ async def handle_status(dax_broker, **kwargs):
         f"  Position: {dax_pos}\n"
         f"  Today P&L: {dax_pnl or 'N/A'}\n"
         f"  Streaming bars: {stream_bars}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>US30</b>\n"
+        f"  Phase: {us30_phase}\n"
+        f"  Position: {us30_pos}\n"
+        f"  Today P&L: {us30_pnl or 'N/A'}\n"
+        f"  Streaming bars: {us30_bars}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━"
     )
     await _send(msg)
