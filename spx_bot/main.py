@@ -99,7 +99,8 @@ async def on_tick_trigger(trigger: dict):
     state.phase = Phase.LONG_ACTIVE if direction == "LONG" else Phase.SHORT_ACTIVE
     state.direction = direction
     state.entry_price = fill_price
-    state.initial_stop = state.buy_level if direction == "SHORT" else state.sell_level
+    # Stop at the opposite side of the bar range (not the OCA bracket level which may be 999999)
+    state.initial_stop = state.bar_high + config.BUFFER_PTS if direction == "SHORT" else state.bar_low - config.BUFFER_PTS
     state.trailing_stop = state.initial_stop
     state.contracts_active = state.position_size
     state.entries_used += 1
