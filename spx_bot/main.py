@@ -362,6 +362,14 @@ async def monitor_cycle():
 
     try:
         if state.phase == Phase.ORDERS_PLACED:
+            # Re-arm bracket if lost (e.g. after restart)
+            pb = broker._pending_bracket
+            if not pb or not pb.get("active"):
+                logger.warning(f"US30: bracket lost — re-arming from state (buy={state.buy_level}, sell={state.sell_level})")
+                await broker.place_oca_bracket(
+                    state.buy_level, state.sell_level,
+                    qty=state.position_size, oca_group=state.oca_group
+                )
             # Check for trigger
             result = await broker.check_trigger_levels()
             if result:
