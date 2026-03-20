@@ -105,6 +105,24 @@ class DailyState:
     reentry_direction: str = ""        # LONG or SHORT — same as profitable exit
     reentry_price:     float = 0.0     # Exit price — re-enter if price resumes through here
 
+    # Session 2 (11:00 CET continuation)
+    s2_phase:          str = "IDLE"    # Independent phase for session 2
+    s2_bar_high:       float = 0.0
+    s2_bar_low:        float = 0.0
+    s2_bar_range:      float = 0.0
+    s2_buy_level:      float = 0.0
+    s2_sell_level:     float = 0.0
+    s2_direction:      str = ""
+    s2_entry_price:    float = 0.0
+    s2_initial_stop:   float = 0.0
+    s2_trailing_stop:  float = 0.0
+    s2_max_favourable: float = 0.0
+    s2_contracts_active: int = 0
+    s2_adds_used:      int = 0
+    s2_last_add_price: float = 0.0
+    s2_breakeven_hit:  bool = False
+    s2_entries_used:   int = 0
+
     # Trade log
     trades:            list = field(default_factory=list)
 

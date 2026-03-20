@@ -712,6 +712,122 @@ async def failsafe_check():
 
 
 
+async def session2_routine():
+    """10:00 UK (11:00 CET) — Session 2 continuation trade.
+
+    Uses bars 1-4 from 11:00-11:20 CET. Only trades in the same direction
+    as the morning trade (continuation bias). Independent state tracking.
+    """
+    if not config.SESSION2_ENABLED:
+        return
+    now = datetime.now(config.TZ_UK)
+    if now.weekday() >= 5:
+        return
+
+    state = DailyState.load()
+
+    # Only trade if morning had a direction (even if stopped out)
+    morning_dir = state.direction or state.reentry_direction
+    if not morning_dir and state.trades:
+        # Get direction from first trade
+        morning_dir = state.trades[0].get("direction", "")
+    if not morning_dir:
+        logger.info("Session 2: no morning direction — skipping")
+        return
+
+    # Skip if session 2 already processed
+    if state.s2_phase != "IDLE":
+        logger.info(f"Session 2: already processed (s2_phase={state.s2_phase})")
+        return
+
+    # Skip if daily loss limit hit
+    if _check_daily_loss_limit():
+        logger.info("Session 2: daily loss limit — skipping")
+        return
+
+    logger.info("═══ SESSION 2 ROUTINE (11:00 CET) ═══")
+
+    # Get streaming bars from 11:00 CET
+    s2_open_cet = datetime.now(config.TZ_CET).replace(hour=config.SESSION2_HOUR_CET, minute=0, second=0)
+    s2_bar4_cet = s2_open_cet.replace(minute=20)
+
+    df = broker.get_streaming_bars_df()
+    if df.empty:
+        logger.warning("Session 2: no streaming bars")
+        return
+
+    # Filter to session 2 bars (11:00-11:20 CET)
+    today_date = datetime.now(config.TZ_CET).date()
+    today = df[df.index.date == today_date]
+    s2_bars = today[(today.index.hour == config.SESSION2_HOUR_CET) & (today.index.minute < 20)]
+
+    if len(s2_bars) < config.SESSION2_BAR_COUNT:
+        logger.warning(f"Session 2: only {len(s2_bars)} bars, need {config.SESSION2_BAR_COUNT}")
+        return
+
+    s2_bar = s2_bars.iloc[config.SESSION2_BAR_COUNT - 1]
+    s2_high = s2_bar["High"] if "High" in s2_bar else s2_bar["high"]
+    s2_low = s2_bar["Low"] if "Low" in s2_bar else s2_bar["low"]
+    s2_range = s2_high - s2_low
+
+    if s2_range < 3 or s2_range > 100:
+        logger.info(f"Session 2: bar range {s2_range:.1f} out of bounds — skipping")
+        return
+
+    # Set levels
+    state.s2_bar_high = s2_high
+    state.s2_bar_low = s2_low
+    state.s2_bar_range = s2_range
+    state.s2_buy_level = s2_high + config.BUFFER_PTS
+    state.s2_sell_level = s2_low - config.BUFFER_PTS
+
+    # Use morning direction as bias (continuation only)
+    if morning_dir == "LONG" or morning_dir == "LONG_ACTIVE":
+        bias_dir = "LONG"
+        state.s2_buy_level = s2_high + config.BUFFER_PTS
+        state.s2_sell_level = 0.01  # Disable sell
+    else:
+        bias_dir = "SHORT"
+        state.s2_buy_level = 999999  # Disable buy
+        state.s2_sell_level = s2_low - config.BUFFER_PTS
+
+    state.s2_phase = "ORDERS_PLACED"
+    state.save()
+
+    logger.info(f"Session 2: Bar4 H={s2_high:.1f} L={s2_low:.1f} Range={s2_range:.1f}")
+    logger.info(f"Session 2: Bias={bias_dir} Buy={state.s2_buy_level} Sell={state.s2_sell_level}")
+
+    # Place bracket via secondary broker bracket
+    # Use the s2_ prefix in OCA group to distinguish from morning trade
+    qty = state.position_size or config.NUM_CONTRACTS
+    oca_group = f"S2_{datetime.now(config.TZ_UK).strftime('%Y-%m-%d')}"
+
+    if hasattr(broker, "place_oca_bracket_s2"):
+        await broker.place_oca_bracket_s2(state.s2_buy_level, state.s2_sell_level, qty, oca_group)
+    else:
+        # Use a secondary pending bracket stored separately
+        broker._pending_bracket_s2 = {
+            "buy_price": state.s2_buy_level,
+            "sell_price": state.s2_sell_level,
+            "qty": qty,
+            "oca_group": oca_group,
+            "active": True,
+        }
+
+    # Send Telegram alert
+    await alerts.send(
+        f"📊 <b>SESSION 2 ARMED</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Bar 4 (11:00 CET): H={s2_high:.1f} L={s2_low:.1f}\n"
+        f"Range: {s2_range:.1f}pts\n"
+        f"Direction: {bias_dir} only (continuation)\n"
+        f"Buy: {state.s2_buy_level:.1f} | Sell: {state.s2_sell_level:.1f}\n"
+        f"⏰ Active until 17:30 CET"
+    )
+
+    logger.info("Session 2: orders placed — routine complete")
+
+
 async def place_single_order(state: DailyState, direction: str):
     """Place only the buy-stop or sell-stop, not both.
     For IG spread bet, uses price-triggered approach (same as OCA bracket but one-sided).
@@ -1116,6 +1232,212 @@ async def _handle_fill_event(data):
         logger.error(f"Fill event handler error: {e}", exc_info=True)
 
 
+async def _monitor_s2():
+    """Session 2 monitoring — polled every minute from monitor_cycle.
+
+    Handles: entry detection, trailing stop, breakeven, exit detection.
+    Uses polling (not tick trigger) for simplicity and safety.
+    """
+    state = DailyState.load()
+    if state.s2_phase == "IDLE" or state.s2_phase == "DONE":
+        return
+
+    price = await broker.get_current_price()
+    if not price or price <= 0:
+        return
+
+    # ── Entry detection (ORDERS_PLACED) ──────────────────────────────
+    if state.s2_phase == "ORDERS_PLACED":
+        triggered = None
+        if state.s2_buy_level < 999999 and price >= state.s2_buy_level:
+            triggered = "LONG"
+        elif state.s2_sell_level > 0.02 and price <= state.s2_sell_level:
+            triggered = "SHORT"
+
+        if triggered:
+            # Check spread before entering
+            from shared.ig_session import IGSharedSession
+            session = IGSharedSession.get_instance()
+            if session and session.stream:
+                bid = session.stream.get_price_sync(config.IG_EPIC + "_bid") or 0
+                ofr = session.stream.get_price_sync(config.IG_EPIC + "_ofr") or 0
+                spread = ofr - bid if bid > 0 and ofr > 0 else 0
+                if spread > config.MAX_SPREAD_PTS:
+                    return  # Skip, spread too wide
+
+            action = "BUY" if triggered == "LONG" else "SELL"
+            qty = state.position_size or config.NUM_CONTRACTS
+            result = await broker.place_market_order(action, qty)
+
+            if "order_id" not in result:
+                logger.error(f"S2 entry FAILED: {result}")
+                state.s2_phase = "DONE"
+                state.save()
+                return
+
+            fill = result.get("avg_price", price)
+            deal_id = result.get("order_id", "")
+
+            state.s2_direction = triggered
+            state.s2_entry_price = fill
+            state.s2_phase = f"{triggered}_ACTIVE"
+            state.s2_contracts_active = qty
+            state.s2_entries_used = 1
+            state.s2_last_add_price = fill
+
+            # Set initial stop
+            if triggered == "LONG":
+                state.s2_initial_stop = state.s2_bar_low - config.BUFFER_PTS
+            else:
+                state.s2_initial_stop = state.s2_bar_high + config.BUFFER_PTS
+            state.s2_trailing_stop = state.s2_initial_stop
+
+            # Place stop on IG
+            try:
+                await broker.modify_stop(deal_id, state.s2_trailing_stop)
+            except Exception as e:
+                logger.error(f"S2 stop placement failed: {e}")
+
+            state.save()
+
+            slippage = abs(fill - (state.s2_buy_level if triggered == "LONG" else state.s2_sell_level))
+            await alerts.send(
+                f"📊 <b>S2 {triggered}</b> DAX\n"
+                f"Entry: {fill:.1f}\n"
+                f"Stop: {state.s2_trailing_stop:.1f}\n"
+                f"Range: {state.s2_bar_range:.1f}pts\n"
+                f"Slippage: {slippage:.1f}pts\n"
+                f"Session: S2 (11:00 CET)"
+            )
+            logger.info(f"S2 entry: {triggered} @ {fill}, stop={state.s2_trailing_stop}, deal={deal_id}")
+        return
+
+    # ── Active position management ───────────────────────────────────
+    if state.s2_phase in ("LONG_ACTIVE", "SHORT_ACTIVE"):
+        # Check if position still exists
+        pos = await broker.get_position()
+
+        # Detect exit: if morning trade is also active, we can't use get_position
+        # to distinguish. Use price vs trailing_stop instead.
+        s2_stopped = False
+        if state.s2_direction == "LONG" and price <= state.s2_trailing_stop:
+            s2_stopped = True
+        elif state.s2_direction == "SHORT" and price >= state.s2_trailing_stop:
+            s2_stopped = True
+
+        if s2_stopped:
+            exit_price = state.s2_trailing_stop
+            if state.s2_direction == "LONG":
+                pnl = exit_price - state.s2_entry_price
+            else:
+                pnl = state.s2_entry_price - exit_price
+
+            state.s2_phase = "DONE"
+            state.save()
+
+            stake = config.NUM_CONTRACTS
+            await alerts.send(
+                f"📊 <b>S2 EXIT</b> DAX {state.s2_direction}\n"
+                f"Entry: {state.s2_entry_price:.1f}\n"
+                f"Exit: {exit_price:.1f}\n"
+                f"P&L: {pnl:+.1f}pts\n"
+                f"MFE: {state.s2_max_favourable:.1f}pts"
+            )
+            logger.info(f"S2 exit: {pnl:+.1f}pts")
+
+            # Log to journal
+            trade_dict = {
+                "instrument": "DAX", "direction": state.s2_direction,
+                "entry": state.s2_entry_price, "exit": exit_price,
+                "pnl_pts": round(pnl, 1), "mfe": state.s2_max_favourable,
+                "exit_reason": "S2_TRAILED_STOP" if state.s2_breakeven_hit else "S2_INITIAL_STOP",
+                "session": "S2",
+            }
+            journal.append_trade(trade_dict, state)
+            return
+
+        # Update MFE
+        if state.s2_direction == "LONG":
+            unrealized = price - state.s2_entry_price
+        else:
+            unrealized = state.s2_entry_price - price
+        if unrealized > state.s2_max_favourable:
+            state.s2_max_favourable = unrealized
+
+        # Breakeven
+        risk = abs(state.s2_entry_price - state.s2_initial_stop)
+        if not state.s2_breakeven_hit and unrealized >= config.TRAIL_BREAKEVEN_PTS:
+            state.s2_breakeven_hit = True
+            state.s2_trailing_stop = state.s2_entry_price
+            state.save()
+            # Update stop on IG
+            pos_list = await _get_all_positions()
+            for p in pos_list:
+                if p.get("epic") == config.IG_EPIC and p.get("direction") == ("BUY" if state.s2_direction == "LONG" else "SELL"):
+                    try:
+                        await broker.modify_stop(p["dealId"], state.s2_trailing_stop)
+                    except Exception:
+                        pass
+            await alerts.send(f"📊 S2 BREAKEVEN — stop → {state.s2_entry_price:.1f}")
+            logger.info(f"S2 breakeven: stop → {state.s2_entry_price}")
+
+        # Candle trail
+        df = broker.get_streaming_bars_df()
+        if not df.empty:
+            today_date = datetime.now(config.TZ_CET).date()
+            today = df[df.index.date == today_date]
+            if len(today) >= 2:
+                prev_bar = today.iloc[-2]
+                prev_high = prev_bar["High"] if "High" in prev_bar else prev_bar.get("high", 0)
+                prev_low = prev_bar["Low"] if "Low" in prev_bar else prev_bar.get("low", 0)
+
+                # Tight trail after +100pts
+                use_tight = unrealized >= config.TRAIL_TIGHT_THRESHOLD
+                if state.s2_direction == "LONG":
+                    new_stop = prev_bar["Close"] if use_tight else prev_low
+                    if new_stop > state.s2_trailing_stop:
+                        old = state.s2_trailing_stop
+                        state.s2_trailing_stop = new_stop
+                        state.save()
+                        if abs(new_stop - old) >= config.TRAIL_MIN_MOVE:
+                            await alerts.send(
+                                f"📊 S2 TRAIL ↑ DAX LONG\n"
+                                f"Stop: {old:.1f} → {new_stop:.1f}\n"
+                                f"Entry: {state.s2_entry_price:.1f}\n"
+                                f"🔒 Profit locked: {new_stop - state.s2_entry_price:.1f}pts"
+                            )
+                else:
+                    new_stop = prev_bar["Close"] if use_tight else prev_high
+                    if new_stop < state.s2_trailing_stop:
+                        old = state.s2_trailing_stop
+                        state.s2_trailing_stop = new_stop
+                        state.save()
+                        if abs(new_stop - old) >= config.TRAIL_MIN_MOVE:
+                            await alerts.send(
+                                f"📊 S2 TRAIL ↓ DAX SHORT\n"
+                                f"Stop: {old:.1f} → {new_stop:.1f}\n"
+                                f"Entry: {state.s2_entry_price:.1f}\n"
+                                f"🔒 Profit locked: {state.s2_entry_price - new_stop:.1f}pts"
+                            )
+
+        state.save()
+
+
+async def _get_all_positions():
+    """Get all open positions from IG as a list of dicts."""
+    try:
+        from shared.ig_session import IGSharedSession
+        session = IGSharedSession.get_instance()
+        if session and session.ig:
+            positions = session.ig.fetch_open_positions()
+            if hasattr(positions, "to_dict"):
+                return positions.to_dict("records")
+            return positions if isinstance(positions, list) else []
+    except Exception:
+        pass
+    return []
+
+
 async def monitor_cycle():
     """Every 5 min — backup fill check + trail stops.
     When in ORDERS_PLACED phase on IG, polls price every 5s for fast entry detection.
@@ -1161,6 +1483,10 @@ async def monitor_cycle():
             return
 
         await _monitor_cycle_inner()
+
+        # Session 2 monitoring (independent of morning trade)
+        if config.SESSION2_ENABLED:
+            await _monitor_s2()
     except Exception as e:
         logger.error(f"Monitor cycle error: {e}", exc_info=True)
         state = DailyState.load()
@@ -1495,8 +1821,14 @@ async def end_of_day():
 
     await alerts.send(alerts.day_summary(state))
 
+    # Reset Session 2 state
+    if state.s2_phase not in ("IDLE", "DONE"):
+        state.s2_phase = "DONE"
+        logger.info("S2 position closed via EOD")
+
     global _bar4_triggered
     state.phase = Phase.DONE
+    state.s2_phase = "DONE"
     state.save()
     _bar4_triggered = False  # Reset for next trading day
     await broker.disconnect()

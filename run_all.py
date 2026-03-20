@@ -213,6 +213,11 @@ async def main():
         day_of_week="mon-fri", hour=8, minute=25,
         id="dax_failsafe", misfire_grace_time=120)
 
+    # Session 2: 10:21 UK = 11:21 CET (after bar 4 of session 2 closes at 11:20)
+    dax_scheduler.add_job(dax_main.session2_routine, "cron",
+        day_of_week="mon-fri", hour=10, minute=21,
+        id="dax_session2", misfire_grace_time=120)
+
     dax_scheduler.add_job(dax_main.monitor_cycle, "cron",
         day_of_week="mon-fri", hour="8-17", minute="*",
         id="dax_monitor", misfire_grace_time=30)
@@ -255,6 +260,12 @@ async def main():
         dax_scheduler.add_job(spx_main.monitor_cycle, "cron",
             day_of_week="mon-fri", hour="9-16", minute="*",
             id="spx_monitor", misfire_grace_time=30,
+            timezone=tz_et)
+
+        # US30 Session 2: 11:21 ET (after bar 4 of session 2 closes at 11:20)
+        dax_scheduler.add_job(spx_main.session2_routine, "cron",
+            day_of_week="mon-fri", hour=11, minute=21,
+            id="spx_session2", misfire_grace_time=120,
             timezone=tz_et)
 
         dax_scheduler.add_job(spx_main.end_of_day, "cron",

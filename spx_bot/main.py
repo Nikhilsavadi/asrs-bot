@@ -558,6 +558,220 @@ async def monitor_cycle():
         _strat.config = original_config
 
 
+async def session2_routine():
+    """11:21 ET — Session 2 continuation trade using bar 4 from 11:00-11:20 ET."""
+    if not getattr(config, 'SESSION2_ENABLED', False):
+        return
+    now = datetime.now(config.TZ_ET)
+    if now.weekday() >= 5:
+        return
+
+    state = US30DailyState.load()
+
+    # Get morning direction
+    morning_dir = state.direction or state.reentry_direction
+    if not morning_dir and state.trades:
+        morning_dir = state.trades[0].get("direction", "")
+    if not morning_dir:
+        logger.info("US30 S2: no morning direction — skipping")
+        return
+
+    if state.s2_phase != "IDLE":
+        logger.info(f"US30 S2: already processed (s2_phase={state.s2_phase})")
+        return
+
+    logger.info("═══ US30 SESSION 2 (11:00 ET) ═══")
+
+    # Get streaming bars from 11:00 ET
+    df = broker.get_streaming_bars_df()
+    if df.empty:
+        logger.warning("US30 S2: no streaming bars")
+        return
+
+    # Filter to 11:00-11:20 ET bars (in CET: 17:00-17:20 CET during EST, 16:00-16:20 during EDT)
+    from zoneinfo import ZoneInfo
+    cet = ZoneInfo("Europe/Berlin")
+    now_cet = datetime.now(cet)
+    # Convert 11:00 ET to CET
+    s2_start_et = now.replace(hour=config.SESSION2_HOUR_ET, minute=0, second=0)
+    s2_bar4_et = s2_start_et.replace(minute=20)
+
+    # Convert to CET for bar filtering (bars are stored in CET)
+    import pandas as pd
+    s2_start_cet = pd.Timestamp(s2_start_et).tz_convert(cet)
+    s2_bar4_cet = pd.Timestamp(s2_bar4_et).tz_convert(cet)
+
+    s2_bars = df[(df.index >= s2_start_cet) & (df.index < s2_bar4_cet)]
+
+    if len(s2_bars) < config.SESSION2_BAR_COUNT:
+        logger.warning(f"US30 S2: only {len(s2_bars)} bars, need {config.SESSION2_BAR_COUNT}")
+        return
+
+    s2_bar = s2_bars.iloc[config.SESSION2_BAR_COUNT - 1]
+    s2_high = s2_bar["High"]
+    s2_low = s2_bar["Low"]
+    s2_range = s2_high - s2_low
+
+    if s2_range < 5 or s2_range > 200:
+        logger.info(f"US30 S2: bar range {s2_range:.1f} out of bounds — skipping")
+        return
+
+    state.s2_bar_high = s2_high
+    state.s2_bar_low = s2_low
+    state.s2_bar_range = s2_range
+
+    # Continuation bias from morning
+    if morning_dir in ("LONG", "LONG_ACTIVE"):
+        state.s2_buy_level = s2_high + config.BUFFER_PTS
+        state.s2_sell_level = 0.01
+        bias_dir = "LONG"
+    else:
+        state.s2_buy_level = 999999
+        state.s2_sell_level = s2_low - config.BUFFER_PTS
+        bias_dir = "SHORT"
+
+    state.s2_phase = "ORDERS_PLACED"
+    state.save()
+
+    logger.info(f"US30 S2: Bar4 H={s2_high:.1f} L={s2_low:.1f} Range={s2_range:.1f} Bias={bias_dir}")
+
+    await _alert(
+        f"📊 <b>US30 SESSION 2 ARMED</b>\n"
+        f"Bar 4 (11:00 ET): H={s2_high:.1f} L={s2_low:.1f}\n"
+        f"Range: {s2_range:.1f}pts\n"
+        f"Direction: {bias_dir} (continuation)\n"
+        f"Buy: {state.s2_buy_level:.1f} | Sell: {state.s2_sell_level:.1f}"
+    )
+    logger.info("US30 S2: orders placed — routine complete")
+
+
+async def _monitor_s2():
+    """US30 Session 2 monitoring — polled every minute."""
+    state = US30DailyState.load()
+    if state.s2_phase in ("IDLE", "DONE"):
+        return
+
+    price = await broker.get_current_price()
+    if not price or price <= 0:
+        return
+
+    # Swap config for strategy calls
+    original_config = _strat.config
+    _strat.config = config
+
+    try:
+        if state.s2_phase == "ORDERS_PLACED":
+            # Check entry trigger
+            triggered = None
+            if state.s2_buy_level < 999999 and price >= state.s2_buy_level:
+                triggered = "LONG"
+            elif state.s2_sell_level > 0.02 and price <= state.s2_sell_level:
+                triggered = "SHORT"
+
+            if triggered:
+                action = "BUY" if triggered == "LONG" else "SELL"
+                qty = state.position_size or config.NUM_CONTRACTS
+                result = await broker.place_market_order(action, qty)
+
+                if "order_id" not in result:
+                    logger.error(f"US30 S2 entry FAILED: {result}")
+                    state.s2_phase = "DONE"
+                    state.save()
+                    return
+
+                fill = result.get("avg_price", price)
+                deal_id = result.get("order_id", "")
+
+                state.s2_direction = triggered
+                state.s2_entry_price = fill
+                state.s2_phase = f"{triggered}_ACTIVE"
+                state.s2_contracts_active = qty
+                state.s2_entries_used = 1
+                state.s2_last_add_price = fill
+
+                if triggered == "LONG":
+                    state.s2_initial_stop = state.s2_bar_low - config.BUFFER_PTS
+                else:
+                    state.s2_initial_stop = state.s2_bar_high + config.BUFFER_PTS
+                state.s2_trailing_stop = state.s2_initial_stop
+
+                try:
+                    await broker.modify_stop(deal_id, state.s2_trailing_stop)
+                except Exception as e:
+                    logger.error(f"US30 S2 stop failed: {e}")
+
+                state.save()
+                slippage = abs(fill - (state.s2_buy_level if triggered == "LONG" else state.s2_sell_level))
+                await _alert(
+                    f"📊 <b>US30 S2 {triggered}</b>\n"
+                    f"Entry: {fill:.1f}\n"
+                    f"Stop: {state.s2_trailing_stop:.1f}\n"
+                    f"Range: {state.s2_bar_range:.1f}pts\n"
+                    f"Slippage: {slippage:.1f}pts"
+                )
+            return
+
+        if state.s2_phase in ("LONG_ACTIVE", "SHORT_ACTIVE"):
+            # Check exit
+            s2_stopped = False
+            if state.s2_direction == "LONG" and price <= state.s2_trailing_stop:
+                s2_stopped = True
+            elif state.s2_direction == "SHORT" and price >= state.s2_trailing_stop:
+                s2_stopped = True
+
+            if s2_stopped:
+                exit_price = state.s2_trailing_stop
+                pnl = (exit_price - state.s2_entry_price) if state.s2_direction == "LONG" else (state.s2_entry_price - exit_price)
+                state.s2_phase = "DONE"
+                state.save()
+                await _alert(
+                    f"📊 <b>US30 S2 EXIT</b> {state.s2_direction}\n"
+                    f"Entry: {state.s2_entry_price:.1f} | Exit: {exit_price:.1f}\n"
+                    f"P&L: {pnl:+.1f}pts | MFE: {state.s2_max_favourable:.1f}pts"
+                )
+                return
+
+            # Update MFE
+            unrealized = (price - state.s2_entry_price) if state.s2_direction == "LONG" else (state.s2_entry_price - price)
+            if unrealized > state.s2_max_favourable:
+                state.s2_max_favourable = unrealized
+
+            # Breakeven
+            if not state.s2_breakeven_hit and unrealized >= config.TRAIL_BREAKEVEN_PTS:
+                state.s2_breakeven_hit = True
+                state.s2_trailing_stop = state.s2_entry_price
+                state.save()
+                await _alert(f"📊 US30 S2 BREAKEVEN — stop → {state.s2_entry_price:.1f}")
+
+            # Candle trail
+            df = broker.get_streaming_bars_df()
+            if not df.empty and len(df) >= 2:
+                prev_bar = df.iloc[-2]
+                use_tight = unrealized >= config.TRAIL_TIGHT_THRESHOLD
+                if state.s2_direction == "LONG":
+                    new_stop = prev_bar["Close"] if use_tight else prev_bar["Low"]
+                    if new_stop > state.s2_trailing_stop:
+                        old = state.s2_trailing_stop
+                        state.s2_trailing_stop = new_stop
+                        if abs(new_stop - old) >= config.TRAIL_MIN_MOVE:
+                            await _alert(f"📊 US30 S2 TRAIL ↑\nStop: {old:.1f} → {new_stop:.1f}\n🔒 Locked: {new_stop - state.s2_entry_price:.1f}pts")
+                else:
+                    new_stop = prev_bar["Close"] if use_tight else prev_bar["High"]
+                    if new_stop < state.s2_trailing_stop:
+                        old = state.s2_trailing_stop
+                        state.s2_trailing_stop = new_stop
+                        if abs(new_stop - old) >= config.TRAIL_MIN_MOVE:
+                            await _alert(f"📊 US30 S2 TRAIL ↓\nStop: {old:.1f} → {new_stop:.1f}\n🔒 Locked: {state.s2_entry_price - new_stop:.1f}pts")
+
+            state.save()
+    finally:
+        _strat.config = original_config
+
+    # Session 2 monitoring
+    if getattr(config, 'SESSION2_ENABLED', False):
+        await _monitor_s2()
+
+
 async def end_of_day():
     """16:05 ET — Close everything."""
     now = datetime.now(config.TZ_ET)
@@ -565,14 +779,15 @@ async def end_of_day():
         return
 
     state = US30DailyState.load()
-    if state.phase in (Phase.IDLE, Phase.DONE):
+    if state.phase in (Phase.IDLE, Phase.DONE) and state.s2_phase in ("IDLE", "DONE"):
         return
 
     logger.info("US30 end of day — closing positions")
     if state.phase in (Phase.LONG_ACTIVE, Phase.SHORT_ACTIVE):
         close_action = "SELL" if state.direction == "LONG" else "BUY"
         await broker.place_market_order(close_action, state.contracts_active)
-        await _alert("US30 END OF DAY — positions closed")
+        await _alert("US30 END OF DAY — S1 positions closed")
 
     state.phase = Phase.DONE
+    state.s2_phase = "DONE"
     state.save()

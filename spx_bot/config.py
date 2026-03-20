@@ -76,5 +76,10 @@ RISK_GBP   = float(os.getenv("US30_RISK_PER_TRADE_GBP", "25"))
 MORNING_HOUR   = 9
 MORNING_MINUTE = 51
 
+# ── Session 2 (11:00 ET continuation) ──────────────────────────────────────
+SESSION2_ENABLED   = os.getenv("US30_SESSION2_ENABLED", "true").lower() == "true"
+SESSION2_HOUR_ET   = 11   # 11:00 ET
+SESSION2_BAR_COUNT = 4    # Use bar 4 of session 2 (11:00-11:20 ET)
+
 # ── State ────────────────────────────────────────────────────────────────────
 STATE_FILE = os.getenv("US30_STATE_FILE", "data/us30_daily_state.json")

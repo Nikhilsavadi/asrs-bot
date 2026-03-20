@@ -87,6 +87,11 @@ RISK_GBP   = float(os.getenv("RISK_PER_TRADE_GBP", "100"))
 # the streaming candle 1 minute to arrive. Failsafe retry at 08:25.
 MORNING_HOUR   = 8
 MORNING_MINUTE = 21
+
+# ── Session 2 (11:00 CET continuation) ──────────────────────────────────────
+SESSION2_ENABLED   = os.getenv("SESSION2_ENABLED", "true").lower() == "true"
+SESSION2_HOUR_CET  = 11   # 11:00 CET = 10:00 UK
+SESSION2_BAR_COUNT = 4    # Use bar 4 of session 2 (11:00-11:20 CET)
 MONITOR_START  = "08:21"
 MONITOR_END    = "17:30"
 SUMMARY_HOUR   = 17
