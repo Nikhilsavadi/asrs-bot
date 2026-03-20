@@ -574,6 +574,11 @@ async def morning_routine():
             from shared.ig_session import IGSharedSession
             session = IGSharedSession.get_instance()
             if session and session.ig:
+                # Ensure session is fresh before historical data call
+                try:
+                    await session.keepalive()
+                except Exception:
+                    pass
                 spx_prices = session.ig.fetch_historical_prices_by_epic_and_num_points(
                     config.SPX_EPIC, "DAY", 2
                 )

@@ -275,39 +275,8 @@ async def morning_routine():
 
     today_date = now.date()
 
-    # Gap direction
-    try:
-        prev_df = await broker.get_5min_bars("2 D")
-        if not prev_df.empty:
-            prev_day = prev_df[prev_df.index.date < today_date]
-            today_bars = df[df.index.date == today_date]
-            if not prev_day.empty and not today_bars.empty:
-                gap_dir, gap_size = classify_gap(prev_day["Close"].iloc[-1], today_bars["Open"].iloc[0])
-                state.gap_dir = gap_dir
-                state.gap_size = gap_size
-                logger.info(f"Gap: {gap_dir} ({gap_size:+.1f})")
-    except Exception as e:
-        logger.warning(f"Gap computation failed: {e}")
-
-    # Overnight range
-    overnight_result = OvernightResult()
-    try:
-        overnight_df = await broker.get_overnight_bars()
-        today_bars = df[df.index.date == today_date]
-        bar4_temp = get_bar(today_bars, 4) if not today_bars.empty else None
-        if bar4_temp:
-            overnight_result = calculate_overnight_range(
-                overnight_df, bar4_temp["high"], bar4_temp["low"]
-            )
-    except Exception as e:
-        logger.warning(f"Overnight range failed: {e}")
-
-    state.overnight_high = overnight_result.range_high
-    state.overnight_low = overnight_result.range_low
-    state.overnight_range = overnight_result.range_size
-    state.overnight_bias = overnight_result.bias.value
-    state.save()
-
+    # FAST PATH: Get bar 4 from streaming FIRST, arm bracket immediately
+    # Gap and overnight are done AFTER bracket is armed
     # Calculate levels directly — streaming bars are in CET, US open is 14:30 CET
     # We can't use DAX's candle_number() which is hardcoded to 09:00 CET
     from zoneinfo import ZoneInfo
@@ -369,6 +338,70 @@ async def morning_routine():
         state.position_size = min(config.NUM_CONTRACTS * config.NARROW_STD_MULTIPLIER, config.MAX_CONTRACTS)
     state.save()
 
+    # ARM BRACKET IMMEDIATELY (both sides) — speed is critical at US open
+    qty = min(config.NUM_CONTRACTS, config.MAX_CONTRACTS)
+    state.position_size = qty
+    result = await broker.place_oca_bracket(
+        buy_price=state.buy_level, sell_price=state.sell_level,
+        qty=qty, oca_group=f"US30_{state.date}_1",
+    )
+
+    if "error" not in result:
+        state.buy_order_id = result.get("buy_order_id", "")
+        state.sell_order_id = result.get("sell_order_id", "")
+        state.phase = Phase.ORDERS_PLACED
+        state.oca_group = f"US30_{state.date}_1"
+        state.save()
+        logger.info(f"Bracket armed: Buy={state.buy_level} Sell={state.sell_level}")
+    else:
+        await _alert(f"US30 ORDER FAILED: {result['error']}")
+        return
+
+    # NOW do slow REST calls for gap + overnight (bracket is already live)
+    overnight_result = OvernightResult()
+    try:
+        prev_df = await broker.get_5min_bars("2 D")
+        if not prev_df.empty:
+            prev_day = prev_df[prev_df.index.date < today_date]
+            today_bars = df[df.index.date == today_date]
+            if not prev_day.empty and not today_bars.empty:
+                gap_dir, gap_size = classify_gap(prev_day["Close"].iloc[-1], today_bars["Open"].iloc[0])
+                state.gap_dir = gap_dir
+                state.gap_size = gap_size
+                logger.info(f"Gap: {gap_dir} ({gap_size:+.1f})")
+    except Exception as e:
+        logger.warning(f"Gap computation failed: {e}")
+
+    # For US30, "overnight" = pre-market bars before 14:30 CET (from streaming)
+    # These are bars from when IG starts quoting US30 (~08:00 CET) to US open
+    try:
+        from zoneinfo import ZoneInfo
+        cet = ZoneInfo("Europe/Berlin")
+        pre_market = df[df.index < now_cet.replace(hour=14, minute=30)]
+        if not pre_market.empty:
+            overnight_result = calculate_overnight_range(
+                pre_market, state.bar_high, state.bar_low
+            )
+            logger.info(f"US30 pre-market range: {overnight_result.range_high:.1f}-{overnight_result.range_low:.1f}, bias={overnight_result.bias.value}")
+    except Exception as e:
+        logger.warning(f"Pre-market range failed: {e}")
+
+    state.overnight_high = overnight_result.range_high
+    state.overnight_low = overnight_result.range_low
+    state.overnight_range = overnight_result.range_size
+    state.overnight_bias = overnight_result.bias.value
+
+    # Apply bias filter: narrow to one side if bias is clear
+    bias = overnight_result.bias
+    if bias == OvernightBias.LONG_ONLY:
+        logger.info("V58 bias: LONG ONLY — disabling sell side")
+        broker._pending_bracket["sell_price"] = 0.01
+    elif bias == OvernightBias.SHORT_ONLY:
+        logger.info("V58 bias: SHORT ONLY — disabling buy side")
+        broker._pending_bracket["buy_price"] = 999999.0
+
+    state.save()
+
     # Send signal
     await _alert(
         f"<b>US30 ASRS Signal</b>\n"
@@ -378,35 +411,7 @@ async def morning_routine():
         f"Bias: {state.overnight_bias}\n"
         f"Contracts: {state.position_size}"
     )
-
-    # Place orders
-    bias = overnight_result.bias
-    qty = state.position_size
-
-    # One-sided based on bias
-    if bias == OvernightBias.LONG_ONLY:
-        buy_price = state.buy_level
-        sell_price = 0.01  # Unreachable
-    elif bias == OvernightBias.SHORT_ONLY:
-        buy_price = 999999.0
-        sell_price = state.sell_level
-    else:
-        buy_price = state.buy_level
-        sell_price = state.sell_level
-
-    result = await broker.place_oca_bracket(
-        buy_price=buy_price, sell_price=sell_price,
-        qty=qty, oca_group=f"US30_{state.date}_1",
-    )
-
-    if "error" not in result:
-        state.buy_order_id = result.get("buy_order_id", "")
-        state.sell_order_id = result.get("sell_order_id", "")
-        state.phase = Phase.ORDERS_PLACED
-        state.save()
-        logger.info("Orders placed — US30 morning routine complete")
-    else:
-        await _alert(f"US30 ORDER FAILED: {result['error']}")
+    logger.info("Orders placed — US30 morning routine complete")
 
 
 async def monitor_cycle():
@@ -458,6 +463,19 @@ async def monitor_cycle():
             pos = await broker.get_position()
             if pos and pos["direction"] == "FLAT" and state.contracts_active > 0:
                 exit_price = await broker.get_fill_price(state.stop_order_id) or state.trailing_stop
+
+                # Detect manual close: if current price is far from trailing_stop,
+                # someone closed manually (not a stop hit)
+                current_price = await broker.get_current_price() or exit_price
+                if state.direction == "LONG":
+                    stop_distance = abs(current_price - state.trailing_stop)
+                else:
+                    stop_distance = abs(current_price - state.trailing_stop)
+                manual_close = stop_distance > state.bar_range * 0.5
+                if manual_close:
+                    logger.warning(f"US30: position closed far from trail stop ({current_price} vs {state.trailing_stop}) — likely manual close")
+                    exit_price = current_price
+
                 # Ensure contracts_active reflects what was actually stopped
                 if state.contracts_active == 0:
                     state.contracts_active = 1 + len(state.add_positions)
@@ -465,11 +483,13 @@ async def monitor_cycle():
                 logger.info(f"US30 stop processing: exit={exit_price}, trailing_stop={state.trailing_stop}, "
                             f"entry={state.entry_price}, contracts={state.contracts_active}, adds={len(state.add_positions)}")
                 events = process_stop_hit(state, exit_price)
-                logger.info(f"US30 stop hit: {events}")
+                if manual_close:
+                    state.trades[-1]["exit_reason"] = "MANUAL_CLOSE"
+                logger.info(f"US30 stop hit: {events}{' (MANUAL)' if manual_close else ''}")
 
                 trade = state.trades[-1] if state.trades else {}
                 await _alert(
-                    f"<b>US30 EXIT</b>\n"
+                    f"<b>US30 EXIT</b>{' (MANUAL)' if manual_close else ''}\n"
                     f"Direction: {trade.get('direction', '?')}\n"
                     f"Entry: {trade.get('entry', '?')} | Exit: {exit_price}\n"
                     f"PnL: {trade.get('pnl_pts', 0):.1f} pts\n"
@@ -477,8 +497,12 @@ async def monitor_cycle():
                     f"Reason: {trade.get('exit_reason', '?')}"
                 )
 
-                # Re-entry on profitable trail
-                if "CAN_REENTER" in events:
+                # Re-entry: skip on manual close
+                if manual_close:
+                    state.phase = Phase.DONE
+                    state.save()
+                    logger.info("US30: skipping re-entry after manual close")
+                elif "CAN_REENTER" in events:
                     if state.reentry_direction == "LONG":
                         state.buy_level = state.reentry_price
                         state.sell_level = 0.01
