@@ -153,23 +153,45 @@ async def handle_status(dax_broker, **kwargs):
     except Exception:
         pass
 
+    # S2 phases
+    dax_s2_phase = "N/A"
+    dax_s2_pos = ""
+    us30_s2_phase = "N/A"
+    us30_s2_pos = ""
+    if dax_state:
+        dax_s2_phase = getattr(dax_state, 's2_phase', 'IDLE')
+        if getattr(dax_state, 's2_direction', ''):
+            dax_s2_pos = f" | {dax_state.s2_direction} @ {dax_state.s2_entry_price}"
+    try:
+        us30_state_s2 = us30_state if 'us30_state' in dir() else None
+        if us30_state_s2:
+            us30_s2_phase = getattr(us30_state_s2, 's2_phase', 'IDLE')
+            if getattr(us30_state_s2, 's2_direction', ''):
+                us30_s2_pos = f" | {us30_state_s2.s2_direction} @ {us30_state_s2.s2_entry_price}"
+    except Exception:
+        pass
+
     msg = (
         f"📊 <b>BOT STATUS</b> [{mode}]\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🕐 {now.strftime('%Y-%m-%d %H:%M')} UK\n"
         f"🔄 Trading: <b>{pause_str}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>DAX</b>\n"
+        f"<b>DAX S1</b>\n"
         f"  IG: {'✅' if dax_ok else '❌'} | Phase: {dax_phase}\n"
         f"  Position: {dax_pos}\n"
         f"  Today P&L: {dax_pnl or 'N/A'}\n"
         f"  Streaming bars: {stream_bars}\n"
+        f"<b>DAX S2</b> (11:00 CET)\n"
+        f"  Phase: {dax_s2_phase}{dax_s2_pos}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>US30</b>\n"
+        f"<b>US30 S1</b>\n"
         f"  Phase: {us30_phase}\n"
         f"  Position: {us30_pos}\n"
         f"  Today P&L: {us30_pnl or 'N/A'}\n"
         f"  Streaming bars: {us30_bars}\n"
+        f"<b>US30 S2</b> (11:00 ET)\n"
+        f"  Phase: {us30_s2_phase}{us30_s2_pos}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━"
     )
     await _send(msg)

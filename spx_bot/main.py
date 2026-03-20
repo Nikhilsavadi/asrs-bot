@@ -791,3 +791,31 @@ async def end_of_day():
     state.phase = Phase.DONE
     state.s2_phase = "DONE"
     state.save()
+
+    # Combined daily summary (US30 EOD fires last — include DAX)
+    try:
+        from dax_bot.strategy import DailyState as DaxState
+        dax_state = DaxState.load()
+        dax_trades = dax_state.trades if dax_state else []
+        dax_pnl = sum(t.get("pnl_pts", 0) for t in dax_trades)
+        us30_trades = state.trades if state else []
+        us30_pnl = sum(t.get("pnl_pts", 0) for t in us30_trades)
+        total_pnl = dax_pnl + us30_pnl
+        total_trades = len(dax_trades) + len(us30_trades)
+        icon = "🟢" if total_pnl >= 0 else "🔴"
+        sign = "+" if total_pnl >= 0 else ""
+
+        await _alert(
+            f"📊 <b>DAILY SUMMARY</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📅 {state.date}\n"
+            f"{icon} Net: <b>{sign}{round(total_pnl, 1)} pts</b> ({total_trades} trades)\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"DAX S1: {len(dax_trades)} trades, {'+' if dax_pnl >= 0 else ''}{round(dax_pnl, 1)}pts\n"
+            f"DAX S2: {dax_state.s2_phase if dax_state else 'N/A'}\n"
+            f"US30 S1: {len(us30_trades)} trades, {'+' if us30_pnl >= 0 else ''}{round(us30_pnl, 1)}pts\n"
+            f"US30 S2: {state.s2_phase}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━"
+        )
+    except Exception as e:
+        logger.warning(f"Combined summary failed: {e}")
