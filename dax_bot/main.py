@@ -48,6 +48,9 @@ scheduler = AsyncIOScheduler(timezone=config.TZ_UK)
 # Overnight bar cache — populated by hourly job, consumed by morning_routine
 _overnight_bars_cache = {"date": "", "bars": []}
 
+# Trade stream exit levels — used when IG stop fires server-side and /confirms returns 404
+_last_stream_exit_levels: dict[str, float] = {}
+
 
 async def _check_slippage(state: DailyState, fill_price: float) -> bool:
     """Check if fill slipped too far from trigger level. Returns True if OK, False if excessive."""
@@ -485,6 +488,12 @@ async def morning_routine():
     now = datetime.now(config.TZ_UK)
     if now.weekday() >= 5:
         logger.info("Weekend — skipping")
+        return
+
+    from shared.holidays import is_holiday
+    if is_holiday(now.date(), "DAX"):
+        logger.info(f"Market holiday ({now.date()}) — skipping")
+        await alerts.send(f"📅 DAX market holiday today — no trading")
         return
 
     # Check if trading is paused via Telegram command
@@ -1106,6 +1115,12 @@ async def _handle_fill_event(data):
     # Log all trade events for debugging
     logger.info(f"[DAX] Trade stream event: dealId={deal_id} status={deal_status} "
                 f"direction={direction} level={level}")
+
+    # Store last stream exit level for accurate PnL when IG stop fires
+    # (get_fill_price via /confirms returns 404 for IG server-side stops)
+    if level and float(level) > 0:
+        _last_stream_exit_levels[deal_id] = float(level)
+
     return
     state = DailyState.load()
 
@@ -1589,8 +1604,18 @@ async def _monitor_cycle_inner():
                 if not state.tp2_filled and state.tp2_order_id:
                     await broker.cancel_order(state.tp2_order_id)
 
-            # Use actual fill price from stop order if available
-            exit_price = await broker.get_fill_price(state.stop_order_id) or state.trailing_stop
+            # Use actual fill price: try /confirms first, then trade stream level, then trailing_stop
+            exit_price = await broker.get_fill_price(state.stop_order_id)
+            if not exit_price:
+                # IG server-side stop: /confirms returns 404. Use trade stream level.
+                for did in list(_last_stream_exit_levels.keys()):
+                    exit_price = _last_stream_exit_levels.pop(did, None)
+                    if exit_price:
+                        logger.info(f"Using trade stream exit level: {exit_price} (deal {did})")
+                        break
+            if not exit_price:
+                exit_price = state.trailing_stop
+                logger.warning(f"No fill price found — using trailing_stop: {exit_price}")
             # Ensure contracts_active reflects what was actually stopped
             # (trade stream events may have already decremented it)
             if state.contracts_active == 0:

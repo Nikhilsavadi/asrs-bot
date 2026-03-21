@@ -82,6 +82,7 @@ async def init(shared_session, stream_manager, tg_send=None):
 
 
 _shared_session = None
+_prefetch_cache: dict = {}  # Pre-fetched data from warmup (gap, overnight bars)
 
 
 async def on_tick_trigger(trigger: dict):
@@ -212,6 +213,15 @@ async def pre_trade_warmup():
     bar_count = broker.get_streaming_bar_count() if broker else 0
     logger.info(f"Pre-warm: {bar_count} streaming bars")
 
+    # Pre-fetch gap and overnight data (cached for morning routine)
+    try:
+        prev_df = await broker.get_5min_bars("2 D")
+        if not prev_df.empty:
+            _prefetch_cache["prev_df"] = prev_df
+            logger.info(f"Pre-warm: cached {len(prev_df)} bars for gap/overnight")
+    except Exception as e:
+        logger.warning(f"Pre-warm: bar pre-fetch failed: {e}")
+
     if issues:
         await _alert(
             "<b>Pre-trade warmup</b>\n"
@@ -249,6 +259,12 @@ async def morning_routine():
     """09:51 ET — Calculate levels from bar 4/5 and place orders."""
     now = datetime.now(config.TZ_ET)
     if now.weekday() >= 5:
+        return
+
+    from shared.holidays import is_holiday
+    if is_holiday(now.date(), "US30"):
+        logger.info(f"US30 market holiday ({now.date()}) — skipping")
+        await _alert(f"📅 US30 market holiday today — no trading")
         return
 
     logger.info("═══ US30 MORNING ROUTINE ═══")
@@ -357,10 +373,14 @@ async def morning_routine():
         await _alert(f"US30 ORDER FAILED: {result['error']}")
         return
 
-    # NOW do slow REST calls for gap + overnight (bracket is already live)
+    # Use pre-fetched data from warmup if available, else do REST call
     overnight_result = OvernightResult()
     try:
-        prev_df = await broker.get_5min_bars("2 D")
+        prev_df = _prefetch_cache.pop("prev_df", None)
+        if prev_df is None:
+            prev_df = await broker.get_5min_bars("2 D")
+        else:
+            logger.info("Using pre-fetched bars from warmup (fast path)")
         if not prev_df.empty:
             prev_day = prev_df[prev_df.index.date < today_date]
             today_bars = df[df.index.date == today_date]
@@ -462,7 +482,10 @@ async def monitor_cycle():
             # Check if stopped out
             pos = await broker.get_position()
             if pos and pos["direction"] == "FLAT" and state.contracts_active > 0:
-                exit_price = await broker.get_fill_price(state.stop_order_id) or state.trailing_stop
+                exit_price = await broker.get_fill_price(state.stop_order_id)
+                if not exit_price:
+                    exit_price = state.trailing_stop
+                    logger.info(f"US30: /confirms failed — using trailing_stop as exit: {exit_price}")
 
                 # Detect manual close: if current price is far from trailing_stop,
                 # someone closed manually (not a stop hit)

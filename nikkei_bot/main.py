@@ -251,6 +251,12 @@ async def morning_routine():
     if now.weekday() >= 5:
         return
 
+    from shared.holidays import is_holiday
+    if is_holiday(now.date(), "NIKKEI"):
+        logger.info(f"Nikkei market holiday ({now.date()}) — skipping")
+        await _alert(f"📅 Nikkei market holiday today — no trading")
+        return
+
     logger.info("═══ NIKKEI MORNING ROUTINE ═══")
     state = NikkeiDailyState.load()
     if state.phase != Phase.IDLE:
