@@ -378,13 +378,17 @@ class IGBroker:
 
         try:
             direction = "BUY" if action == "BUY" else "SELL"
+            # Disaster stop: wide server-side stop as safety net if bot crashes
+            # Bot's tick-based trail will tighten this, but this protects if bot dies
+            disaster_distance = getattr(config, 'DISASTER_STOP_PTS', 200)
+
             result = await self._shared.rest_call(
                 self._shared.ig.create_open_position,
                 currency_code=self.currency, direction=direction,
                 epic=self.epic, expiry="DFB", force_open=True,
                 guaranteed_stop=False, level=None, limit_distance=None,
                 limit_level=None, order_type="MARKET", quote_id=None,
-                size=qty, stop_distance=None, stop_level=None,
+                size=qty, stop_distance=disaster_distance, stop_level=None,
                 trailing_stop=False, trailing_stop_increment=None,
             )
 
