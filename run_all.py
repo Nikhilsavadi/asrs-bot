@@ -143,6 +143,30 @@ async def main():
         except Exception as e:
             logger.error("Strategy 3 (US30) init failed: %s", e, exc_info=True)
 
+    # ══════════════════════════════════════════════════════════════
+    # STRATEGY 4: Nikkei 225 ASRS (scheduler-driven, Tokyo hours)
+    # Same ASRS rules as DAX, adapted for Nikkei price scale.
+    # TSE: 09:00-15:00 JST = 00:00-06:00 UTC
+    # ══════════════════════════════════════════════════════════════
+    nikkei_main = None
+    enable_nikkei = os.getenv("ENABLE_NIKKEI", "true").lower() == "true"
+
+    if enable_nikkei:
+        try:
+            import nikkei_bot.config as nikkei_config
+            import nikkei_bot.main as _nikkei_main
+
+            # Subscribe to Nikkei streaming
+            await stream_mgr.subscribe_ticks(nikkei_config.IG_EPIC)
+            await stream_mgr.subscribe_candles(nikkei_config.IG_EPIC)
+
+            # Initialize Nikkei bot
+            await _nikkei_main.init(shared, stream_mgr, tg_send=telegram_cmd._send)
+            nikkei_main = _nikkei_main
+            logger.info("Strategy 4 (Nikkei ASRS) initialized")
+        except Exception as e:
+            logger.error("Strategy 4 (Nikkei) init failed: %s", e, exc_info=True)
+
     # ── Graceful shutdown ─────────────────────────────────────────
     dax_scheduler = AsyncIOScheduler(timezone=dax_config.TZ_UK)
     dax_main.scheduler = dax_scheduler
@@ -273,6 +297,28 @@ async def main():
             id="spx_eod", misfire_grace_time=120,
             timezone=tz_et)
 
+    # ── Nikkei schedule (all times UTC; TSE 09:00-15:00 JST = 00:00-06:00 UTC) ──
+    if nikkei_main is not None:
+        dax_scheduler.add_job(nikkei_main.health_check, "cron",
+            day_of_week="mon-fri", hour=0, minute=0,
+            id="nikkei_health", misfire_grace_time=120)
+
+        dax_scheduler.add_job(nikkei_main.pre_trade_warmup, "cron",
+            day_of_week="mon-fri", hour=0, minute=10,
+            id="nikkei_prewarm", misfire_grace_time=120)
+
+        dax_scheduler.add_job(nikkei_main.morning_routine, "cron",
+            day_of_week="mon-fri", hour=0, minute=21,
+            id="nikkei_morning", misfire_grace_time=120)
+
+        dax_scheduler.add_job(nikkei_main.monitor_cycle, "cron",
+            day_of_week="mon-fri", hour="0-6", minute="*",
+            id="nikkei_monitor", misfire_grace_time=30)
+
+        dax_scheduler.add_job(nikkei_main.end_of_day, "cron",
+            day_of_week="mon-fri", hour=6, minute=5,
+            id="nikkei_eod", misfire_grace_time=120)
+
     # ── Session keepalive every 10 minutes ────────────────────────
     async def keepalive_with_stream_check():
         await shared.keepalive()
@@ -320,27 +366,33 @@ async def main():
     if spx_main is not None:
         us30_str = f"ASRS bar4/5 ({spx_main.config.IG_EPIC})"
 
-    # ── Startup alert via Telegram (single combined message) ──
-    await send_startup_alert(telegram_cmd._send, gold_str=gold_str, spx_str=us30_str)
+    nikkei_str = "disabled"
+    if nikkei_main is not None:
+        nikkei_str = f"ASRS bar4/5 ({nikkei_main.config.IG_EPIC})"
 
-    logger.info("Bot started: DAX=%s, S3 ORB=%s, US30=%s, mode=%s",
-                dax_config.IG_EPIC, gold_str, us30_str, ig_mode)
+    # ── Startup alert via Telegram (single combined message) ──
+    await send_startup_alert(telegram_cmd._send, gold_str=gold_str, spx_str=us30_str, nikkei_str=nikkei_str)
+
+    logger.info("Bot started: DAX=%s, S3 ORB=%s, US30=%s, Nikkei=%s, mode=%s",
+                dax_config.IG_EPIC, gold_str, us30_str, nikkei_str, ig_mode)
 
     print("")
-    print("=" * 52)
-    print("  ASRS Trading Bot (DAX + US30)")
+    print("=" * 56)
+    print("  ASRS Trading Bot (DAX + US30 + Nikkei)")
     print("  IG Markets - Streaming Edition")
-    print("=" * 52)
-    print("  Broker:     IG %s" % ig_mode)
-    print("  S1 DAX:     %s" % dax_config.IG_EPIC)
-    print("  S3 US30:    %s" % us30_str)
-    print("  Telegram:   Commands active")
-    print("-" * 52)
-    print("  DAX:  08:21 Morning -> 17:35 EOD (UK time)")
-    print("  Gold: 07:00-09:00 London, 13:30-15:30 US (UTC)")
-    print("  EUR:  07:00-12:00 London, 12:00-15:00 US (UTC)")
+    print("=" * 56)
+    print("  Broker:      IG %s" % ig_mode)
+    print("  S1 DAX:      %s" % dax_config.IG_EPIC)
+    print("  S3 US30:     %s" % us30_str)
+    print("  S4 Nikkei:   %s" % nikkei_str)
+    print("  Telegram:    Commands active")
+    print("-" * 56)
+    print("  DAX:    08:21 Morning -> 17:35 EOD (UK time)")
+    print("  Gold:   07:00-09:00 London, 13:30-15:30 US (UTC)")
+    print("  EUR:    07:00-12:00 London, 12:00-15:00 US (UTC)")
+    print("  Nikkei: 00:21 Morning -> 06:05 EOD (UTC)")
     print("  Every 10m: Keepalive (REST + stream)")
-    print("=" * 52)
+    print("=" * 56)
     print("")
 
     try:

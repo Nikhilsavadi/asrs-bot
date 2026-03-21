@@ -89,6 +89,111 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_trades_date ON trades(date);
         CREATE INDEX IF NOT EXISTS idx_trades_instrument ON trades(instrument);
     """)
+
+    # ── Extended columns for AI analysis (added via ALTER TABLE) ──
+    extended_cols = [
+        # Market context at entry
+        ("signal_type", "TEXT DEFAULT ''"),        # BRACKET, REENTRY, S2
+        ("session", "TEXT DEFAULT ''"),            # S1, S2
+        ("spx_regime", "TEXT DEFAULT ''"),         # UP, DOWN, FLAT
+        ("overnight_high", "REAL DEFAULT 0"),
+        ("overnight_low", "REAL DEFAULT 0"),
+        ("overnight_range", "REAL DEFAULT 0"),
+        ("prev_day_close", "REAL DEFAULT 0"),
+        ("gap_pts", "REAL DEFAULT 0"),
+        ("gap_pct", "REAL DEFAULT 0"),
+        # Bar data at signal time
+        ("bar4_open", "REAL DEFAULT 0"),
+        ("bar4_high", "REAL DEFAULT 0"),
+        ("bar4_low", "REAL DEFAULT 0"),
+        ("bar4_close", "REAL DEFAULT 0"),
+        ("bar4_body_pct", "REAL DEFAULT 0"),       # abs(close-open)/range
+        ("bar4_upper_wick_pct", "REAL DEFAULT 0"),
+        ("bar4_lower_wick_pct", "REAL DEFAULT 0"),
+        # Trade execution detail
+        ("entry_spread", "REAL DEFAULT 0"),         # bid-offer spread at entry
+        ("exit_spread", "REAL DEFAULT 0"),
+        ("time_in_trade_mins", "REAL DEFAULT 0"),
+        ("bars_in_trade", "INTEGER DEFAULT 0"),
+        # Price action during trade
+        ("mae", "REAL DEFAULT 0"),                  # Max Adverse Excursion
+        ("mfe_time_mins", "REAL DEFAULT 0"),        # Time to reach MFE
+        ("breakeven_hit", "INTEGER DEFAULT 0"),
+        ("breakeven_time_mins", "REAL DEFAULT 0"),
+        # Adds detail
+        ("add1_price", "REAL DEFAULT 0"),
+        ("add1_time", "TEXT DEFAULT ''"),
+        ("add2_price", "REAL DEFAULT 0"),
+        ("add2_time", "TEXT DEFAULT ''"),
+        # Market conditions
+        ("day_of_week", "INTEGER DEFAULT 0"),       # 0=Mon, 4=Fri
+        ("hour_of_entry", "INTEGER DEFAULT 0"),
+        ("ig_spread_at_entry", "REAL DEFAULT 0"),
+        # Tick data summary
+        ("tick_count_during_trade", "INTEGER DEFAULT 0"),
+        ("avg_tick_interval_ms", "REAL DEFAULT 0"),
+    ]
+
+    for col_name, col_def in extended_cols:
+        try:
+            conn.execute(f"ALTER TABLE trades ADD COLUMN {col_name} {col_def}")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+    # ── Tick log table: raw price data during active trades ──
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS tick_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_id    INTEGER,
+            instrument  TEXT NOT NULL,
+            timestamp   TEXT NOT NULL,
+            bid         REAL,
+            offer       REAL,
+            mid         REAL,
+            spread      REAL,
+            FOREIGN KEY (trade_id) REFERENCES trades(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_tick_trade ON tick_log(trade_id);
+
+        CREATE TABLE IF NOT EXISTS bar_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_id    INTEGER,
+            instrument  TEXT NOT NULL,
+            timestamp   TEXT NOT NULL,
+            open        REAL,
+            high        REAL,
+            low         REAL,
+            close       REAL,
+            bar_num     INTEGER,
+            FOREIGN KEY (trade_id) REFERENCES trades(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_bar_trade ON bar_log(trade_id);
+
+        CREATE TABLE IF NOT EXISTS daily_context (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            date            TEXT NOT NULL,
+            instrument      TEXT NOT NULL,
+            prev_close      REAL DEFAULT 0,
+            open_price      REAL DEFAULT 0,
+            gap_pts         REAL DEFAULT 0,
+            overnight_high  REAL DEFAULT 0,
+            overnight_low   REAL DEFAULT 0,
+            overnight_range REAL DEFAULT 0,
+            spx_prev_close  REAL DEFAULT 0,
+            spx_prev_dir    TEXT DEFAULT '',
+            vix_level       REAL DEFAULT 0,
+            day_of_week     INTEGER DEFAULT 0,
+            bar1_range      REAL DEFAULT 0,
+            bar2_range      REAL DEFAULT 0,
+            bar3_range      REAL DEFAULT 0,
+            bar4_range      REAL DEFAULT 0,
+            bar5_range      REAL DEFAULT 0,
+            morning_trend   TEXT DEFAULT '',
+            UNIQUE(date, instrument)
+        );
+        CREATE INDEX IF NOT EXISTS idx_daily_date ON daily_context(date);
+    """)
+
     conn.commit()
     logger.info(f"Trade journal DB initialized: {DB_PATH}")
 
@@ -518,3 +623,74 @@ def _safe_int(val, default=0) -> int:
         return int(float(val)) if val else default
     except (ValueError, TypeError):
         return default
+
+
+# ── AI Data Logging ──────────────────────────────────────────────────────
+
+def log_tick(trade_id: int, instrument: str, timestamp: str,
+             bid: float, offer: float, mid: float):
+    """Log a tick during an active trade for post-analysis."""
+    try:
+        conn = _get_conn()
+        conn.execute(
+            "INSERT INTO tick_log (trade_id, instrument, timestamp, bid, offer, mid, spread) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (trade_id, instrument.upper(), timestamp, bid, offer, mid, round(offer - bid, 2)),
+        )
+        conn.commit()
+    except Exception as e:
+        pass  # Don't let tick logging break trading
+
+
+def log_bar(trade_id: int, instrument: str, timestamp: str,
+            open_: float, high: float, low: float, close: float, bar_num: int):
+    """Log a 5-min bar during an active trade."""
+    try:
+        conn = _get_conn()
+        conn.execute(
+            "INSERT INTO bar_log (trade_id, instrument, timestamp, open, high, low, close, bar_num) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (trade_id, instrument.upper(), timestamp, open_, high, low, close, bar_num),
+        )
+        conn.commit()
+    except Exception as e:
+        pass
+
+
+def log_daily_context(date: str, instrument: str, context: dict):
+    """Log daily market context for AI analysis."""
+    try:
+        conn = _get_conn()
+        conn.execute(
+            "INSERT OR REPLACE INTO daily_context "
+            "(date, instrument, prev_close, open_price, gap_pts, "
+            "overnight_high, overnight_low, overnight_range, "
+            "spx_prev_close, spx_prev_dir, day_of_week, "
+            "bar1_range, bar2_range, bar3_range, bar4_range, bar5_range, morning_trend) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (date, instrument.upper(),
+             context.get("prev_close", 0), context.get("open_price", 0),
+             context.get("gap_pts", 0),
+             context.get("overnight_high", 0), context.get("overnight_low", 0),
+             context.get("overnight_range", 0),
+             context.get("spx_prev_close", 0), context.get("spx_prev_dir", ""),
+             context.get("day_of_week", 0),
+             context.get("bar1_range", 0), context.get("bar2_range", 0),
+             context.get("bar3_range", 0), context.get("bar4_range", 0),
+             context.get("bar5_range", 0), context.get("morning_trend", "")),
+        )
+        conn.commit()
+    except Exception as e:
+        logger.warning(f"Daily context log failed: {e}")
+
+
+def update_trade_extended(trade_id: int, **kwargs):
+    """Update extended columns on an existing trade."""
+    try:
+        conn = _get_conn()
+        sets = ", ".join(f"{k}=?" for k in kwargs.keys())
+        vals = list(kwargs.values()) + [trade_id]
+        conn.execute(f"UPDATE trades SET {sets} WHERE id=?", vals)
+        conn.commit()
+    except Exception as e:
+        logger.warning(f"Extended trade update failed: {e}")
