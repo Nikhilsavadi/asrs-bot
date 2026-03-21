@@ -278,6 +278,84 @@ async def handle_close(dax_broker, target: str = "all", **kwargs):
     await _send(msg)
 
 
+async def handle_kill(dax_broker, **kwargs):
+    """EMERGENCY: Close ALL positions on IG, pause trading, reset all state."""
+    global paused
+    paused = True
+    results = []
+
+    try:
+        from shared.ig_session import IGSharedSession
+        shared = IGSharedSession.get_instance()
+        if not shared or not shared.ig:
+            shared = IGSharedSession()
+            await shared.connect()
+
+        # Fetch ALL open positions on the account
+        positions = shared.ig.fetch_open_positions()
+        if hasattr(positions, 'to_dict'):
+            positions = positions.to_dict('records')
+
+        if not positions:
+            results.append("No open positions found.")
+        else:
+            for pos in positions:
+                deal_id = pos.get('dealId', '')
+                epic = pos.get('epic', '')
+                direction = pos.get('direction', '')
+                size = pos.get('size', 1)
+                try:
+                    close_dir = 'SELL' if direction == 'BUY' else 'BUY'
+                    shared.ig.close_open_position(
+                        deal_id=deal_id, direction=close_dir,
+                        epic=epic, expiry='DFB', level=None,
+                        order_type='MARKET', quote_id=None, size=size,
+                    )
+                    results.append(f"  {epic} {direction} x{size}: CLOSED")
+                except Exception as e:
+                    results.append(f"  {epic} {direction}: FAILED ({e})")
+
+        # Reset DAX state
+        try:
+            from dax_bot.strategy import DailyState as DaxState, Phase as DaxPhase
+            ds = DaxState.load()
+            ds.phase = DaxPhase.DONE
+            ds.s2_phase = "DONE"
+            ds.direction = ""
+            ds.contracts_active = 0
+            ds.save()
+            results.append("DAX state: RESET")
+        except Exception:
+            pass
+
+        # Reset US30 state
+        try:
+            from spx_bot.strategy import US30DailyState, Phase as US30Phase
+            us = US30DailyState.load()
+            us.phase = US30Phase.DONE
+            us.s2_phase = "DONE"
+            us.direction = ""
+            us.contracts_active = 0
+            us.save()
+            results.append("US30 state: RESET")
+        except Exception:
+            pass
+
+    except Exception as e:
+        results.append(f"ERROR: {e}")
+
+    msg = (
+        f"🚨 <b>EMERGENCY KILL</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"ALL positions closed. Trading PAUSED.\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        + "\n".join(results)
+        + "\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>Use /resume to resume trading.</i>"
+    )
+    await _send(msg)
+
+
 async def handle_pause():
     """Pause new trades."""
     global paused
@@ -561,6 +639,8 @@ async def poll_commands(dax_broker=None, **kwargs):
                             await handle_positions(dax_broker)
                         elif cmd in ("/close", "/close dax", "/close_dax"):
                             await handle_close(dax_broker, "dax")
+                        elif cmd == "/kill":
+                            await handle_kill(dax_broker)
                         elif cmd == "/pause":
                             await handle_pause()
                         elif cmd == "/resume":

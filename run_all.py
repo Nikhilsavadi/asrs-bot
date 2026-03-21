@@ -283,13 +283,23 @@ async def main():
 
     # ── Monitoring: missed job alerts ──────────────────────────────
     from apscheduler.events import EVENT_JOB_MISSED, EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
-    from shared.monitoring import create_job_listener, heartbeat_ping, send_startup_alert
+    from shared.monitoring import create_job_listener, heartbeat_ping, send_startup_alert, position_safety_audit
 
     job_listener = create_job_listener(telegram_cmd._send, loop)
     dax_scheduler.add_listener(job_listener, EVENT_JOB_MISSED | EVENT_JOB_ERROR | EVENT_JOB_EXECUTED)
 
     dax_scheduler.add_job(heartbeat_ping, "interval", minutes=5,
         id="heartbeat", misfire_grace_time=60)
+
+    # Position safety audit — verify all open positions have stops
+    async def _safety_audit():
+        from shared.ig_session import IGSharedSession
+        shared = IGSharedSession.get_instance()
+        if shared and shared.ig:
+            await position_safety_audit(shared, telegram_cmd._send)
+
+    dax_scheduler.add_job(_safety_audit, "interval", minutes=5,
+        id="safety_audit", misfire_grace_time=60)
 
     dax_scheduler.start()
 

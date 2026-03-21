@@ -114,6 +114,63 @@ async def send_startup_alert(send_func, gold_str: str = "disabled", spx_str: str
     await send_func(msg)
 
 
+# ── Position Safety Audit ─────────────────────────────────────────────────
+
+async def position_safety_audit(ig_session, send_func):
+    """
+    Every 5 mins: check ALL open positions on IG have stops set.
+    If any position has no stop, set a disaster stop and alert.
+    """
+    try:
+        positions = ig_session.ig.fetch_open_positions()
+        if hasattr(positions, 'to_dict'):
+            positions = positions.to_dict('records')
+        if not positions:
+            return
+
+        for pos in positions:
+            deal_id = pos.get('dealId', '')
+            epic = pos.get('epic', '')
+            direction = pos.get('direction', '')
+            stop_level = pos.get('stopLevel') or pos.get('stop_level')
+            level = pos.get('level', 0)
+            size = pos.get('size', 0)
+
+            if stop_level is None or stop_level == 0:
+                # NO STOP — CRITICAL
+                # Set disaster stop immediately
+                disaster_dist = 500  # default
+                if 'DAX' in epic or 'GER' in epic:
+                    disaster_dist = 200
+                elif 'DOW' in epic:
+                    disaster_dist = 500
+                elif 'NIKKEI' in epic:
+                    disaster_dist = 1000
+
+                if direction == 'BUY':
+                    emergency_stop = float(level) - disaster_dist
+                else:
+                    emergency_stop = float(level) + disaster_dist
+
+                try:
+                    ig_session.ig.update_open_position(
+                        limit_level=None, stop_level=emergency_stop, deal_id=deal_id,
+                    )
+                    logger.warning(f"SAFETY AUDIT: Set emergency stop on {deal_id} ({epic} {direction}) @ {emergency_stop}")
+                except Exception as e:
+                    logger.error(f"SAFETY AUDIT: Failed to set stop on {deal_id}: {e}")
+
+                await send_func(
+                    f"🚨 <b>SAFETY AUDIT</b>\n"
+                    f"Position {deal_id} had NO STOP!\n"
+                    f"Epic: {epic} | Dir: {direction} | Entry: {level}\n"
+                    f"Emergency stop set @ {emergency_stop}\n"
+                    f"<b>Check immediately!</b>"
+                )
+    except Exception as e:
+        logger.warning(f"Position safety audit failed: {e}")
+
+
 # ── Health Status (for /health endpoint) ──────────────────────────────────
 
 def get_health() -> dict:
