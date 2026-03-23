@@ -78,7 +78,23 @@ async def _check_slippage(state: DailyState, fill_price: float) -> bool:
                 process_stop_hit(state, fill_price)
                 if state.trades and state.trades[-1].get("exit"):
                     state.trades[-1]["exit_reason"] = "SLIPPAGE_CLOSE"
-            state.phase = Phase.DONE
+
+            # Slippage close = missed entry, not a failed trade.
+            # Re-arm the bracket for another attempt if entries remain.
+            if state.entries_used < config.MAX_ENTRIES:
+                state.phase = Phase.ORDERS_PLACED
+                state.direction = ""
+                state.entry_price = 0
+                logger.info(f"Slippage close — re-arming bracket (entry {state.entries_used}/{config.MAX_ENTRIES})")
+                await alerts.send("Re-arming bracket after slippage close")
+                await broker.place_oca_bracket(
+                    state.buy_level, state.sell_level,
+                    qty=state.position_size or config.NUM_CONTRACTS,
+                    oca_group=f"ASRS_{state.date}_{state.entries_used + 1}"
+                )
+            else:
+                state.phase = Phase.DONE
+                logger.info("Slippage close — max entries reached, done for today")
             state.save()
         except Exception as e:
             logger.error(f"Slippage close failed: {e}")
