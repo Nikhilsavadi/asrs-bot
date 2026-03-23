@@ -277,7 +277,7 @@ async def main():
             timezone=tz_et)
 
         dax_scheduler.add_job(spx_main.morning_routine, "cron",
-            day_of_week="mon-fri", hour=9, minute=51,
+            day_of_week="mon-fri", hour=9, minute=56,
             id="spx_morning", misfire_grace_time=120,
             timezone=tz_et)
 
@@ -308,7 +308,7 @@ async def main():
             id="nikkei_prewarm", misfire_grace_time=120)
 
         dax_scheduler.add_job(nikkei_main.morning_routine, "cron",
-            day_of_week="mon-fri", hour=0, minute=21,
+            day_of_week="mon-fri", hour=0, minute=26,
             id="nikkei_morning", misfire_grace_time=120)
 
         dax_scheduler.add_job(nikkei_main.monitor_cycle, "cron",
