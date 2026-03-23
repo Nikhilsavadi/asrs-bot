@@ -319,6 +319,11 @@ async def main():
             day_of_week="mon-fri", hour=6, minute=5,
             id="nikkei_eod", misfire_grace_time=120)
 
+        # Nikkei overnight collection: 15:00-23:00 UTC (00:00-08:00 JST next day)
+        dax_scheduler.add_job(nikkei_main.collect_overnight_bars, "cron",
+            day_of_week="mon-fri", hour="15-23", minute=0,
+            id="nikkei_overnight", misfire_grace_time=300)
+
     # ── Session keepalive every 10 minutes ────────────────────────
     async def keepalive_with_stream_check():
         await shared.keepalive()

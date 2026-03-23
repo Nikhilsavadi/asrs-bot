@@ -26,6 +26,9 @@ broker: IGBroker = None
 _bar4_triggered = False
 _tg_send = None  # Telegram send function, set by init()
 
+# Overnight price cache — hourly samples for overnight bias (same as DAX)
+_overnight_cache = {"date": "", "bars": []}
+
 
 async def _alert(text: str):
     """Send Telegram alert with [S4 NIKKEI] prefix."""
@@ -82,6 +85,44 @@ async def init(shared_session, stream_manager, tg_send=None):
 
 
 _shared_session = None
+
+
+async def collect_overnight_bars():
+    """Hourly job (15:00-00:00 UTC = 00:00-09:00 JST) — sample current price for overnight range."""
+    from datetime import timedelta
+    now_jst = datetime.now(config.TZ_JST)
+    today_str = now_jst.strftime("%Y-%m-%d")
+
+    if _overnight_cache["date"] != today_str:
+        _overnight_cache["date"] = today_str
+        _overnight_cache["bars"] = []
+
+    # Get streaming price
+    price = None
+    if _shared_session and _shared_session.stream:
+        price = _shared_session.stream.get_price_sync(config.IG_EPIC)
+    if not price or price <= 0:
+        price = await broker.get_current_price() if broker else None
+
+    if price and price > 0:
+        _overnight_cache["bars"].append({
+            "time": now_jst,
+            "Open": price, "High": price, "Low": price, "Close": price,
+        })
+        logger.info(f"Nikkei overnight cached: {price} ({len(_overnight_cache['bars'])} samples)")
+    else:
+        logger.warning("Nikkei overnight collection: no price available")
+
+
+def get_cached_overnight_df():
+    """Convert cached overnight samples to DataFrame for calculate_overnight_range()."""
+    import pandas as pd
+    bars = _overnight_cache.get("bars", [])
+    if not bars:
+        return pd.DataFrame()
+    df = pd.DataFrame(bars)
+    df.index = pd.DatetimeIndex([b["time"] for b in bars], tz=config.TZ_JST)
+    return df
 
 
 async def on_tick_trigger(trigger: dict):
@@ -398,14 +439,20 @@ async def morning_routine():
     except Exception as e:
         logger.warning(f"Gap computation failed: {e}")
 
-    # For Nikkei, "overnight" = pre-market bars before 09:00 JST (from streaming)
+    # For Nikkei, "overnight" = pre-market prices before 09:00 JST
+    # Try streaming bars first, fall back to hourly cache
     try:
         pre_market = df[df.index < tokyo_open_cet]
+        if pre_market.empty:
+            logger.info("Streaming pre-market empty — using cached overnight samples")
+            pre_market = get_cached_overnight_df()
         if not pre_market.empty:
             overnight_result = calculate_overnight_range(
                 pre_market, state.bar_high, state.bar_low
             )
             logger.info(f"NIKKEI pre-market range: {overnight_result.range_high:.1f}-{overnight_result.range_low:.1f}, bias={overnight_result.bias.value}")
+        else:
+            logger.warning("NIKKEI: no pre-market data (streaming + cache both empty)")
     except Exception as e:
         logger.warning(f"Pre-market range failed: {e}")
 
