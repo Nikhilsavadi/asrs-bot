@@ -31,12 +31,15 @@ class _TickListener(SubscriptionListener):
 
     def __init__(self, epic: str, prices: dict, events: dict,
                  tick_callbacks: dict,
-                 loop: asyncio.AbstractEventLoop):
+                 loop: asyncio.AbstractEventLoop,
+                 tick_bars: dict = None, candle_bars: dict = None):
         self._epic = epic
         self._prices = prices
         self._events = events
         self._tick_callbacks = tick_callbacks
         self._loop = loop
+        self._tick_bars = tick_bars or {}      # shared tick-bar accumulator
+        self._candle_bars = candle_bars or {}  # shared bar store (same as CONS_END)
 
     def onItemUpdate(self, update):
         try:
@@ -58,11 +61,66 @@ class _TickListener(SubscriptionListener):
                 if event:
                     self._loop.call_soon_threadsafe(event.set)
                 # Fire tick callbacks (for real-time entry triggers)
-                # Pass bid, offer, mid so triggers can use the correct side
                 for cb in self._tick_callbacks.get(self._epic, []):
                     self._loop.call_soon_threadsafe(cb, mid, float(bid), float(ofr))
+
+                # ── Tick-based bar builder ─────────────────────────────
+                # Build 5-min OHLC bars in real-time from ticks
+                # Bars emit on our clock, not IG's CONS_END delay
+                self._update_tick_bar(mid)
+
         except Exception as e:
             logger.debug(f"Tick update error ({self._epic}): {e}")
+
+    def _update_tick_bar(self, mid: float):
+        """Accumulate tick into current 5-min bar. Emit when clock crosses boundary."""
+        now = datetime.now(CET)
+        bar_min = (now.minute // 5) * 5
+        bar_start = now.replace(minute=bar_min, second=0, microsecond=0)
+
+        current = self._tick_bars.get(self._epic)
+
+        if current is None or current["time"] != bar_start:
+            # New bar period — emit the old bar (if exists) and start fresh
+            if current is not None and current["tick_count"] > 0:
+                # Emit completed bar
+                completed = {
+                    "time": current["time"],
+                    "Open": current["Open"],
+                    "High": current["High"],
+                    "Low": current["Low"],
+                    "Close": current["Close"],
+                }
+                end_time = current["time"] + timedelta(minutes=5)
+
+                # Store in same bar store as CONS_END bars (dedup by time)
+                epic_bars = self._candle_bars.setdefault(self._epic, deque(maxlen=300))
+                # Only add if not already there from CONS_END
+                already = any(b["time"] == completed["time"] for b in epic_bars)
+                if not already:
+                    epic_bars.append(completed)
+                    logger.info(
+                        f"Tick-bar ({self._epic}): {completed['time'].strftime('%H:%M')}-"
+                        f"{end_time.strftime('%H:%M')} CET | "
+                        f"O={completed['Open']} H={completed['High']} "
+                        f"L={completed['Low']} C={completed['Close']}"
+                    )
+
+            # Start new bar
+            self._tick_bars[self._epic] = {
+                "time": bar_start,
+                "Open": mid,
+                "High": mid,
+                "Low": mid,
+                "Close": mid,
+                "tick_count": 1,
+            }
+        else:
+            # Update current bar
+            current["High"] = max(current["High"], mid)
+            current["Low"] = min(current["Low"], mid)
+            current["Close"] = mid
+            current["tick_count"] += 1
 
     def onSubscription(self):
         logger.info(f"Tick subscription active: {self._epic}")
@@ -252,6 +310,10 @@ class IGStreamManager:
         # BUG #2 FIX: Dedup state persists across reconnects
         self._candle_dedup: dict[str, datetime] = {}
 
+        # Tick-based bar builder: real-time OHLC from ticks (no CONS_END delay)
+        self._tick_bars: dict[str, dict] = {}  # epic -> current accumulating bar
+        self._tick_bar_lock: dict[str, bool] = {}  # prevent race conditions
+
     # ── Tick streaming ─────────────────────────────────────────────
 
     async def subscribe_ticks(self, epic: str):
@@ -269,7 +331,8 @@ class IGStreamManager:
             fields=["BID", "OFR", "LTP", "UTM"],
         )
         listener = _TickListener(
-            epic, self._prices, self._price_events, self._tick_callbacks, self._loop
+            epic, self._prices, self._price_events, self._tick_callbacks, self._loop,
+            tick_bars=self._tick_bars, candle_bars=self._candle_bars
         )
         sub.addListener(listener)
         self._session.stream.subscribe(sub)
