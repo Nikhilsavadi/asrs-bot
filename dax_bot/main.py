@@ -758,26 +758,47 @@ async def session2_routine():
 
     state = DailyState.load()
 
-    # Only trade if morning had a direction (even if stopped out)
-    morning_dir = state.direction or state.reentry_direction
+    # Get morning direction — try state, then trades, then fall back to overnight bias
+    morning_dir = state.direction or getattr(state, 'reentry_direction', '')
     if not morning_dir and state.trades:
-        # Get direction from first trade
         morning_dir = state.trades[0].get("direction", "")
     if not morning_dir:
-        logger.info("Session 2: no morning direction — skipping")
+        # Fall back: compute overnight bias independently (S2 doesn't need S1)
+        try:
+            overnight_df = broker.get_streaming_bars_df() if broker else None
+            if overnight_df is not None and not overnight_df.empty:
+                today_date = datetime.now(config.TZ_CET).date()
+                pre_open = overnight_df[
+                    (overnight_df.index.date == today_date) &
+                    (overnight_df.index.hour < config.SESSION2_HOUR_CET)
+                ]
+                if len(pre_open) >= 3:
+                    on_mid = (pre_open["High"].max() + pre_open["Low"].min()) / 2
+                    last_close = pre_open.iloc[-1]["Close"]
+                    morning_dir = "LONG" if last_close > on_mid else "SHORT"
+                    logger.info(f"Session 2: no S1 direction — using bar bias: {morning_dir}")
+        except Exception as e:
+            logger.warning(f"Session 2: fallback bias failed: {e}")
+
+    if not morning_dir:
+        logger.info("Session 2: no direction available — skipping")
+        await alerts.send("[S1 DAX] S2 SKIPPED: no morning direction or overnight bias available")
         return
 
     # Skip if session 2 already processed
     if state.s2_phase != "IDLE":
         logger.info(f"Session 2: already processed (s2_phase={state.s2_phase})")
+        await alerts.send(f"[S1 DAX] S2 SKIPPED: already processed ({state.s2_phase})")
         return
 
     # Skip if daily loss limit hit
     if _check_daily_loss_limit():
         logger.info("Session 2: daily loss limit — skipping")
+        await alerts.send("[S1 DAX] S2 SKIPPED: daily loss limit hit")
         return
 
     logger.info("═══ SESSION 2 ROUTINE (11:00 CET) ═══")
+    await alerts.send(f"[S1 DAX] S2 starting — bias: {morning_dir}")
 
     # Get streaming bars from 11:00 CET
     s2_open_cet = datetime.now(config.TZ_CET).replace(hour=config.SESSION2_HOUR_CET, minute=0, second=0)
@@ -786,6 +807,7 @@ async def session2_routine():
     df = broker.get_streaming_bars_df()
     if df.empty:
         logger.warning("Session 2: no streaming bars")
+        await alerts.send("[S1 DAX] S2 ERROR: no streaming bars")
         return
 
     # Filter to session 2 bars (11:00-11:20 CET)
