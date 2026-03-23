@@ -53,16 +53,23 @@ _last_stream_exit_levels: dict[str, float] = {}
 
 
 async def _check_slippage(state: DailyState, fill_price: float) -> bool:
-    """Check if fill slipped too far from trigger level. Returns True if OK, False if excessive."""
+    """Check if fill slipped too far from trigger level. Returns True if OK, False if excessive.
+    Slippage limit is proportional to the trade's initial risk (bar range), not a fixed number.
+    If slippage < 50% of risk → keep trade (slightly worse R:R but still valid).
+    If slippage > 50% of risk → close immediately (trade invalidated).
+    """
     trigger_price = state.buy_level if state.direction == "LONG" else state.sell_level
     slippage = abs(fill_price - trigger_price)
-    if slippage > config.MAX_SLIPPAGE_PTS:
-        logger.error(f"EXCESSIVE SLIPPAGE: fill={fill_price}, trigger={trigger_price}, slip={slippage}pts")
+    initial_risk = state.bar_range + config.BUFFER_PTS * 2  # bar range + both buffers
+    max_slip = initial_risk * config.MAX_SLIPPAGE_PCT  # default 50% of risk
+    if slippage > max_slip:
+        logger.error(f"EXCESSIVE SLIPPAGE: fill={fill_price}, trigger={trigger_price}, "
+                     f"slip={slippage:.1f}pts > {max_slip:.1f}pts ({config.MAX_SLIPPAGE_PCT*100:.0f}% of {initial_risk:.1f}pt risk)")
         await alerts.send(
             "🚨 <b>EXCESSIVE SLIPPAGE — CLOSING</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             f"Trigger: {trigger_price} | Fill: {fill_price}\n"
-            f"Slippage: {slippage:.1f} pts (limit: {config.MAX_SLIPPAGE_PTS})\n"
+            f"Slippage: {slippage:.1f} pts (limit: {max_slip:.1f} = {config.MAX_SLIPPAGE_PCT*100:.0f}% of risk)\n"
             "Closing position immediately."
         )
         try:

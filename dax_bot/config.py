@@ -39,9 +39,11 @@ NUM_CONTRACTS = int(os.getenv("NUM_CONTRACTS", "1"))   # £1/pt to start — sca
 MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "5"))   # Hard ceiling regardless of scaling ladder
 NARROW_STD_MULTIPLIER = int(os.getenv("NARROW_STD_MULTIPLIER", "2"))  # 2x size on STANDARD+NARROW days
 MAX_DAILY_LOSS_GBP = float(os.getenv("MAX_DAILY_LOSS_GBP", "200"))  # Stop trading if day P&L < -£200
-MAX_SLIPPAGE_PTS   = int(os.getenv("MAX_SLIPPAGE_PTS", "10"))       # Close entry if fill slips >10pts
+MAX_SLIPPAGE_PCT   = float(os.getenv("MAX_SLIPPAGE_PCT", "0.5"))  # Max slippage as % of initial risk (50%)
 MAX_SPREAD_PTS     = float(os.getenv("MAX_SPREAD_PTS", "10.0"))   # Skip entry if spread > this
 DISASTER_STOP_PTS  = int(os.getenv("DISASTER_STOP_PTS", "200"))   # Wide server-side stop as safety net
+MAX_RISK_GBP       = float(os.getenv("MAX_RISK_GBP", "50.0"))     # Max £ risk per trade — skip if exceeded
+MAX_BAR_RANGE      = int(os.getenv("MAX_BAR_RANGE", "120"))        # Skip trade if bar range > this
 
 # ── Signal Bar Selection ─────────────────────────────────────────────────────
 # Always use bar 4. Bar 5 disabled — backtest showed bar 5 rules reduced P&L

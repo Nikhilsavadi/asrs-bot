@@ -325,6 +325,20 @@ async def morning_routine():
         await _alert(f"NIKKEI ASRS: Bar range too small ({state.bar_range}pts)")
         return
 
+    # Max bar range check — skip absurdly wide bars
+    if state.bar_range > config.MAX_BAR_RANGE:
+        logger.warning(f"Bar range {state.bar_range:.1f} > MAX {config.MAX_BAR_RANGE} — skipping")
+        await _alert(f"[S4 NIKKEI] SKIPPED: Bar range {state.bar_range:.1f}pts > max {config.MAX_BAR_RANGE}")
+        return
+
+    # Max risk check — at minimum stake, would this trade risk more than MAX_RISK_GBP?
+    min_stake = 0.5  # IG minimum
+    risk_gbp = state.bar_range * min_stake
+    if risk_gbp > config.MAX_RISK_GBP:
+        logger.warning(f"Risk £{risk_gbp:.0f} > MAX £{config.MAX_RISK_GBP:.0f} — skipping")
+        await _alert(f"[S4 NIKKEI] SKIPPED: Risk £{risk_gbp:.0f} > cap £{config.MAX_RISK_GBP:.0f}")
+        return
+
     # Range flag
     if state.bar_range <= config.NARROW_RANGE:
         state.range_flag = "NARROW"

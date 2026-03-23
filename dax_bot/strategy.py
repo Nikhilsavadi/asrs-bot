@@ -350,6 +350,22 @@ def calculate_levels(state: DailyState, df: pd.DataFrame) -> list[str]:
     else:
         state.range_flag = "NORMAL"
 
+    # Max bar range check
+    max_range = getattr(config, 'MAX_BAR_RANGE', 999)
+    if state.bar_range > max_range:
+        events.append(f"SKIP_WIDE_RANGE_{state.bar_range:.0f}")
+        state.save()
+        return events
+
+    # Max risk check at minimum stake
+    max_risk_gbp = getattr(config, 'MAX_RISK_GBP', 999)
+    min_stake = 0.5
+    risk_gbp = state.bar_range * min_stake
+    if risk_gbp > max_risk_gbp:
+        events.append(f"SKIP_RISK_{risk_gbp:.0f}")
+        state.save()
+        return events
+
     # Set levels
     state.buy_level = round(state.bar_high + config.BUFFER_PTS, 1)
     state.sell_level = round(state.bar_low - config.BUFFER_PTS, 1)
