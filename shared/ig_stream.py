@@ -78,12 +78,13 @@ class _CandleListener(SubscriptionListener):
     """Receives CHART:{epic}:MINUTE_5 updates and stores completed candles."""
 
     def __init__(self, epic: str, bars: dict, callbacks: dict,
-                 loop: asyncio.AbstractEventLoop):
+                 loop: asyncio.AbstractEventLoop, dedup_state: dict = None):
         self._epic = epic
         self._bars = bars
         self._callbacks = callbacks
         self._loop = loop
-        self._last_bar_time = None  # Deduplicate CONS_END=1 bursts
+        # BUG #2 FIX: dedup state lives at manager level, survives reconnects
+        self._dedup = dedup_state if dedup_state is not None else {}
 
     def onItemUpdate(self, update):
         try:
@@ -100,29 +101,45 @@ class _CandleListener(SubscriptionListener):
             ofr_h = update.getValue("OFR_HIGH")
             ofr_l = update.getValue("OFR_LOW")
             ofr_c = update.getValue("OFR_CLOSE")
+            utm = update.getValue("UTM")
 
             if not all([bid_o, bid_h, bid_l, bid_c, ofr_o, ofr_h, ofr_l, ofr_c]):
                 return
 
-            # Compute candle START time in CET
-            # CONS_END=1 fires at candle close (e.g., 09:05 for 09:00-09:05 bar)
-            now_cet = datetime.now(CET)
-            m, s = now_cet.minute, now_cet.second
-            # Snap to nearest 5-minute boundary (the close time)
-            if m % 5 == 4 and s >= 45:
-                snap_min = ((m // 5) + 1) * 5
+            # BUG #1 FIX: Use UTM (event timestamp) instead of datetime.now()
+            # UTM is Unix time in milliseconds from Lightstreamer
+            if utm:
+                try:
+                    event_utc = datetime.fromtimestamp(float(utm) / 1000, tz=CET)
+                    m = event_utc.minute
+                    # Snap to 5-min boundary: the close time is the next 5-min mark
+                    snap_min = ((m // 5) + 1) * 5 if m % 5 != 0 else m
+                    if snap_min == m and m % 5 == 0:
+                        # Exactly on boundary — this IS the close time
+                        snap_min = m
+                    snap_hour = event_utc.hour + snap_min // 60
+                    snap_min_mod = snap_min % 60
+                    end_time = event_utc.replace(hour=snap_hour % 24, minute=snap_min_mod,
+                                                  second=0, microsecond=0)
+                    start_time = end_time - timedelta(minutes=5)
+                except (ValueError, OSError):
+                    # Fallback to system time if UTM parsing fails
+                    now_cet = datetime.now(CET)
+                    snap_min = (now_cet.minute // 5) * 5
+                    end_time = now_cet.replace(minute=snap_min, second=0, microsecond=0)
+                    start_time = end_time - timedelta(minutes=5)
             else:
-                snap_min = (m // 5) * 5
-            snap_hour = now_cet.hour + snap_min // 60
-            snap_min_mod = snap_min % 60
-            end_time = now_cet.replace(hour=snap_hour, minute=snap_min_mod,
-                                       second=0, microsecond=0)
-            start_time = end_time - timedelta(minutes=5)
+                # No UTM available — fall back to system time
+                now_cet = datetime.now(CET)
+                snap_min = (now_cet.minute // 5) * 5
+                end_time = now_cet.replace(minute=snap_min, second=0, microsecond=0)
+                start_time = end_time - timedelta(minutes=5)
 
-            # Deduplicate: Lightstreamer sends CONS_END=1 on every tick after bar closes
-            if self._last_bar_time == start_time:
+            # BUG #2 FIX: Dedup using manager-level state (survives reconnects)
+            last_bar = self._dedup.get(self._epic)
+            if last_bar == start_time:
                 return
-            self._last_bar_time = start_time
+            self._dedup[self._epic] = start_time
 
             bar = {
                 "time": start_time,
@@ -132,10 +149,16 @@ class _CandleListener(SubscriptionListener):
                 "Close": round((float(bid_c) + float(ofr_c)) / 2, 1),
             }
 
+            # BUG #3 FIX: Bar range sanity check
+            bar_range = bar["High"] - bar["Low"]
+            if bar_range <= 0 or bar["High"] <= 0:
+                logger.warning(f"Invalid bar data ({self._epic}): H={bar['High']} L={bar['Low']}")
+                return
+
             epic_bars = self._bars.setdefault(self._epic, deque(maxlen=300))
             epic_bars.append(bar)
 
-            # Log bar construction with OHLC (Issue 5)
+            # Log bar construction with OHLC
             logger.info(
                 f"Bar built ({self._epic}): {start_time.strftime('%H:%M')}-"
                 f"{end_time.strftime('%H:%M')} CET | "
@@ -226,6 +249,9 @@ class IGStreamManager:
         self._candle_subs: dict[str, Subscription] = {}
         self._trade_sub: Subscription | None = None
 
+        # BUG #2 FIX: Dedup state persists across reconnects
+        self._candle_dedup: dict[str, datetime] = {}
+
     # ── Tick streaming ─────────────────────────────────────────────
 
     async def subscribe_ticks(self, epic: str):
@@ -305,7 +331,8 @@ class IGStreamManager:
             ],
         )
         listener = _CandleListener(
-            epic, self._candle_bars, self._candle_callbacks, self._loop
+            epic, self._candle_bars, self._candle_callbacks, self._loop,
+            dedup_state=self._candle_dedup  # BUG #2 FIX: shared dedup state
         )
         sub.addListener(listener)
         self._session.stream.subscribe(sub)
