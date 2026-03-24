@@ -300,12 +300,23 @@ async def morning_routine():
     now_cet = datetime.now(cet)
     us_open_cet = now_cet.replace(hour=14, minute=30, second=0, microsecond=0)
 
-    # Filter bars from US open onwards
-    us_bars = df[df.index >= us_open_cet].sort_index()
-    logger.info(f"US30 bars from 14:30 CET: {len(us_bars)} bars")
+    # Filter bars from US open onwards — retry up to 60s if bar 4 not yet received
+    import asyncio
+    for retry in range(4):
+        df = broker.get_streaming_bars_df()
+        if not df.empty:
+            us_bars = df[df.index >= us_open_cet].sort_index()
+        else:
+            us_bars = pd.DataFrame()
+        logger.info(f"US30 bars from 14:30 CET (attempt {retry+1}): {len(us_bars)} bars")
+        if len(us_bars) >= 4:
+            break
+        if retry < 3:
+            logger.info(f"Waiting 15s for bar 4...")
+            await asyncio.sleep(15)
 
     if len(us_bars) < 4:
-        await _alert(f"US30 ASRS ERROR\nOnly {len(us_bars)} bars since US open (need 4)")
+        await _alert(f"US30 ASRS ERROR\nOnly {len(us_bars)} bars since US open (need 4)\nRetried 4 times over 45s")
         return
 
     # Bar 4 = 4th bar from US open

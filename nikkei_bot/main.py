@@ -333,12 +333,23 @@ async def morning_routine():
     import pandas as pd
     tokyo_open_cet = pd.Timestamp(tokyo_open_jst).tz_convert(cet)
 
-    # Filter bars from Tokyo open onwards
-    nikkei_bars = df[df.index >= tokyo_open_cet].sort_index()
-    logger.info(f"NIKKEI bars from 09:00 JST: {len(nikkei_bars)} bars")
+    # Filter bars from Tokyo open onwards — retry up to 60s if bar 4 not yet received
+    for retry in range(4):
+        df = broker.get_streaming_bars_df()
+        if not df.empty:
+            today_bars = df[df.index.date == tokyo_open_cet.date()] if hasattr(df.index, 'date') else df
+            nikkei_bars = today_bars[today_bars.index >= tokyo_open_cet].sort_index()
+        else:
+            nikkei_bars = pd.DataFrame()
+        logger.info(f"NIKKEI bars from 09:00 JST (attempt {retry+1}): {len(nikkei_bars)} bars")
+        if len(nikkei_bars) >= 4:
+            break
+        if retry < 3:
+            logger.info(f"Waiting 15s for bar 4...")
+            await asyncio.sleep(15)
 
     if len(nikkei_bars) < 4:
-        await _alert(f"NIKKEI ASRS ERROR\nOnly {len(nikkei_bars)} bars since Tokyo open (need 4)")
+        await _alert(f"NIKKEI ASRS ERROR\nOnly {len(nikkei_bars)} bars since Tokyo open (need 4)\nRetried 4 times over 45s")
         return
 
     # Bar 4 = 4th bar from Tokyo open

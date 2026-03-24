@@ -498,6 +498,8 @@ async def _get_today_bars_with_fallback() -> "pd.DataFrame":
     return pd.DataFrame()
 
 
+_morning_running = False  # mutex to prevent duplicate execution
+
 async def morning_routine():
     """
     08:21 UK — Calculate levels from streaming bar 4 data.
@@ -508,6 +510,17 @@ async def morning_routine():
       3. Select signal bar (bar 4 default; bar 5 if BAR5_RULES match)
       4. Calculate levels, auto-trade
     """
+    global _morning_running
+    if _morning_running:
+        logger.warning("Morning routine already running — skipping duplicate")
+        return
+    _morning_running = True
+    try:
+        await _morning_routine_inner()
+    finally:
+        _morning_running = False
+
+async def _morning_routine_inner():
     now = datetime.now(config.TZ_UK)
     if now.weekday() >= 5:
         logger.info("Weekend — skipping")
@@ -600,17 +613,15 @@ async def morning_routine():
                 f"bias={overnight_result.bias.value}")
 
     # ── SPX regime filter: override bias based on previous day SPX close ──
+    # Non-blocking: 5s timeout. If fails, keeps overnight bias. Never stalls morning routine.
     if config.SPX_REGIME_ENABLED:
         logger.info("Step 5b: Checking SPX regime filter...")
         try:
-            from shared.ig_session import IGSharedSession
-            session = IGSharedSession.get_instance()
-            if session and session.ig:
-                # Ensure session is fresh before historical data call
-                try:
-                    await session.keepalive()
-                except Exception:
-                    pass
+            async def _fetch_spx_regime():
+                from shared.ig_session import IGSharedSession
+                session = IGSharedSession.get_instance()
+                if not session or not session.ig:
+                    return None
                 spx_prices = session.ig.fetch_historical_prices_by_epic_and_num_points(
                     config.SPX_EPIC, "DAY", 2
                 )
@@ -619,20 +630,19 @@ async def morning_routine():
                     if len(prices) >= 2:
                         prev_close = float(prices[-2]["closePrice"]["bid"])
                         prev_open = float(prices[-2]["openPrice"]["bid"])
-                        spx_dir = "UP" if prev_close > prev_open else "DOWN"
-                        if spx_dir == "UP":
-                            state.overnight_bias = "LONG_ONLY"
-                        else:
-                            state.overnight_bias = "SHORT_ONLY"
-                        overnight_result.bias = OvernightBias(state.overnight_bias)
-                        state.save()
-                        logger.info(f"Step 5b: SPX prev day {spx_dir} → bias overridden to {state.overnight_bias}")
-                    else:
-                        logger.warning("Step 5b: SPX insufficient price data")
-                else:
-                    logger.warning("Step 5b: SPX price fetch returned no data")
+                        return "UP" if prev_close > prev_open else "DOWN"
+                return None
+
+            spx_dir = await asyncio.wait_for(_fetch_spx_regime(), timeout=5.0)
+            if spx_dir:
+                state.overnight_bias = "LONG_ONLY" if spx_dir == "UP" else "SHORT_ONLY"
+                overnight_result.bias = OvernightBias(state.overnight_bias)
+                state.save()
+                logger.info(f"Step 5b: SPX prev day {spx_dir} → bias overridden to {state.overnight_bias}")
             else:
-                logger.warning("Step 5b: No IG session for SPX regime check")
+                logger.warning("Step 5b: SPX data unavailable — keeping overnight bias")
+        except asyncio.TimeoutError:
+            logger.warning("Step 5b: SPX regime filter timed out (5s) — keeping overnight bias")
         except Exception as e:
             logger.warning(f"Step 5b: SPX regime filter failed (non-fatal): {e}")
 
