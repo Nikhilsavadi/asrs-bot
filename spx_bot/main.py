@@ -602,22 +602,40 @@ async def session2_routine():
 
     state = US30DailyState.load()
 
-    # Get morning direction — fall back to overnight bias if S1 didn't trade
+    # Get morning direction — fall back to calculating bias from live bars
     morning_dir = state.direction or state.reentry_direction
     if not morning_dir and state.trades:
         morning_dir = state.trades[0].get("direction", "")
     if not morning_dir:
-        # S1 didn't trade — use overnight bias instead
+        # S1 didn't trade — use state overnight bias first
         ob = state.overnight_bias
         if ob in ("LONG_ONLY", "LONG"):
             morning_dir = "LONG"
         elif ob in ("SHORT_ONLY", "SHORT"):
             morning_dir = "SHORT"
-        else:
-            logger.info("US30 S2: no morning direction and no overnight bias — skipping")
-            await _alert("US30 S2: skipped — no direction from S1 or overnight bias")
-            return
-        logger.info(f"US30 S2: no S1 trade, using overnight bias: {morning_dir}")
+    if not morning_dir:
+        # Still no direction — calculate from live bars (same as DAX S2)
+        try:
+            s2_df = broker.get_streaming_bars_df()
+            if s2_df is not None and not s2_df.empty:
+                from zoneinfo import ZoneInfo
+                cet = ZoneInfo("Europe/Berlin")
+                now_cet = datetime.now(cet)
+                pre_s2 = s2_df[s2_df.index < now_cet.replace(hour=16, minute=0)]
+                if len(pre_s2) >= 5:
+                    on_mid = (pre_s2["High"].max() + pre_s2["Low"].min()) / 2
+                    last_close = pre_s2.iloc[-1]["Close"]
+                    morning_dir = "LONG" if last_close > on_mid else "SHORT"
+                    logger.info(f"US30 S2: calculated bias from {len(pre_s2)} bars: {morning_dir}")
+                else:
+                    logger.warning(f"US30 S2: only {len(pre_s2)} pre-S2 bars, not enough")
+        except Exception as e:
+            logger.warning(f"US30 S2: live bar bias failed: {e}")
+    if not morning_dir:
+        logger.info("US30 S2: no direction available from any source — skipping")
+        await _alert("US30 S2: skipped — no direction from S1, state, or live bars")
+        return
+    logger.info(f"US30 S2: direction = {morning_dir}")
 
     if state.s2_phase != "IDLE":
         logger.info(f"US30 S2: already processed (s2_phase={state.s2_phase})")
