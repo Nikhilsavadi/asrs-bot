@@ -47,7 +47,7 @@ TRAIL_EMA_BUFFER       = float(os.getenv("NIKKEI_TRAIL_EMA_BUFFER", "0.005"))
 ADD_EMA_TOUCH_ZONE     = float(os.getenv("NIKKEI_ADD_EMA_TOUCH_ZONE", "0.003"))
 
 # -- Add-to-Winners (scaled for Nikkei) ----------------------------------------
-ADD_STRENGTH_ENABLED   = os.getenv("NIKKEI_ADD_STRENGTH_ENABLED", "false").lower() == "true"  # DISABLED: IG creates separate positions per add, stops not managed
+ADD_STRENGTH_ENABLED   = os.getenv("NIKKEI_ADD_STRENGTH_ENABLED", "true").lower() == "true"  # Multi-position stops managed: set stop on each deal_id
 ADD_STRENGTH_TRIGGER   = float(os.getenv("NIKKEI_ADD_STRENGTH_TRIGGER", "80"))
 ADD_STRENGTH_MAX       = int(os.getenv("NIKKEI_ADD_STRENGTH_MAX", "2"))
 
