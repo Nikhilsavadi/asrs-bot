@@ -61,6 +61,8 @@ MAX_SLIPPAGE_PTS   = int(os.getenv("US30_MAX_SLIPPAGE_PTS", "15"))
 MAX_SPREAD_PTS     = float(os.getenv("US30_MAX_SPREAD_PTS", "15.0"))
 DISASTER_STOP_PTS  = int(os.getenv("US30_DISASTER_STOP_PTS", "500"))
 MAX_DAILY_LOSS_GBP = float(os.getenv("US30_MAX_DAILY_LOSS_GBP", "200"))
+MAX_RISK_GBP       = float(os.getenv("US30_MAX_RISK_GBP", "50"))       # Cap risk per trade
+MAX_BAR_RANGE      = int(os.getenv("US30_MAX_BAR_RANGE", "300"))        # Skip if bar range > this
 STALE_PRICE_SECS   = int(os.getenv("US30_STALE_PRICE_SECS", "30"))
 
 # ── SPX Regime Filter (not applicable for SPX itself — disabled) ────────────

@@ -602,13 +602,22 @@ async def session2_routine():
 
     state = US30DailyState.load()
 
-    # Get morning direction
+    # Get morning direction — fall back to overnight bias if S1 didn't trade
     morning_dir = state.direction or state.reentry_direction
     if not morning_dir and state.trades:
         morning_dir = state.trades[0].get("direction", "")
     if not morning_dir:
-        logger.info("US30 S2: no morning direction — skipping")
-        return
+        # S1 didn't trade — use overnight bias instead
+        ob = state.overnight_bias
+        if ob in ("LONG_ONLY", "LONG"):
+            morning_dir = "LONG"
+        elif ob in ("SHORT_ONLY", "SHORT"):
+            morning_dir = "SHORT"
+        else:
+            logger.info("US30 S2: no morning direction and no overnight bias — skipping")
+            await _alert("US30 S2: skipped — no direction from S1 or overnight bias")
+            return
+        logger.info(f"US30 S2: no S1 trade, using overnight bias: {morning_dir}")
 
     if state.s2_phase != "IDLE":
         logger.info(f"US30 S2: already processed (s2_phase={state.s2_phase})")
