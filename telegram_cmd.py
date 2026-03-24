@@ -182,7 +182,7 @@ async def handle_status(dax_broker, **kwargs):
         f"  Position: {dax_pos}\n"
         f"  Today P&L: {dax_pnl or 'N/A'}\n"
         f"  Streaming bars: {stream_bars}\n"
-        f"<b>DAX S2</b> (11:00 CET)\n"
+        f"<b>DAX S2</b> (14:00 CET)\n"
         f"  Phase: {dax_s2_phase}{dax_s2_pos}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>US30 S1</b>\n"
@@ -192,6 +192,39 @@ async def handle_status(dax_broker, **kwargs):
         f"  Streaming bars: {us30_bars}\n"
         f"<b>US30 S2</b> (11:00 ET)\n"
         f"  Phase: {us30_s2_phase}{us30_s2_pos}\n"
+    )
+
+    # Nikkei
+    nk_phase = "N/A"
+    nk_pos = "FLAT"
+    nk_pnl = ""
+    nk_bars = 0
+    nk_s2_phase = "N/A"
+    try:
+        from nikkei_bot.main import broker as nk_broker
+        from nikkei_bot.main import NikkeiDailyState
+        nk_state = NikkeiDailyState.load()
+        nk_phase = str(nk_state.phase)
+        if nk_state.direction:
+            nk_pos = f"{nk_state.direction} @ {nk_state.entry_price}"
+        if hasattr(nk_state, 'trades') and nk_state.trades:
+            total_nk = sum(t.get("pnl_pts", 0) for t in nk_state.trades if isinstance(t.get("pnl_pts"), (int, float)))
+            nk_pnl = f"{'+' if total_nk >= 0 else ''}{round(total_nk, 1)} pts"
+        if nk_broker:
+            nk_bars = nk_broker.get_streaming_bar_count()
+        nk_s2_phase = getattr(nk_state, 's2_phase', 'IDLE')
+    except Exception:
+        pass
+
+    msg += (
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>NIKKEI S1</b> (10:00 JST)\n"
+        f"  Phase: {nk_phase}\n"
+        f"  Position: {nk_pos}\n"
+        f"  Today P&L: {nk_pnl or 'N/A'}\n"
+        f"  Streaming bars: {nk_bars}\n"
+        f"<b>NIKKEI S2</b> (12:00 JST)\n"
+        f"  Phase: {nk_s2_phase}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━"
     )
     await _send(msg)
