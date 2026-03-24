@@ -106,6 +106,8 @@ async def collect_overnight_bars():
             "Open": price, "High": price, "Low": price, "Close": price,
         })
         logger.info(f"Nikkei overnight cached: {price} ({len(_overnight_cache['bars'])} samples)")
+        if len(_overnight_cache["bars"]) == 1:
+            await _alert(f"🌙 Nikkei overnight collection started: {price}")
     else:
         logger.warning("Nikkei overnight collection: no price available")
 
@@ -282,8 +284,21 @@ async def stream_alive_check():
         logger.info(f"Stream check: {bar_count} NIKKEI bars — OK")
 
 
+_morning_running = False
+
 async def morning_routine():
     """09:21 JST — Calculate levels from bar 4/5 and place orders."""
+    global _morning_running
+    if _morning_running:
+        logger.warning("Nikkei morning routine already running — skipping duplicate")
+        return
+    _morning_running = True
+    try:
+        await _morning_routine_inner()
+    finally:
+        _morning_running = False
+
+async def _morning_routine_inner():
     now = datetime.now(config.TZ_JST)
     if now.weekday() >= 5:
         return
@@ -566,13 +581,21 @@ async def monitor_cycle():
 
                 trade = state.trades[-1] if state.trades else {}
                 await _alert(
-                    f"<b>NIKKEI EXIT</b>{' (MANUAL)' if manual_close else ''}\n"
+                    f"✅ <b>NIKKEI EXIT</b>{' (MANUAL)' if manual_close else ''}\n"
                     f"Direction: {trade.get('direction', '?')}\n"
                     f"Entry: {trade.get('entry', '?')} | Exit: {exit_price}\n"
                     f"PnL: {trade.get('pnl_pts', 0):.1f} pts\n"
                     f"MFE: {trade.get('mfe', 0):.1f} pts\n"
                     f"Reason: {trade.get('exit_reason', '?')}"
                 )
+
+                # Log to journal
+                try:
+                    from shared.journal_db import insert_trade
+                    insert_trade("NIKKEI", trade, state=None)
+                    logger.info(f"[NIKKEI] Trade logged to journal: {trade.get('pnl_pts', 0):.1f} pts")
+                except Exception as e:
+                    logger.warning(f"NIKKEI journal write failed: {e}")
 
                 # Re-entry: skip on manual close
                 if manual_close:

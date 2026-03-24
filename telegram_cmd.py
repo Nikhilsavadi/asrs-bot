@@ -432,6 +432,28 @@ async def handle_pnl():
     except ImportError:
         lines.append("\n<b>DAX</b>: N/A")
 
+    # US30 + Nikkei from shared journal DB
+    try:
+        from shared import journal_db
+        for inst in ["US30", "NIKKEI"]:
+            inst_trades = journal_db.get_trades_for_date(today, instrument=inst)
+            if inst_trades:
+                inst_pnl = sum(t.get("pnl_pts", 0) for t in inst_trades)
+                inst_wins = sum(1 for t in inst_trades if t.get("pnl_pts", 0) > 0)
+                inst_losses = sum(1 for t in inst_trades if t.get("pnl_pts", 0) < 0)
+                ps = "+" if inst_pnl >= 0 else ""
+                lines.append(
+                    f"\n<b>{inst}</b>: {ps}{round(inst_pnl, 1)} pts\n"
+                    f"  Trades: {len(inst_trades)} | W: {inst_wins} L: {inst_losses}"
+                )
+                for t in inst_trades:
+                    p = t.get("pnl_pts", 0)
+                    lines.append(f"  {t.get('direction', '?')} {'+' if p >= 0 else ''}{round(p, 1)} pts")
+            else:
+                lines.append(f"\n<b>{inst}</b>: No trades today")
+    except Exception as e:
+        lines.append(f"\n<b>US30/NIKKEI</b>: {e}")
+
     lines.append("━━━━━━━━━━━━━━━━━━━━━━")
     await _send("\n".join(lines))
 

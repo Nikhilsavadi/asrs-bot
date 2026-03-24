@@ -255,8 +255,21 @@ async def stream_alive_check():
         logger.info(f"Stream check: {bar_count} US30 bars — OK")
 
 
+_morning_running = False
+
 async def morning_routine():
     """09:51 ET — Calculate levels from bar 4/5 and place orders."""
+    global _morning_running
+    if _morning_running:
+        logger.warning("US30 morning routine already running — skipping duplicate")
+        return
+    _morning_running = True
+    try:
+        await _morning_routine_inner()
+    finally:
+        _morning_running = False
+
+async def _morning_routine_inner():
     now = datetime.now(config.TZ_ET)
     if now.weekday() >= 5:
         return
@@ -523,13 +536,21 @@ async def monitor_cycle():
 
                 trade = state.trades[-1] if state.trades else {}
                 await _alert(
-                    f"<b>US30 EXIT</b>{' (MANUAL)' if manual_close else ''}\n"
+                    f"✅ <b>US30 EXIT</b>{' (MANUAL)' if manual_close else ''}\n"
                     f"Direction: {trade.get('direction', '?')}\n"
                     f"Entry: {trade.get('entry', '?')} | Exit: {exit_price}\n"
                     f"PnL: {trade.get('pnl_pts', 0):.1f} pts\n"
                     f"MFE: {trade.get('mfe', 0):.1f} pts\n"
                     f"Reason: {trade.get('exit_reason', '?')}"
                 )
+
+                # Log to journal
+                try:
+                    from shared.journal_db import insert_trade
+                    insert_trade("US30", trade, state=None)
+                    logger.info(f"[US30] Trade logged to journal: {trade.get('pnl_pts', 0):.1f} pts")
+                except Exception as e:
+                    logger.warning(f"US30 journal write failed: {e}")
 
                 # Re-entry: skip on manual close
                 if manual_close:

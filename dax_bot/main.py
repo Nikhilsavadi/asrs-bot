@@ -186,6 +186,9 @@ async def collect_overnight_bars():
             "Open": price, "High": price, "Low": price, "Close": price,
         })
         logger.info(f"Overnight bar cached: {price} ({len(_overnight_bars_cache['bars'])} samples)")
+        # Alert on first sample of the day
+        if len(_overnight_bars_cache["bars"]) == 1:
+            await alerts.send(f"🌙 DAX overnight collection started: {price}")
     else:
         logger.warning("Overnight bar collection: no price available")
 
