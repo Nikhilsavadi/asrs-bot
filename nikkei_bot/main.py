@@ -343,7 +343,8 @@ async def _morning_routine_inner():
     now_cet = datetime.now(cet)
     # Tokyo open at 09:00 JST — convert to CET for bar filtering
     now_jst = datetime.now(jst)
-    tokyo_open_jst = now_jst.replace(hour=9, minute=0, second=0, microsecond=0)
+    session_open_hour = getattr(config, 'SESSION_OPEN_HOUR_JST', 10)
+    tokyo_open_jst = now_jst.replace(hour=session_open_hour, minute=0, second=0, microsecond=0)
 
     import pandas as pd
     tokyo_open_cet = pd.Timestamp(tokyo_open_jst).tz_convert(cet)
@@ -656,6 +657,113 @@ async def monitor_cycle():
                             )
     finally:
         _strat.config = original_config
+
+
+async def session2_routine():
+    """12:21 JST — Session 2 continuation trade using 12:00 JST bars."""
+    if not getattr(config, 'SESSION2_ENABLED', False):
+        return
+    now = datetime.now(config.TZ_JST)
+    if now.weekday() >= 5:
+        return
+
+    state = NikkeiDailyState.load()
+
+    # Get S1 direction or calculate from bars
+    morning_dir = state.direction or state.reentry_direction
+    if not morning_dir and state.trades:
+        morning_dir = state.trades[0].get("direction", "")
+    if not morning_dir:
+        try:
+            s2_df = broker.get_streaming_bars_df()
+            if s2_df is not None and not s2_df.empty:
+                from zoneinfo import ZoneInfo
+                cet = ZoneInfo("Europe/Berlin")
+                jst = config.TZ_JST
+                s2_hour = getattr(config, 'SESSION2_HOUR_JST', 12)
+                s2_open_jst = now.replace(hour=s2_hour, minute=0, second=0)
+                import pandas as pd
+                s2_open_cet = pd.Timestamp(s2_open_jst).tz_convert(cet)
+                pre_s2 = s2_df[s2_df.index < s2_open_cet]
+                if len(pre_s2) >= 5:
+                    mid = (pre_s2["High"].max() + pre_s2["Low"].min()) / 2
+                    morning_dir = "LONG" if pre_s2.iloc[-1]["Close"] > mid else "SHORT"
+                    logger.info(f"Nikkei S2: calculated bias from {len(pre_s2)} bars: {morning_dir}")
+        except Exception as e:
+            logger.warning(f"Nikkei S2: bar bias failed: {e}")
+    if not morning_dir:
+        logger.info("Nikkei S2: no direction available — skipping")
+        await _alert("[S4 NIKKEI] S2 skipped: no direction available")
+        return
+
+    if state.s2_phase != "IDLE":
+        return
+
+    logger.info("═══ NIKKEI SESSION 2 (12:00 JST) ═══")
+
+    # Get bars from S2 open
+    from zoneinfo import ZoneInfo
+    import pandas as pd
+    cet = ZoneInfo("Europe/Berlin")
+    s2_hour = getattr(config, 'SESSION2_HOUR_JST', 12)
+    s2_open_jst = now.replace(hour=s2_hour, minute=0, second=0)
+    s2_open_cet = pd.Timestamp(s2_open_jst).tz_convert(cet)
+
+    for retry in range(4):
+        df = broker.get_streaming_bars_df()
+        if not df.empty:
+            s2_bars = df[df.index >= s2_open_cet].sort_index()
+        else:
+            s2_bars = pd.DataFrame()
+        logger.info(f"Nikkei S2 bars from 12:00 JST (attempt {retry+1}): {len(s2_bars)}")
+        if len(s2_bars) >= 4:
+            break
+        if retry < 3:
+            await asyncio.sleep(15)
+
+    if len(s2_bars) < 4:
+        await _alert(f"[S4 NIKKEI] S2 ERROR: only {len(s2_bars)} bars (need 4)")
+        return
+
+    s2_bar = s2_bars.iloc[3]
+    s2_high = s2_bar["High"]; s2_low = s2_bar["Low"]
+    s2_range = s2_high - s2_low
+
+    if s2_range < config.BUFFER_PTS * 1.5 or s2_range > config.WIDE_RANGE * 2.5:
+        logger.info(f"Nikkei S2: range {s2_range:.1f} out of bounds — skipping")
+        state.s2_phase = "DONE"
+        state.save()
+        return
+
+    if morning_dir in ("LONG", "LONG_ACTIVE"):
+        state.s2_buy_level = s2_high + config.BUFFER_PTS
+        state.s2_sell_level = 0.01
+        bias_dir = "LONG"
+    else:
+        state.s2_buy_level = 999999
+        state.s2_sell_level = s2_low - config.BUFFER_PTS
+        bias_dir = "SHORT"
+
+    state.s2_phase = "ORDERS_PLACED"
+    state.s2_bar_high = s2_high
+    state.s2_bar_low = s2_low
+    state.save()
+
+    broker._pending_bracket_s2 = {
+        "buy_price": state.s2_buy_level,
+        "sell_price": state.s2_sell_level,
+        "qty": 1, "oca_group": f"NK_S2_{now.strftime('%Y-%m-%d')}",
+        "active": True,
+    }
+
+    await _alert(
+        f"📊 <b>[S4 NIKKEI] SESSION 2 ARMED</b>\n"
+        f"Bar 4 (12:00 JST): H={s2_high:.1f} L={s2_low:.1f}\n"
+        f"Range: {s2_range:.1f}pts\n"
+        f"Direction: {bias_dir} only\n"
+        f"Buy: {state.s2_buy_level:.1f} | Sell: {state.s2_sell_level:.1f}"
+    )
+    logger.info("Nikkei S2: orders placed — routine complete")
 
 
 async def end_of_day():

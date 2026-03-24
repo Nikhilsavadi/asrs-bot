@@ -75,14 +75,15 @@ TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 RISK_GBP   = float(os.getenv("NIKKEI_RISK_PER_TRADE_GBP", "25"))
 
 # -- Schedule (JST -- Asia/Tokyo) ----------------------------------------------
-# TSE opens 09:00 JST. Bar 4 closes at 09:20 JST. Schedule at 09:21 JST.
-# 09:21 JST = 00:21 UTC (winter), 00:21 UTC (no DST in Japan)
-MORNING_HOUR   = 0    # UTC hour for 09:21 JST (00:21 UTC)
+# S1 at 10:00 JST (bar 4 closes at 10:20 JST, routine at 10:21 JST)
+# 10:21 JST = 01:21 UTC (no DST in Japan)
+MORNING_HOUR   = 1    # UTC hour for 10:21 JST (01:21 UTC)
 MORNING_MINUTE = 21
+SESSION_OPEN_HOUR_JST = 10  # S1 uses 10:00 JST bars, not 09:00
 
-# -- Session 2 (disabled -- Nikkei S2 not worth it based on backtest) ----------
-SESSION2_ENABLED   = os.getenv("NIKKEI_SESSION2_ENABLED", "false").lower() == "true"
-SESSION2_HOUR_JST  = 12   # placeholder
+# -- Session 2 (12:00 JST — PF 1.92, lunch breakout) --------------------------
+SESSION2_ENABLED   = os.getenv("NIKKEI_SESSION2_ENABLED", "true").lower() == "true"
+SESSION2_HOUR_JST  = 12   # 12:00 JST = 03:00 UTC
 SESSION2_BAR_COUNT = 4
 
 # -- State ---------------------------------------------------------------------

@@ -237,9 +237,10 @@ async def main():
         day_of_week="mon-fri", hour=8, minute=25,
         id="dax_failsafe", misfire_grace_time=120)
 
-    # Session 2: 10:21 UK = 11:21 CET (after bar 4 of session 2 closes at 11:20)
+    # Session 2: 13:21 UK = 14:21 CET (US open overlap — PF 2.26)
+    # Bar 4 of S2 closes at 14:20 CET, routine fires at 14:21
     dax_scheduler.add_job(dax_main.session2_routine, "cron",
-        day_of_week="mon-fri", hour=10, minute=21,
+        day_of_week="mon-fri", hour=13, minute=21,
         id="dax_session2", misfire_grace_time=120)
 
     dax_scheduler.add_job(dax_main.monitor_cycle, "cron",
@@ -299,17 +300,26 @@ async def main():
 
     # ── Nikkei schedule (all times UTC; TSE 09:00-15:00 JST = 00:00-06:00 UTC) ──
     if nikkei_main is not None:
+        # Nikkei S1 at 10:00 JST = 01:00 UTC, S2 at 12:00 JST = 03:00 UTC
+        # Health check at 09:00 JST = 00:00 UTC, warmup at 09:50 JST = 00:50 UTC
         dax_scheduler.add_job(nikkei_main.health_check, "cron",
             day_of_week="mon-fri", hour=0, minute=0,
             id="nikkei_health", misfire_grace_time=120)
 
         dax_scheduler.add_job(nikkei_main.pre_trade_warmup, "cron",
-            day_of_week="mon-fri", hour=0, minute=10,
+            day_of_week="mon-fri", hour=1, minute=10,
             id="nikkei_prewarm", misfire_grace_time=120)
 
+        # S1: 10:21 JST = 01:21 UTC
         dax_scheduler.add_job(nikkei_main.morning_routine, "cron",
-            day_of_week="mon-fri", hour=0, minute=21,
+            day_of_week="mon-fri", hour=1, minute=21,
             id="nikkei_morning", misfire_grace_time=120)
+
+        # S2: 12:21 JST = 03:21 UTC
+        if hasattr(nikkei_main, 'session2_routine'):
+            dax_scheduler.add_job(nikkei_main.session2_routine, "cron",
+                day_of_week="mon-fri", hour=3, minute=21,
+                id="nikkei_session2", misfire_grace_time=120)
 
         dax_scheduler.add_job(nikkei_main.monitor_cycle, "cron",
             day_of_week="mon-fri", hour="0-6", minute="*",

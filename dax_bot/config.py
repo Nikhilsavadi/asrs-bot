@@ -93,7 +93,7 @@ MORNING_MINUTE = 21
 
 # ── Session 2 (11:00 CET continuation) ──────────────────────────────────────
 SESSION2_ENABLED   = os.getenv("SESSION2_ENABLED", "true").lower() == "true"
-SESSION2_HOUR_CET  = 11   # 11:00 CET = 10:00 UK
+SESSION2_HOUR_CET  = 14   # 14:00 CET = 13:00 UK (US open overlap — PF 2.26)
 SESSION2_BAR_COUNT = 4    # Use bar 4 of session 2 (11:00-11:20 CET)
 MONITOR_START  = "08:21"
 MONITOR_END    = "17:30"
