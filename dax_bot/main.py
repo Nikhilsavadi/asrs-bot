@@ -312,6 +312,18 @@ async def on_candle_complete(bar: dict):
         else:
             logger.info(f"Bar 4 complete but phase={state.phase} — skipping trigger")
 
+    # S2 event-driven trigger: bar 4 of S2 session
+    if config.SESSION2_ENABLED:
+        s2_open_minutes = config.SESSION2_HOUR_CET * 60
+        s2_bar_minutes = bar_time.hour * 60 + bar_time.minute - s2_open_minutes
+        if s2_bar_minutes >= 0:
+            s2_bar_number = s2_bar_minutes // 5 + 1
+            if s2_bar_number == 4:
+                state = DailyState.load()
+                if state.s2_phase == "IDLE":
+                    logger.info("S2 Bar 4 complete — triggering session2_routine (event-driven)")
+                    await session2_routine()
+
 
 async def pre_trade_warmup():
     """08:00 UK — Verify REST + Lightstreamer are both alive before critical window.

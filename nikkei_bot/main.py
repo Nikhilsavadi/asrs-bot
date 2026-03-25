@@ -210,6 +210,20 @@ async def on_candle_complete(bar: dict):
             logger.info(f"Bar 4 complete — triggering Nikkei morning routine (event-driven)")
             await morning_routine()
 
+    # S2 event-driven trigger: bar 4 of S2 session (12:00 JST)
+    if getattr(config, 'SESSION2_ENABLED', False):
+        s2_hour_jst = getattr(config, 'SESSION2_HOUR_JST', 12)
+        s2_open_jst = now_jst.replace(hour=s2_hour_jst, minute=0, second=0)
+        s2_open_cet = pd.Timestamp(s2_open_jst).tz_convert(cet)
+        s2_bar_minutes = (bar_time.hour * 60 + bar_time.minute) - (s2_open_cet.hour * 60 + s2_open_cet.minute)
+        if s2_bar_minutes >= 0:
+            s2_bar_number = s2_bar_minutes // 5 + 1
+            if s2_bar_number == 4:
+                state = NikkeiDailyState.load()
+                if state.s2_phase == "IDLE":
+                    logger.info("Nikkei S2 Bar 4 complete — triggering session2_routine (event-driven)")
+                    await session2_routine()
+
 
 async def collect_overnight_bars():
     """Hourly job (15:00-00:00 UTC = 00:00-09:00 JST) — sample current price for overnight range."""

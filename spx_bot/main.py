@@ -203,6 +203,18 @@ async def on_candle_complete(bar: dict):
             logger.info(f"US30 Bar 4 complete — triggering morning routine (event-driven)")
             await morning_routine()
 
+    # S2 event-driven trigger: bar 4 of S2 session (11:00 ET = 16:00 CET)
+    if getattr(config, 'SESSION2_ENABLED', False):
+        s2_open_minutes = getattr(config, 'SESSION2_HOUR_CET', 16) * 60  # 11:00 ET = 16:00 CET
+        s2_bar_minutes = bar_minutes - s2_open_minutes
+        if s2_bar_minutes >= 0:
+            s2_bar_number = s2_bar_minutes // 5 + 1
+            if s2_bar_number == 4:
+                state = US30DailyState.load()
+                if state.s2_phase == "IDLE":
+                    logger.info("US30 S2 Bar 4 complete — triggering session2_routine (event-driven)")
+                    await session2_routine()
+
 
 async def on_tick_trigger(trigger: dict):
     """Called instantly when a tick crosses bracket levels (sub-second).
