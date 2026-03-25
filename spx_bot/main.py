@@ -76,6 +76,7 @@ async def init(shared_session, stream_manager, tg_send=None):
 
     broker = IGBroker(shared_session, stream_manager, config.IG_EPIC, "GBP")
     broker.register_trigger_callback(on_tick_trigger)
+    broker.register_order_handler(_handle_fill_event)
     _tg_send = tg_send
     _shared_session = shared_session
     logger.info(f"US30 bot initialized: {config.IG_EPIC}")
@@ -84,6 +85,93 @@ async def init(shared_session, stream_manager, tg_send=None):
 _shared_session = None
 _prefetch_cache: dict = {}  # Pre-fetched data from warmup (gap, overnight bars)
 _bar4_triggered = False  # Prevent double-trigger from callback + schedule
+
+# Trade stream exit levels — used when IG stop fires server-side and /confirms returns 404
+_last_stream_exit_levels: dict[str, float] = {}
+
+
+async def _check_slippage(state: US30DailyState, fill_price: float) -> bool:
+    """Check if fill slipped too far from trigger level. Returns True if OK, False if excessive.
+    Slippage limit is proportional to the trade's initial risk (bar range), not a fixed number.
+    If slippage < 50% of risk -> keep trade (slightly worse R:R but still valid).
+    If slippage > 50% of risk -> close immediately (trade invalidated).
+    """
+    trigger_price = state.buy_level if state.direction == "LONG" else state.sell_level
+    slippage = abs(fill_price - trigger_price)
+    initial_risk = state.bar_range + config.BUFFER_PTS * 2  # bar range + both buffers
+    max_slip = initial_risk * config.MAX_SLIPPAGE_PCT  # default 50% of risk
+    if slippage > max_slip:
+        logger.error(f"EXCESSIVE SLIPPAGE: fill={fill_price}, trigger={trigger_price}, "
+                     f"slip={slippage:.1f}pts > {max_slip:.1f}pts ({config.MAX_SLIPPAGE_PCT*100:.0f}% of {initial_risk:.1f}pt risk)")
+        await _alert(
+            "EXCESSIVE SLIPPAGE -- CLOSING\n"
+            f"Trigger: {trigger_price} | Fill: {fill_price}\n"
+            f"Slippage: {slippage:.1f} pts (limit: {max_slip:.1f} = {config.MAX_SLIPPAGE_PCT*100:.0f}% of risk)\n"
+            "Closing position immediately."
+        )
+        try:
+            await broker.close_position()
+            if fill_price:
+                process_stop_hit(state, fill_price)
+                if state.trades and state.trades[-1].get("exit"):
+                    state.trades[-1]["exit_reason"] = "SLIPPAGE_CLOSE"
+
+            # Slippage close = missed entry, not a failed trade.
+            # Re-arm the bracket for another attempt if entries remain.
+            if state.entries_used < config.MAX_ENTRIES:
+                state.phase = Phase.ORDERS_PLACED
+                state.direction = ""
+                state.entry_price = 0
+                logger.info(f"Slippage close -- re-arming bracket (entry {state.entries_used}/{config.MAX_ENTRIES})")
+                await _alert("Re-arming bracket after slippage close")
+                await broker.place_oca_bracket(
+                    state.buy_level, state.sell_level,
+                    qty=state.position_size or config.NUM_CONTRACTS,
+                    oca_group=f"US30_{state.date}_{state.entries_used + 1}"
+                )
+            else:
+                state.phase = Phase.DONE
+                logger.info("Slippage close -- max entries reached, done for today")
+            state.save()
+        except Exception as e:
+            logger.error(f"Slippage close failed: {e}")
+            await _alert(f"Slippage close FAILED: {e}\nManual intervention required!")
+        return False
+    return True
+
+
+def _check_daily_loss_limit() -> bool:
+    """Return True if daily loss limit is breached."""
+    from shared.journal_db import get_trades_for_date
+    today_str = datetime.now(config.TZ_UK).strftime("%Y-%m-%d")
+    trades = get_trades_for_date(today_str, instrument="US30")
+    day_pnl = sum(t.get("pnl_gbp", 0) or 0 for t in trades)
+    if day_pnl <= -config.MAX_DAILY_LOSS_GBP:
+        logger.warning(f"Daily loss limit hit: {day_pnl:.2f} GBP (limit: -{config.MAX_DAILY_LOSS_GBP})")
+        return True
+    return False
+
+
+async def _handle_fill_event(data):
+    """
+    Event-driven handler for IG streaming trade updates (OPU dict).
+    Currently used for logging + storing exit levels for accurate PnL
+    when IG server-side stops fire and /confirms returns 404.
+    """
+    if not isinstance(data, dict):
+        return
+
+    deal_status = data.get("dealStatus", data.get("status", ""))
+    deal_id = data.get("dealId", "")
+    level = data.get("level", 0)
+    direction = data.get("direction", "")
+
+    logger.info(f"[US30] Trade stream event: dealId={deal_id} status={deal_status} "
+                f"direction={direction} level={level}")
+
+    # Store last stream exit level for accurate PnL when IG stop fires
+    if level and float(level) > 0:
+        _last_stream_exit_levels[deal_id] = float(level)
 
 
 async def on_candle_complete(bar: dict):
@@ -160,6 +248,10 @@ async def on_tick_trigger(trigger: dict):
     })
     state.save()
     logger.info(f"US30 tick trigger fill: {direction} @ {fill_price}")
+
+    # Slippage guard
+    if not await _check_slippage(state, fill_price):
+        return
 
     # Place stop on IG
     try:
@@ -409,6 +501,16 @@ async def _morning_routine_inner():
         state.position_size = min(config.NUM_CONTRACTS * config.NARROW_STD_MULTIPLIER, config.MAX_CONTRACTS)
     state.save()
 
+    # Daily loss circuit breaker
+    if _check_daily_loss_limit():
+        state.phase = Phase.DONE
+        state.save()
+        await _alert(
+            "<b>DAILY LOSS LIMIT</b>\n"
+            f"No entries today -- max daily loss ({config.MAX_DAILY_LOSS_GBP:.0f} GBP) reached."
+        )
+        return
+
     # ARM BRACKET IMMEDIATELY (both sides) — speed is critical at US open
     qty = min(config.NUM_CONTRACTS, config.MAX_CONTRACTS)
     state.position_size = qty
@@ -539,6 +641,13 @@ async def monitor_cycle():
             if pos and pos["direction"] == "FLAT" and state.contracts_active > 0:
                 exit_price = await broker.get_fill_price(state.stop_order_id)
                 if not exit_price:
+                    # IG server-side stop: /confirms returns 404. Use trade stream level.
+                    for did in list(_last_stream_exit_levels.keys()):
+                        exit_price = _last_stream_exit_levels.pop(did, None)
+                        if exit_price:
+                            logger.info(f"Using trade stream exit level: {exit_price} (deal {did})")
+                            break
+                if not exit_price:
                     exit_price = state.trailing_stop
                     logger.info(f"US30: /confirms failed — using trailing_stop as exit: {exit_price}")
 
@@ -589,23 +698,32 @@ async def monitor_cycle():
                     state.save()
                     logger.info("US30: skipping re-entry after manual close")
                 elif "CAN_REENTER" in events:
-                    if state.reentry_direction == "LONG":
-                        state.buy_level = state.reentry_price
-                        state.sell_level = 0.01
-                    else:
-                        state.buy_level = 999999.0
-                        state.sell_level = state.reentry_price
-                    state.save()
-                    result = await broker.place_oca_bracket(
-                        buy_price=state.buy_level, sell_price=state.sell_level,
-                        qty=state.position_size or config.NUM_CONTRACTS,
-                        oca_group=f"US30_{state.date}_{state.entries_used + 1}",
-                    )
-                    if "error" not in result:
-                        state.buy_order_id = result.get("buy_order_id", "")
-                        state.sell_order_id = result.get("sell_order_id", "")
-                        state.phase = Phase.ORDERS_PLACED
+                    if _check_daily_loss_limit():
+                        state.phase = Phase.DONE
                         state.save()
+                        await _alert("RE-ENTRY BLOCKED -- daily loss limit hit")
+                    elif state.entries_used >= config.MAX_ENTRIES:
+                        state.phase = Phase.DONE
+                        state.save()
+                        logger.info(f"Re-entry blocked: max entries reached ({state.entries_used}/{config.MAX_ENTRIES})")
+                    else:
+                        if state.reentry_direction == "LONG":
+                            state.buy_level = state.reentry_price
+                            state.sell_level = 0.01
+                        else:
+                            state.buy_level = 999999.0
+                            state.sell_level = state.reentry_price
+                        state.save()
+                        result = await broker.place_oca_bracket(
+                            buy_price=state.buy_level, sell_price=state.sell_level,
+                            qty=state.position_size or config.NUM_CONTRACTS,
+                            oca_group=f"US30_{state.date}_{state.entries_used + 1}",
+                        )
+                        if "error" not in result:
+                            state.buy_order_id = result.get("buy_order_id", "")
+                            state.sell_order_id = result.get("sell_order_id", "")
+                            state.phase = Phase.ORDERS_PLACED
+                            state.save()
                         await _alert(
                             f"RE-ENTRY ARMED US30\n"
                             f"Direction: {state.reentry_direction}\n"
@@ -691,6 +809,12 @@ async def session2_routine():
 
     if state.s2_phase != "IDLE":
         logger.info(f"US30 S2: already processed (s2_phase={state.s2_phase})")
+        return
+
+    # Skip if daily loss limit hit
+    if _check_daily_loss_limit():
+        logger.info("US30 S2: daily loss limit — skipping")
+        await _alert("US30 S2 SKIPPED: daily loss limit hit")
         return
 
     logger.info("═══ US30 SESSION 2 (11:00 ET) ═══")

@@ -58,6 +58,7 @@ TP2_PTS        = float(os.getenv("US30_TP2_PTS", "60"))    # ~50 DAX pts
 
 # ── Risk Management ──────────────────────────────────────────────────────────
 MAX_SLIPPAGE_PTS   = int(os.getenv("US30_MAX_SLIPPAGE_PTS", "15"))
+MAX_SLIPPAGE_PCT   = float(os.getenv("US30_MAX_SLIPPAGE_PCT", "0.5"))  # Max slippage as % of initial risk (50%)
 MAX_SPREAD_PTS     = float(os.getenv("US30_MAX_SPREAD_PTS", "15.0"))
 DISASTER_STOP_PTS  = int(os.getenv("US30_DISASTER_STOP_PTS", "500"))
 MAX_DAILY_LOSS_GBP = float(os.getenv("US30_MAX_DAILY_LOSS_GBP", "200"))
