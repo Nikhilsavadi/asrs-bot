@@ -1263,12 +1263,19 @@ async def _handle_fill_event(data):
                     state.save()
                     return
                 try:
+                    # Re-entry: stop at the trail stop level that just exited us
+                    reentry_stop = state.trailing_stop
                     if state.reentry_direction == "LONG":
                         state.buy_level = state.reentry_price
                         state.sell_level = 0.01
+                        state.bar_low = reentry_stop - config.BUFFER_PTS
+                        state.bar_high = state.reentry_price + abs(state.reentry_price - reentry_stop)
                     else:
                         state.buy_level = 999999.0
                         state.sell_level = state.reentry_price
+                        state.bar_high = reentry_stop + config.BUFFER_PTS
+                        state.bar_low = state.reentry_price - abs(reentry_stop - state.reentry_price)
+                    state.bar_range = abs(state.bar_high - state.bar_low)
                     state.save()
                     await place_bracket_orders(state)
                     state = DailyState.load()
@@ -1710,12 +1717,19 @@ async def _monitor_cycle_inner():
                     state.save()
                     return
                 try:
+                    # Re-entry: stop at the trail stop level that just exited us
+                    reentry_stop = state.trailing_stop
                     if state.reentry_direction == "LONG":
                         state.buy_level = state.reentry_price
                         state.sell_level = 0.01
+                        state.bar_low = reentry_stop - config.BUFFER_PTS
+                        state.bar_high = state.reentry_price + abs(state.reentry_price - reentry_stop)
                     else:
                         state.buy_level = 999999.0
                         state.sell_level = state.reentry_price
+                        state.bar_high = reentry_stop + config.BUFFER_PTS
+                        state.bar_low = state.reentry_price - abs(reentry_stop - state.reentry_price)
+                    state.bar_range = abs(state.bar_high - state.bar_low)
                     state.save()
                     await place_bracket_orders(state)
                     state = DailyState.load()

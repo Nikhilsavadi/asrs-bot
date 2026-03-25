@@ -719,12 +719,19 @@ async def monitor_cycle():
                         state.save()
                         logger.info(f"Re-entry blocked: max entries reached ({state.entries_used}/{config.MAX_ENTRIES})")
                     else:
+                        # Re-entry: stop at the trail stop level that just exited us
+                        reentry_stop = state.trailing_stop
                         if state.reentry_direction == "LONG":
                             state.buy_level = state.reentry_price
                             state.sell_level = 0.01
+                            state.bar_low = reentry_stop - config.BUFFER_PTS
+                            state.bar_high = state.reentry_price + abs(state.reentry_price - reentry_stop)
                         else:
                             state.buy_level = 999999.0
                             state.sell_level = state.reentry_price
+                            state.bar_high = reentry_stop + config.BUFFER_PTS
+                            state.bar_low = state.reentry_price - abs(reentry_stop - state.reentry_price)
+                        state.bar_range = abs(state.bar_high - state.bar_low)
                         state.save()
                         result = await broker.place_oca_bracket(
                             buy_price=state.buy_level, sell_price=state.sell_level,
