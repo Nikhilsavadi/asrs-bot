@@ -817,6 +817,10 @@ async def monitor_cycle():
     finally:
         _strat.config = original_config
 
+    # Session 2 monitoring
+    if getattr(config, 'SESSION2_ENABLED', False):
+        await _monitor_s2()
+
 
 async def session2_routine():
     """12:21 JST — Session 2 continuation trade using 12:00 JST bars."""
@@ -912,6 +916,7 @@ async def session2_routine():
     state.s2_phase = "ORDERS_PLACED"
     state.s2_bar_high = s2_high
     state.s2_bar_low = s2_low
+    state.s2_bar_range = s2_range
     state.save()
 
     broker._pending_bracket_s2 = {
@@ -929,6 +934,144 @@ async def session2_routine():
         f"Buy: {state.s2_buy_level:.1f} | Sell: {state.s2_sell_level:.1f}"
     )
     logger.info("Nikkei S2: orders placed — routine complete")
+
+
+async def _monitor_s2():
+    """Nikkei Session 2 monitoring — polled every minute."""
+    state = NikkeiDailyState.load()
+    if state.s2_phase in ("IDLE", "DONE"):
+        return
+
+    price = await broker.get_current_price()
+    if not price or price <= 0:
+        return
+
+    # Swap config for strategy calls
+    original_config = _strat.config
+    _strat.config = config
+
+    try:
+        if state.s2_phase == "ORDERS_PLACED":
+            # Check entry trigger
+            triggered = None
+            if state.s2_buy_level < 999999 and price >= state.s2_buy_level:
+                triggered = "LONG"
+            elif state.s2_sell_level > 0.02 and price <= state.s2_sell_level:
+                triggered = "SHORT"
+
+            if triggered:
+                action = "BUY" if triggered == "LONG" else "SELL"
+                qty = state.position_size or config.NUM_CONTRACTS
+                result = await broker.place_market_order(action, qty)
+
+                if "order_id" not in result:
+                    logger.error(f"NIKKEI S2 entry FAILED: {result}")
+                    state.s2_phase = "DONE"
+                    state.save()
+                    return
+
+                fill = result.get("avg_price", price)
+                deal_id = result.get("order_id", "")
+
+                state.s2_direction = triggered
+                state.s2_entry_price = fill
+                state.s2_phase = f"{triggered}_ACTIVE"
+                state.s2_contracts_active = qty
+                state.s2_entries_used = 1
+                state.s2_last_add_price = fill
+
+                if triggered == "LONG":
+                    state.s2_initial_stop = state.s2_bar_low - config.BUFFER_PTS
+                else:
+                    state.s2_initial_stop = state.s2_bar_high + config.BUFFER_PTS
+                state.s2_trailing_stop = state.s2_initial_stop
+
+                try:
+                    await broker.modify_stop(deal_id, state.s2_trailing_stop)
+                except Exception as e:
+                    logger.error(f"NIKKEI S2 stop failed: {e}")
+
+                state.save()
+                slippage = abs(fill - (state.s2_buy_level if triggered == "LONG" else state.s2_sell_level))
+                await _alert(
+                    f"📊 <b>NIKKEI S2 {triggered}</b>\n"
+                    f"Entry: {fill:.1f}\n"
+                    f"Stop: {state.s2_trailing_stop:.1f}\n"
+                    f"Range: {state.s2_bar_range:.1f}pts\n"
+                    f"Slippage: {slippage:.1f}pts"
+                )
+            return
+
+        if state.s2_phase in ("LONG_ACTIVE", "SHORT_ACTIVE"):
+            # Check exit
+            s2_stopped = False
+            if state.s2_direction == "LONG" and price <= state.s2_trailing_stop:
+                s2_stopped = True
+            elif state.s2_direction == "SHORT" and price >= state.s2_trailing_stop:
+                s2_stopped = True
+
+            if s2_stopped:
+                exit_price = state.s2_trailing_stop
+                pnl = (exit_price - state.s2_entry_price) if state.s2_direction == "LONG" else (state.s2_entry_price - exit_price)
+                state.s2_phase = "DONE"
+                state.save()
+                await _alert(
+                    f"📊 <b>NIKKEI S2 EXIT</b> {state.s2_direction}\n"
+                    f"Entry: {state.s2_entry_price:.1f} | Exit: {exit_price:.1f}\n"
+                    f"P&L: {pnl:+.1f}pts | MFE: {state.s2_max_favourable:.1f}pts"
+                )
+
+                # Log to journal
+                try:
+                    from shared.journal_db import insert_trade
+                    trade_dict = {
+                        "instrument": "NIKKEI", "direction": state.s2_direction,
+                        "entry": state.s2_entry_price, "exit": exit_price,
+                        "pnl_pts": round(pnl, 1), "mfe": state.s2_max_favourable,
+                        "exit_reason": "S2_TRAILED_STOP" if state.s2_breakeven_hit else "S2_INITIAL_STOP",
+                        "session": "S2",
+                    }
+                    insert_trade("NIKKEI_S2", trade_dict, state=None)
+                    logger.info(f"[NIKKEI] S2 trade logged: {pnl:+.1f}pts")
+                except Exception as e:
+                    logger.warning(f"NIKKEI S2 journal write failed: {e}")
+                return
+
+            # Update MFE
+            unrealized = (price - state.s2_entry_price) if state.s2_direction == "LONG" else (state.s2_entry_price - price)
+            if unrealized > state.s2_max_favourable:
+                state.s2_max_favourable = unrealized
+
+            # Breakeven
+            if not state.s2_breakeven_hit and unrealized >= config.TRAIL_BREAKEVEN_PTS:
+                state.s2_breakeven_hit = True
+                state.s2_trailing_stop = state.s2_entry_price
+                state.save()
+                await _alert(f"📊 NIKKEI S2 BREAKEVEN — stop → {state.s2_entry_price:.1f}")
+
+            # Candle trail
+            df = broker.get_streaming_bars_df()
+            if not df.empty and len(df) >= 2:
+                prev_bar = df.iloc[-2]
+                use_tight = unrealized >= config.TRAIL_TIGHT_THRESHOLD
+                if state.s2_direction == "LONG":
+                    new_stop = prev_bar["Close"] if use_tight else prev_bar["Low"]
+                    if new_stop > state.s2_trailing_stop:
+                        old = state.s2_trailing_stop
+                        state.s2_trailing_stop = new_stop
+                        if abs(new_stop - old) >= config.TRAIL_MIN_MOVE:
+                            await _alert(f"📊 NIKKEI S2 TRAIL ↑\nStop: {old:.1f} → {new_stop:.1f}\n🔒 Locked: {new_stop - state.s2_entry_price:.1f}pts")
+                else:
+                    new_stop = prev_bar["Close"] if use_tight else prev_bar["High"]
+                    if new_stop < state.s2_trailing_stop:
+                        old = state.s2_trailing_stop
+                        state.s2_trailing_stop = new_stop
+                        if abs(new_stop - old) >= config.TRAIL_MIN_MOVE:
+                            await _alert(f"📊 NIKKEI S2 TRAIL ↓\nStop: {old:.1f} → {new_stop:.1f}\n🔒 Locked: {state.s2_entry_price - new_stop:.1f}pts")
+
+            state.save()
+    finally:
+        _strat.config = original_config
 
 
 async def end_of_day():
