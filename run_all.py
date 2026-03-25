@@ -138,6 +138,7 @@ async def main():
 
             # Initialize US30 bot
             await _spx_main.init(shared, stream_mgr, tg_send=telegram_cmd._send)
+            stream_mgr.register_candle_callback(spx_config.IG_EPIC, _spx_main.on_candle_complete)
             spx_main = _spx_main
             logger.info("Strategy 3 (US30 ASRS) initialized")
         except Exception as e:
@@ -162,6 +163,7 @@ async def main():
 
             # Initialize Nikkei bot
             await _nikkei_main.init(shared, stream_mgr, tg_send=telegram_cmd._send)
+            stream_mgr.register_candle_callback(nikkei_config.IG_EPIC, _nikkei_main.on_candle_complete)
             nikkei_main = _nikkei_main
             logger.info("Strategy 4 (Nikkei ASRS) initialized")
         except Exception as e:

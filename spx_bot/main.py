@@ -83,6 +83,37 @@ async def init(shared_session, stream_manager, tg_send=None):
 
 _shared_session = None
 _prefetch_cache: dict = {}  # Pre-fetched data from warmup (gap, overnight bars)
+_bar4_triggered = False  # Prevent double-trigger from callback + schedule
+
+
+async def on_candle_complete(bar: dict):
+    """Called on every CONS_END bar. Triggers morning routine when bar 4 arrives."""
+    global _bar4_triggered
+    from zoneinfo import ZoneInfo
+    cet = ZoneInfo("Europe/Berlin")
+
+    bar_time = bar.get("time")  # CET datetime
+    if not bar_time:
+        return
+
+    today_cet = datetime.now(cet).date()
+    if bar_time.date() != today_cet:
+        return
+
+    # US30 opens at 14:30 CET. Bar number from that time.
+    us_open_minutes = 14 * 60 + 30  # 14:30 CET
+    bar_minutes = bar_time.hour * 60 + bar_time.minute
+    minutes_since_open = bar_minutes - us_open_minutes
+    if minutes_since_open < 0:
+        return
+    bar_number = minutes_since_open // 5 + 1
+
+    if bar_number == 4 and not _bar4_triggered:
+        state = US30DailyState.load()
+        if state.phase == Phase.IDLE:
+            _bar4_triggered = True
+            logger.info(f"US30 Bar 4 complete — triggering morning routine (event-driven)")
+            await morning_routine()
 
 
 async def on_tick_trigger(trigger: dict):
@@ -870,6 +901,8 @@ async def end_of_day():
         await broker.place_market_order(close_action, state.contracts_active)
         await _alert("US30 END OF DAY — S1 positions closed")
 
+    global _bar4_triggered
+    _bar4_triggered = False
     state.phase = Phase.DONE
     state.s2_phase = "DONE"
     state.save()

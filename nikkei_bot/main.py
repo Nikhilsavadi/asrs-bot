@@ -85,6 +85,43 @@ async def init(shared_session, stream_manager, tg_send=None):
 
 
 _shared_session = None
+_bar4_triggered = False  # Prevent double-trigger from callback + schedule
+
+
+async def on_candle_complete(bar: dict):
+    """Called on every CONS_END bar. Triggers morning routine when bar 4 arrives."""
+    global _bar4_triggered
+    from zoneinfo import ZoneInfo
+    cet = ZoneInfo("Europe/Berlin")
+    jst = config.TZ_JST
+
+    bar_time = bar.get("time")  # CET datetime
+    if not bar_time:
+        return
+
+    today_cet = datetime.now(cet).date()
+    if bar_time.date() != today_cet:
+        return
+
+    # Convert session open from JST to CET
+    session_open_jst_hour = getattr(config, 'SESSION_OPEN_HOUR_JST', 10)
+    now_jst = datetime.now(jst)
+    import pandas as pd
+    session_open_jst = now_jst.replace(hour=session_open_jst_hour, minute=0, second=0)
+    session_open_cet = pd.Timestamp(session_open_jst).tz_convert(cet)
+
+    # Bar number from session open
+    bar_minutes = (bar_time.hour * 60 + bar_time.minute) - (session_open_cet.hour * 60 + session_open_cet.minute)
+    if bar_minutes < 0:
+        return
+    bar_number = bar_minutes // 5 + 1
+
+    if bar_number == 4 and not _bar4_triggered:
+        state = NikkeiDailyState.load()
+        if state.phase == Phase.IDLE:
+            _bar4_triggered = True
+            logger.info(f"Bar 4 complete — triggering Nikkei morning routine (event-driven)")
+            await morning_routine()
 
 
 async def collect_overnight_bars():
@@ -782,5 +819,7 @@ async def end_of_day():
         await broker.place_market_order(close_action, state.contracts_active)
         await _alert("NIKKEI END OF DAY — positions closed")
 
+    global _bar4_triggered
+    _bar4_triggered = False
     state.phase = Phase.DONE
     state.save()
