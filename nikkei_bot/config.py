@@ -61,7 +61,7 @@ MAX_SLIPPAGE_PCT   = float(os.getenv("NIKKEI_MAX_SLIPPAGE_PCT", "0.5"))  # Max s
 MAX_SPREAD_PTS     = float(os.getenv("NIKKEI_MAX_SPREAD_PTS", "50.0"))   # Nikkei has wider IG spread ~30pts
 DISASTER_STOP_PTS  = int(os.getenv("NIKKEI_DISASTER_STOP_PTS", "1000"))
 MAX_DAILY_LOSS_GBP = float(os.getenv("NIKKEI_MAX_DAILY_LOSS_GBP", "200"))
-MAX_RISK_GBP       = float(os.getenv("NIKKEI_MAX_RISK_GBP", "50.0"))    # Max £ risk per trade — skip if exceeded
+MAX_RISK_GBP       = float(os.getenv("NIKKEI_MAX_RISK_GBP", "75.0"))    # Max £ risk per trade — higher for Nikkei ~52k price level
 MAX_BAR_RANGE      = int(os.getenv("NIKKEI_MAX_BAR_RANGE", "250"))       # Skip trade if bar range > this
 STALE_PRICE_SECS   = int(os.getenv("NIKKEI_STALE_PRICE_SECS", "30"))
 

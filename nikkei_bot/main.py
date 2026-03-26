@@ -487,29 +487,37 @@ async def _morning_routine_inner():
 
     # FAST PATH: Get bar 4 from streaming FIRST, arm bracket immediately
     # Gap and overnight are done AFTER bracket is armed
-    # Calculate levels directly — streaming bars are in CET, Tokyo open is 01:00 CET (winter)
-    # We can't use DAX's candle_number() which is hardcoded to 09:00 CET
+    # Calculate session open in UTC — avoids all timezone conversion bugs
     from zoneinfo import ZoneInfo
+    import pandas as pd
+    utc = ZoneInfo("UTC")
     cet = ZoneInfo("Europe/Berlin")
     jst = config.TZ_JST
-    now_cet = datetime.now(cet)
-    # Tokyo open at 09:00 JST — convert to CET for bar filtering
-    now_jst = datetime.now(jst)
+
     session_open_hour = getattr(config, 'SESSION_OPEN_HOUR_JST', 10)
-    tokyo_open_jst = now_jst.replace(hour=session_open_hour, minute=0, second=0, microsecond=0)
+    # Convert session open JST to UTC directly
+    now_jst = datetime.now(jst)
+    session_open_jst = now_jst.replace(hour=session_open_hour, minute=0, second=0, microsecond=0)
+    session_open_utc = session_open_jst.astimezone(utc)
+    # Convert to CET for bar index comparison (bars stored in CET)
+    session_open_cet = session_open_jst.astimezone(cet)
 
-    import pandas as pd
-    tokyo_open_cet = pd.Timestamp(tokyo_open_jst).tz_convert(cet)
+    logger.info(f"Session open: {session_open_hour}:00 JST = {session_open_cet.strftime('%H:%M')} CET = {session_open_utc.strftime('%H:%M')} UTC")
 
-    # Filter bars from Tokyo open onwards — retry up to 60s if bar 4 not yet received
+    # Filter bars from session open onwards — retry up to 60s if bar 4 not yet received
     for retry in range(4):
         df = broker.get_streaming_bars_df()
         if not df.empty:
-            today_bars = df[df.index.date == tokyo_open_cet.date()] if hasattr(df.index, 'date') else df
-            nikkei_bars = today_bars[today_bars.index >= tokyo_open_cet].sort_index()
+            # Use naive comparison: filter bars where CET hour:minute >= session open
+            session_h = session_open_cet.hour
+            session_m = session_open_cet.minute
+            nikkei_bars = df[
+                (df.index.hour > session_h) |
+                ((df.index.hour == session_h) & (df.index.minute >= session_m))
+            ].sort_index().head(6)  # Max 6 bars (bar 1-4 + margin)
         else:
             nikkei_bars = pd.DataFrame()
-        logger.info(f"NIKKEI bars from 09:00 JST (attempt {retry+1}): {len(nikkei_bars)} bars")
+        logger.info(f"NIKKEI bars from {session_open_hour}:00 JST / {session_open_cet.strftime('%H:%M')} CET (attempt {retry+1}): {len(nikkei_bars)} bars")
         if len(nikkei_bars) >= 4:
             break
         if retry < 3:
@@ -891,21 +899,28 @@ async def session2_routine():
 
     logger.info("═══ NIKKEI SESSION 2 (12:00 JST) ═══")
 
-    # Get bars from S2 open
+    # Get bars from S2 open — use hour/minute comparison (avoids timezone bugs)
     from zoneinfo import ZoneInfo
     import pandas as pd
     cet = ZoneInfo("Europe/Berlin")
     s2_hour = getattr(config, 'SESSION2_HOUR_JST', 12)
     s2_open_jst = now.replace(hour=s2_hour, minute=0, second=0)
-    s2_open_cet = pd.Timestamp(s2_open_jst).tz_convert(cet)
+    s2_open_cet = s2_open_jst.astimezone(cet)
+    s2_h = s2_open_cet.hour
+    s2_m = s2_open_cet.minute
+
+    logger.info(f"S2 open: {s2_hour}:00 JST = {s2_open_cet.strftime('%H:%M')} CET")
 
     for retry in range(4):
         df = broker.get_streaming_bars_df()
         if not df.empty:
-            s2_bars = df[df.index >= s2_open_cet].sort_index()
+            s2_bars = df[
+                (df.index.hour > s2_h) |
+                ((df.index.hour == s2_h) & (df.index.minute >= s2_m))
+            ].sort_index().head(6)
         else:
             s2_bars = pd.DataFrame()
-        logger.info(f"Nikkei S2 bars from 12:00 JST (attempt {retry+1}): {len(s2_bars)}")
+        logger.info(f"Nikkei S2 bars from {s2_hour}:00 JST / {s2_open_cet.strftime('%H:%M')} CET (attempt {retry+1}): {len(s2_bars)}")
         if len(s2_bars) >= 4:
             break
         if retry < 3:
