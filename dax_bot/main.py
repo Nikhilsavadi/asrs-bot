@@ -714,6 +714,17 @@ async def _morning_routine_inner():
         _bar4_triggered = True
         return
 
+    # Risk cap: if bar range risk > MAX_RISK_GBP, tighten the stop
+    risk_pts = state.bar_range + config.BUFFER_PTS * 2
+    risk_gbp = risk_pts * 1.0
+    if risk_gbp > config.MAX_RISK_GBP:
+        max_stop_distance = config.MAX_RISK_GBP
+        logger.info(f"Risk cap: {risk_gbp:.0f} > {config.MAX_RISK_GBP:.0f} — tightening stop from {risk_pts:.1f}pts to {max_stop_distance:.1f}pts")
+        state.bar_high = round(state.sell_level + max_stop_distance, 1)
+        state.bar_low = round(state.buy_level - max_stop_distance, 1)
+        state.bar_range = max_stop_distance
+        await alerts.send(f"[S1 DAX] Risk capped: {risk_pts:.0f}pts → {max_stop_distance:.0f}pts (£{config.MAX_RISK_GBP:.0f} max)")
+
     # Position sizing: 2x on STANDARD+NARROW setups (validated out-of-sample)
     if (overnight_result.bias.value in ("STANDARD", "NO_DATA")
             and state.range_flag == "NARROW"
