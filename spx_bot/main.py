@@ -513,6 +513,19 @@ async def _morning_routine_inner():
     logger.info(f"Levels: Buy={state.buy_level} Sell={state.sell_level} "
                 f"Bar={state.bar_number} Range={state.bar_range} ({state.range_flag})")
 
+    # Risk cap: if bar range risk > MAX_RISK_GBP, tighten the stop
+    risk_pts = state.bar_range + config.BUFFER_PTS * 2  # full stop distance
+    risk_gbp = risk_pts * 1.0  # at £1/pt
+    if risk_gbp > config.MAX_RISK_GBP:
+        # Tighten stop to cap risk at MAX_RISK_GBP
+        max_stop_distance = config.MAX_RISK_GBP  # at £1/pt, pts = £
+        logger.info(f"Risk cap: {risk_gbp:.0f} > {config.MAX_RISK_GBP:.0f} — tightening stop from {risk_pts:.1f}pts to {max_stop_distance:.1f}pts")
+        # Adjust levels: keep entry same, move stop closer
+        state.bar_high = round(state.sell_level + max_stop_distance, 1)  # for SHORT: stop = entry + max_distance
+        state.bar_low = round(state.buy_level - max_stop_distance, 1)   # for LONG: stop = entry - max_distance
+        state.bar_range = max_stop_distance
+        await _alert(f"[S3 US30] Risk capped: {risk_pts:.0f}pts → {max_stop_distance:.0f}pts (£{config.MAX_RISK_GBP:.0f} max)")
+
     # Position sizing
     state.position_size = min(config.NUM_CONTRACTS, config.MAX_CONTRACTS)
     if state.range_flag == "NARROW" and config.NARROW_STD_MULTIPLIER > 1:
