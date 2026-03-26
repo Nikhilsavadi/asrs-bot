@@ -448,15 +448,21 @@ async def _morning_routine_inner():
     now_cet = datetime.now(cet)
     us_open_cet = now_cet.replace(hour=14, minute=30, second=0, microsecond=0)
 
-    # Filter bars from US open onwards — retry up to 60s if bar 4 not yet received
+    # Filter bars from US open onwards — use hour/minute comparison (avoids timezone bugs)
     import asyncio
+    us_open_h = us_open_cet.hour
+    us_open_m = us_open_cet.minute
+    logger.info(f"Session open: 09:30 ET = {us_open_h:02d}:{us_open_m:02d} CET")
     for retry in range(4):
         df = broker.get_streaming_bars_df()
         if not df.empty:
-            us_bars = df[df.index >= us_open_cet].sort_index()
+            us_bars = df[
+                (df.index.hour > us_open_h) |
+                ((df.index.hour == us_open_h) & (df.index.minute >= us_open_m))
+            ].sort_index().head(8)
         else:
             us_bars = pd.DataFrame()
-        logger.info(f"US30 bars from 14:30 CET (attempt {retry+1}): {len(us_bars)} bars")
+        logger.info(f"US30 bars from {us_open_h:02d}:{us_open_m:02d} CET (attempt {retry+1}): {len(us_bars)} bars")
         if len(us_bars) >= 4:
             break
         if retry < 3:
@@ -857,10 +863,16 @@ async def session2_routine():
     s2_start_cet = pd.Timestamp(s2_start_et).tz_convert(cet)
     s2_bar4_cet = pd.Timestamp(s2_bar4_et).tz_convert(cet)
 
-    s2_bars = df[(df.index >= s2_start_cet) & (df.index < s2_bar4_cet)]
+    # Use hour/minute comparison (avoids timezone object mismatch bugs)
+    s2_h = s2_start_cet.hour
+    s2_m = s2_start_cet.minute
+    s2_bars = df[
+        (df.index.hour > s2_h) |
+        ((df.index.hour == s2_h) & (df.index.minute >= s2_m))
+    ].sort_index().head(6)
 
     if len(s2_bars) < config.SESSION2_BAR_COUNT:
-        logger.warning(f"US30 S2: only {len(s2_bars)} bars, need {config.SESSION2_BAR_COUNT}")
+        logger.warning(f"US30 S2: only {len(s2_bars)} bars from {s2_h:02d}:{s2_m:02d} CET, need {config.SESSION2_BAR_COUNT}")
         return
 
     s2_bar = s2_bars.iloc[config.SESSION2_BAR_COUNT - 1]
