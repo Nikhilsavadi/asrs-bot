@@ -159,22 +159,6 @@ class IGBroker:
             logger.error(f"Failed to fetch IG bars: {e}", exc_info=True)
             return pd.DataFrame()
 
-    async def get_overnight_bars(self) -> pd.DataFrame:
-        """Fetch overnight bars (00:00-06:00 CET)."""
-        df = await self.get_5min_bars("1 D")
-        if df.empty:
-            return df
-        try:
-            from zoneinfo import ZoneInfo
-            cet = ZoneInfo("Europe/Berlin")
-            df.index = df.index.tz_convert(cet)
-            overnight = df.between_time("00:00", "06:00")
-            logger.info(f"IG overnight bars: {len(overnight)}")
-            return overnight
-        except Exception as e:
-            logger.error(f"Failed to filter overnight bars: {e}")
-            return pd.DataFrame()
-
     def get_streaming_bars_df(self) -> pd.DataFrame:
         """Get today's 5-min bars from Lightstreamer stream (no REST call)."""
         return self._stream.get_today_bars_df(self.epic)

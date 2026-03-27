@@ -76,10 +76,6 @@ ADD_STRENGTH_ENABLED   = os.getenv("ADD_STRENGTH_ENABLED", "true").lower() == "t
 ADD_STRENGTH_TRIGGER   = float(os.getenv("ADD_STRENGTH_TRIGGER", "25"))   # pts profit before add
 ADD_STRENGTH_MAX       = int(os.getenv("ADD_STRENGTH_MAX", "2"))          # max extra positions
 
-# ── SPX Regime Filter ─────────────────────────────────────────────────────────
-SPX_REGIME_ENABLED = os.getenv("SPX_REGIME_ENABLED", "true").lower() == "true"
-SPX_EPIC           = os.getenv("SPX_EPIC", "IX.D.SPTRD.DAILY.IP")  # S&P 500 DFB on IG
-
 # ── Telegram ───────────────────────────────────────────────────────────────────
 TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")

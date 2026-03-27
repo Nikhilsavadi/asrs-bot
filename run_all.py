@@ -254,11 +254,6 @@ async def main():
         hour=dax_config.SUMMARY_HOUR, minute=dax_config.SUMMARY_MINUTE,
         id="dax_eod", misfire_grace_time=120)
 
-    # Overnight bar collection — hourly 23:00-07:00 UTC (00:00-08:00 CET)
-    dax_scheduler.add_job(dax_main.collect_overnight_bars, "cron",
-        day_of_week="mon-fri", hour="23,0-7", minute=0,
-        id="overnight_bars", misfire_grace_time=300)
-
     # ── US30 schedule (US/Eastern times, converted to UTC for scheduler) ──
     if spx_main is not None:
         from zoneinfo import ZoneInfo
@@ -330,11 +325,6 @@ async def main():
         dax_scheduler.add_job(nikkei_main.end_of_day, "cron",
             day_of_week="mon-fri", hour=6, minute=5,
             id="nikkei_eod", misfire_grace_time=120)
-
-        # Nikkei overnight collection: 15:00-23:00 UTC (00:00-08:00 JST next day)
-        dax_scheduler.add_job(nikkei_main.collect_overnight_bars, "cron",
-            day_of_week="mon-fri", hour="15-23", minute=0,
-            id="nikkei_overnight", misfire_grace_time=300)
 
     # ── Session keepalive every 10 minutes ────────────────────────
     async def keepalive_with_stream_check():

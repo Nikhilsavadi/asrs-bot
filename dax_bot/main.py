@@ -32,7 +32,6 @@ from dax_bot.strategy import (
 )
 from dax_bot import alerts
 from dax_bot import journal
-from dax_bot.overnight import calculate_overnight_range, OvernightBias, OvernightResult
 from dax_bot.dashboard import start_dashboard
 
 logging.basicConfig(
@@ -44,9 +43,6 @@ logger = logging.getLogger("ASRS")
 
 broker = None  # Set by run_all.py (shared session)
 scheduler = AsyncIOScheduler(timezone=config.TZ_UK)
-
-# Overnight bar cache — populated by hourly job, consumed by morning_routine
-_overnight_bars_cache = {"date": "", "bars": []}
 
 # Trade stream exit levels — used when IG stop fires server-side and /confirms returns 404
 _last_stream_exit_levels: dict[str, float] = {}
@@ -161,49 +157,6 @@ async def _check_flip_price(state: DailyState) -> bool:
         return False
 
     return True
-
-
-async def collect_overnight_bars():
-    """Hourly job (00:00-07:00 CET) — sample current price to build overnight range.
-    Falls back to REST if streaming price unavailable."""
-    import pandas as pd
-    from zoneinfo import ZoneInfo
-    cet = ZoneInfo("Europe/Berlin")
-    now_cet = datetime.now(cet)
-    today_str = now_cet.strftime("%Y-%m-%d")
-
-    # Reset cache at midnight
-    if _overnight_bars_cache["date"] != today_str:
-        _overnight_bars_cache["date"] = today_str
-        _overnight_bars_cache["bars"] = []
-
-    # Streaming price first (via broker which checks stream then REST)
-    price = await broker.get_current_price() if broker else None
-
-    if price and price > 0:
-        _overnight_bars_cache["bars"].append({
-            "time": now_cet,
-            "Open": price, "High": price, "Low": price, "Close": price,
-        })
-        logger.info(f"Overnight bar cached: {price} ({len(_overnight_bars_cache['bars'])} samples)")
-        # Alert on first sample of the day
-        if len(_overnight_bars_cache["bars"]) == 1:
-            await alerts.send(f"🌙 DAX overnight collection started: {price}")
-    else:
-        logger.warning("Overnight bar collection: no price available")
-
-
-def get_cached_overnight_df():
-    """Convert cached overnight samples to a DataFrame for calculate_overnight_range()."""
-    import pandas as pd
-    from zoneinfo import ZoneInfo
-    bars = _overnight_bars_cache.get("bars", [])
-    if not bars:
-        return pd.DataFrame()
-    df = pd.DataFrame(bars)
-    cet = ZoneInfo("Europe/Berlin")
-    df.index = pd.DatetimeIndex([b["time"] for b in bars], tz=cet)
-    return df[["Open", "High", "Low", "Close"]]
 
 
 async def connect_with_retry(max_attempts: int = 5, delay: int = 30, alert: bool = True) -> bool:
@@ -428,20 +381,6 @@ async def health_check():
     price_str = f"{price}" if price else "N/A"
     stream_bars = broker.get_streaming_bar_count() if broker else 0
 
-    # Overnight range from cached samples
-    on_samples = len(_overnight_bars_cache.get("bars", []))
-    on_str = "NO DATA"
-    if on_samples > 0:
-        bars = _overnight_bars_cache["bars"]
-        on_high = max(b["High"] for b in bars)
-        on_low = min(b["Low"] for b in bars)
-        on_range = on_high - on_low
-        on_mid = (on_high + on_low) / 2
-        bias_str = ""
-        if price and price > 0:
-            bias_str = "LONG bias" if price > on_mid else "SHORT bias"
-        on_str = f"H: {on_high:.1f} | L: {on_low:.1f} | Size: {on_range:.1f}\n   {bias_str}"
-
     msg = (
         f"🩺 <b>ASRS Health Check</b> [{mode}]\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -451,9 +390,6 @@ async def health_check():
         f"💹 DAX: {price_str}\n"
         f"📡 Streaming bars today: {stream_bars}\n"
         f"📦 {config.INSTRUMENT} x{config.NUM_CONTRACTS}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🌙 Overnight ({on_samples} samples):\n"
-        f"   {on_str}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"⏰ Morning routine at {config.MORNING_HOUR:02d}:{config.MORNING_MINUTE:02d}\n"
         f"<i>Session kept alive for morning routine</i>"
@@ -599,72 +535,10 @@ async def _morning_routine_inner():
     except Exception as e:
         logger.warning(f"Step 4: Gap computation failed (non-fatal): {e}")
 
-    # 2. Overnight range (V58 theory) — REST first, cached bars fallback
-    logger.info("Step 5: Computing overnight range...")
-    overnight_result = OvernightResult()  # default: bias=NO_DATA
-    try:
-        overnight_df = await broker.get_overnight_bars()
-        # Fallback to cached overnight samples if REST returned empty
-        if overnight_df.empty:
-            logger.info("REST overnight bars empty — using cached samples")
-            overnight_df = get_cached_overnight_df()
-        today_bars = df[df.index.date == today_date]
-        bar4_temp = get_bar(today_bars, 4) if not today_bars.empty else None
-        if bar4_temp:
-            overnight_result = calculate_overnight_range(
-                overnight_df, bar4_temp["high"], bar4_temp["low"]
-            )
-        else:
-            overnight_result = calculate_overnight_range(overnight_df, 0, 0)
-    except Exception as e:
-        logger.warning(f"Step 5: Overnight range failed (non-fatal, using STANDARD): {e}")
-    state.overnight_high = overnight_result.range_high
-    state.overnight_low = overnight_result.range_low
-    state.overnight_range = overnight_result.range_size
-    state.overnight_bias = overnight_result.bias.value
-    state.bar4_vs_overnight = overnight_result.bar4_vs_range
-    state.save()
-    logger.info(f"Step 5: Overnight {overnight_result.range_low}-{overnight_result.range_high}, "
-                f"bias={overnight_result.bias.value}")
-
-    # ── SPX regime filter: override bias based on previous day SPX close ──
-    # Non-blocking: 5s timeout. If fails, keeps overnight bias. Never stalls morning routine.
-    if config.SPX_REGIME_ENABLED:
-        logger.info("Step 5b: Checking SPX regime filter...")
-        try:
-            async def _fetch_spx_regime():
-                from shared.ig_session import IGSharedSession
-                session = IGSharedSession.get_instance()
-                if not session or not session.ig:
-                    return None
-                spx_prices = session.ig.fetch_historical_prices_by_epic_and_num_points(
-                    config.SPX_EPIC, "DAY", 2
-                )
-                if spx_prices and "prices" in spx_prices:
-                    prices = spx_prices["prices"]
-                    if len(prices) >= 2:
-                        prev_close = float(prices[-2]["closePrice"]["bid"])
-                        prev_open = float(prices[-2]["openPrice"]["bid"])
-                        return "UP" if prev_close > prev_open else "DOWN"
-                return None
-
-            spx_dir = await asyncio.wait_for(_fetch_spx_regime(), timeout=5.0)
-            if spx_dir:
-                state.overnight_bias = "LONG_ONLY" if spx_dir == "UP" else "SHORT_ONLY"
-                overnight_result.bias = OvernightBias(state.overnight_bias)
-                state.save()
-                logger.info(f"Step 5b: SPX prev day {spx_dir} → bias overridden to {state.overnight_bias}")
-            else:
-                logger.warning("Step 5b: SPX data unavailable — keeping overnight bias")
-        except asyncio.TimeoutError:
-            logger.warning("Step 5b: SPX regime filter timed out (5s) — keeping overnight bias")
-        except Exception as e:
-            logger.warning(f"Step 5b: SPX regime filter failed (non-fatal): {e}")
-
-    # ── Calculate levels (bar selection uses gap_dir + overnight_bias) ──
-    logger.info("Step 6: Calculating levels...")
+    # ── Calculate levels (bar selection uses gap_dir + range context) ──
+    logger.info("Step 5: Calculating levels...")
     events = calculate_levels(state, df)
-    logger.info(f"Step 6: Level events: {events}")
+    logger.info(f"Step 5: Level events: {events}")
 
     if "LEVELS_SET" not in events and "WAITING_FOR_BAR5" not in events:
         await alerts.send(alerts.error_alert(f"Cannot calculate levels: {events}"))
@@ -682,26 +556,13 @@ async def _morning_routine_inner():
             await alerts.send(alerts.error_alert(f"Bar 5 still not available: {events}"))
             return
 
-    logger.info(f"Step 6: Levels — Buy={state.buy_level} Sell={state.sell_level} "
+    logger.info(f"Step 5: Levels — Buy={state.buy_level} Sell={state.sell_level} "
                 f"Bar={state.bar_number} Range={state.bar_range}")
 
-    # Build overnight info for alerts
-    if overnight_result.bias == OvernightBias.NO_DATA:
-        overnight_msg = (
-            "\n⚠️ <b>Overnight data unavailable</b> — using STANDARD bracket (both sides)"
-        )
-    else:
-        overnight_msg = (
-            f"\n🌙 <b>Overnight Range:</b> {overnight_result.range_low:.0f}–"
-            f"{overnight_result.range_high:.0f} ({overnight_result.range_size:.0f}pts)\n"
-            f"Bar {state.bar_number} vs range: <b>{overnight_result.bar4_vs_range}</b>\n"
-            f"V58 Bias: {overnight_result.emoji()} <b>{overnight_result.bias.value}</b>"
-        )
-
     # Always trade — no skipping, no human input
-    logger.info("Step 7: Sending Telegram signal...")
-    await alerts.send(alerts.morning_levels(state) + overnight_msg)
-    logger.info("Step 7: Telegram sent")
+    logger.info("Step 6: Sending Telegram signal...")
+    await alerts.send(alerts.morning_levels(state))
+    logger.info("Step 6: Telegram sent")
 
     # Daily loss circuit breaker
     if _check_daily_loss_limit():
@@ -725,24 +586,22 @@ async def _morning_routine_inner():
         state.bar_range = max_stop_distance
         await alerts.send(f"[S1 DAX] Risk capped: {risk_pts:.0f}pts → {max_stop_distance:.0f}pts (£{config.MAX_RISK_GBP:.0f} max)")
 
-    # Position sizing: 2x on STANDARD+NARROW setups (validated out-of-sample)
-    if (overnight_result.bias.value in ("STANDARD", "NO_DATA")
-            and state.range_flag == "NARROW"
-            and config.NARROW_STD_MULTIPLIER > 1):
+    # Position sizing: 2x on NARROW setups (validated out-of-sample)
+    if (state.range_flag == "NARROW" and config.NARROW_STD_MULTIPLIER > 1):
         state.position_size = min(config.NUM_CONTRACTS * config.NARROW_STD_MULTIPLIER, config.MAX_CONTRACTS)
-        logger.info(f"STANDARD+NARROW → sizing up to {state.position_size} contracts")
+        logger.info(f"NARROW → sizing up to {state.position_size} contracts")
         await alerts.send(
-            f"<b>NARROW RANGE + STANDARD</b> → {state.position_size}x contracts "
+            f"<b>NARROW RANGE</b> → {state.position_size}x contracts "
             f"(x{config.NARROW_STD_MULTIPLIER} multiplier)"
         )
     else:
         state.position_size = min(config.NUM_CONTRACTS, config.MAX_CONTRACTS)
     state.save()
 
-    logger.info("Step 8: Placing orders...")
-    await place_orders_with_bias(state, overnight_result.bias)
+    logger.info("Step 7: Placing OCA bracket (both sides)...")
+    await place_bracket_orders(state)
     _bar4_triggered = True
-    logger.info("Step 8: Orders placed — morning routine complete")
+    logger.info("Step 7: Orders placed — morning routine complete")
 
 
 async def failsafe_check():
@@ -915,70 +774,6 @@ async def session2_routine():
     )
 
     logger.info("Session 2: orders placed — routine complete")
-
-
-async def place_single_order(state: DailyState, direction: str):
-    """Place only the buy-stop or sell-stop, not both.
-    For IG spread bet, uses price-triggered approach (same as OCA bracket but one-sided).
-    """
-    qty = state.position_size or config.NUM_CONTRACTS
-    if hasattr(broker, "_pending_bracket"):
-        # IG price-triggered: store single-side trigger level
-        if direction == "LONG":
-            broker._pending_bracket = {
-                "buy_price": state.buy_level,
-                "sell_price": -999999,  # Will never trigger
-                "qty": qty,
-                "oca_group": state.oca_group,
-                "active": True,
-            }
-            buy_id = f"pending_buy_{state.oca_group}"
-            broker._orders[buy_id] = {
-                "type": "pending", "direction": "BUY",
-                "price": state.buy_level, "qty": qty,
-            }
-            state.buy_order_id = buy_id
-        else:
-            broker._pending_bracket = {
-                "buy_price": 999999,  # Will never trigger
-                "sell_price": state.sell_level,
-                "qty": qty,
-                "oca_group": state.oca_group,
-                "active": True,
-            }
-            sell_id = f"pending_sell_{state.oca_group}"
-            broker._orders[sell_id] = {
-                "type": "pending", "direction": "SELL",
-                "price": state.sell_level, "qty": qty,
-            }
-            state.sell_order_id = sell_id
-
-        state.phase = Phase.ORDERS_PLACED
-        state.save()
-        label = "LONG" if direction == "LONG" else "SHORT"
-        level = state.buy_level if direction == "LONG" else state.sell_level
-        stop = state.sell_level if direction == "LONG" else state.buy_level
-        emoji = "🟩" if direction == "LONG" else "🟥"
-        await alerts.send(
-            f"{emoji} <b>{label} ONLY order placed</b> (price-triggered)\n"
-            f"{'Buy' if direction == 'LONG' else 'Sell'} stop: {level}\n"
-            f"Stop: {stop}"
-        )
-        logger.info(f"IG single order (price-triggered): {label} @ {level}")
-        return
-
-    # Should not reach here — IG is the only broker
-    logger.error("place_single_order: unexpected code path")
-
-
-async def place_orders_with_bias(state: DailyState, bias: OvernightBias):
-    """
-    Place OCA bracket orders (both sides always armed).
-
-    Bias is logged for reference but no longer disables either side.
-    """
-    logger.info(f"V58 bias: {bias.value} — placing OCA bracket (both sides armed)")
-    await place_bracket_orders(state)
 
 
 async def _place_stop_with_retry(state: DailyState, max_attempts: int = 3) -> bool:

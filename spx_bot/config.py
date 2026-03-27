@@ -66,10 +66,6 @@ MAX_RISK_GBP       = float(os.getenv("US30_MAX_RISK_GBP", "50"))       # Cap ris
 MAX_BAR_RANGE      = int(os.getenv("US30_MAX_BAR_RANGE", "300"))        # Skip if bar range > this
 STALE_PRICE_SECS   = int(os.getenv("US30_STALE_PRICE_SECS", "30"))
 
-# ── SPX Regime Filter (not applicable for SPX itself — disabled) ────────────
-SPX_REGIME_ENABLED = False
-SPX_EPIC           = IG_EPIC
-
 # ── Telegram ─────────────────────────────────────────────────────────────────
 TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")

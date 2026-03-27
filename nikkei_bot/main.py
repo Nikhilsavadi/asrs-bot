@@ -17,7 +17,6 @@ from dax_bot.strategy import (
 )
 from dax_bot.broker_ig import IGBroker
 import httpx
-from dax_bot.overnight import calculate_overnight_range, OvernightBias, OvernightResult
 
 logger = logging.getLogger("NIKKEI_ASRS")
 
@@ -26,8 +25,6 @@ broker: IGBroker = None
 _bar4_triggered = False
 _tg_send = None  # Telegram send function, set by init()
 
-# Overnight price cache — hourly samples for overnight bias (same as DAX)
-_overnight_cache = {"date": "", "bars": []}
 
 # Trade stream exit levels — used when IG stop fires server-side and /confirms returns 404
 _last_stream_exit_levels: dict[str, float] = {}
@@ -223,42 +220,6 @@ async def on_candle_complete(bar: dict):
                 if state.s2_phase == "IDLE":
                     logger.info("Nikkei S2 Bar 4 complete — triggering session2_routine (event-driven)")
                     await session2_routine()
-
-
-async def collect_overnight_bars():
-    """Hourly job (15:00-00:00 UTC = 00:00-09:00 JST) — sample current price for overnight range."""
-    from datetime import timedelta
-    now_jst = datetime.now(config.TZ_JST)
-    today_str = now_jst.strftime("%Y-%m-%d")
-
-    if _overnight_cache["date"] != today_str:
-        _overnight_cache["date"] = today_str
-        _overnight_cache["bars"] = []
-
-    # Get current price via broker (checks streaming then REST)
-    price = await broker.get_current_price() if broker else None
-
-    if price and price > 0:
-        _overnight_cache["bars"].append({
-            "time": now_jst,
-            "Open": price, "High": price, "Low": price, "Close": price,
-        })
-        logger.info(f"Nikkei overnight cached: {price} ({len(_overnight_cache['bars'])} samples)")
-        if len(_overnight_cache["bars"]) == 1:
-            await _alert(f"🌙 Nikkei overnight collection started: {price}")
-    else:
-        logger.warning("Nikkei overnight collection: no price available")
-
-
-def get_cached_overnight_df():
-    """Convert cached overnight samples to DataFrame for calculate_overnight_range()."""
-    import pandas as pd
-    bars = _overnight_cache.get("bars", [])
-    if not bars:
-        return pd.DataFrame()
-    df = pd.DataFrame(bars)
-    df.index = pd.DatetimeIndex([b["time"] for b in bars], tz=config.TZ_JST)
-    return df
 
 
 async def on_tick_trigger(trigger: dict):
@@ -486,7 +447,7 @@ async def _morning_routine_inner():
     today_date = now.date()
 
     # FAST PATH: Get bar 4 from streaming FIRST, arm bracket immediately
-    # Gap and overnight are done AFTER bracket is armed
+    # Gap is done AFTER bracket is armed
     # Calculate session open in UTC — avoids all timezone conversion bugs
     from zoneinfo import ZoneInfo
     import pandas as pd
@@ -618,8 +579,7 @@ async def _morning_routine_inner():
         await _alert(f"NIKKEI ORDER FAILED: {result['error']}")
         return
 
-    # NOW do slow REST calls for gap + overnight (bracket is already live)
-    overnight_result = OvernightResult()
+    # Gap computation (bracket is already live — this is non-blocking)
     try:
         prev_df = await broker.get_5min_bars("2 D")
         if not prev_df.empty:
@@ -633,32 +593,6 @@ async def _morning_routine_inner():
     except Exception as e:
         logger.warning(f"Gap computation failed: {e}")
 
-    # For Nikkei, "overnight" = pre-market prices before session open (10:00 JST)
-    # Try streaming bars first, fall back to hourly cache
-    try:
-        pre_market = df[df.index < session_open_cet]
-        if pre_market.empty:
-            logger.info("Streaming pre-market empty — using cached overnight samples")
-            pre_market = get_cached_overnight_df()
-        if not pre_market.empty:
-            overnight_result = calculate_overnight_range(
-                pre_market, state.bar_high, state.bar_low
-            )
-            logger.info(f"NIKKEI pre-market range: {overnight_result.range_high:.1f}-{overnight_result.range_low:.1f}, bias={overnight_result.bias.value}")
-        else:
-            logger.warning("NIKKEI: no pre-market data (streaming + cache both empty)")
-    except Exception as e:
-        logger.warning(f"Pre-market range failed: {e}")
-
-    state.overnight_high = overnight_result.range_high
-    state.overnight_low = overnight_result.range_low
-    state.overnight_range = overnight_result.range_size
-    state.overnight_bias = overnight_result.bias.value
-
-    # Bias logged for reference but both sides always armed
-    bias = overnight_result.bias
-    logger.info(f"V58 bias: {bias.value} — OCA bracket armed (both sides)")
-
     state.save()
 
     # Send signal
@@ -667,7 +601,6 @@ async def _morning_routine_inner():
         f"Bar {state.bar_number}: H={state.bar_high:.1f} L={state.bar_low:.1f}\n"
         f"Range: {state.bar_range:.1f} ({state.range_flag})\n"
         f"Buy: {state.buy_level:.1f} | Sell: {state.sell_level:.1f}\n"
-        f"Bias: {state.overnight_bias}\n"
         f"Contracts: {state.position_size}"
     )
     logger.info("Orders placed — NIKKEI morning routine complete")

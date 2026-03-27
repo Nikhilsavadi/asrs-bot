@@ -17,7 +17,6 @@ from dax_bot.strategy import (
 )
 from dax_bot.broker_ig import IGBroker
 import httpx
-from dax_bot.overnight import calculate_overnight_range, OvernightBias, OvernightResult
 
 logger = logging.getLogger("US30_ASRS")
 
@@ -83,7 +82,7 @@ async def init(shared_session, stream_manager, tg_send=None):
 
 
 _shared_session = None
-_prefetch_cache: dict = {}  # Pre-fetched data from warmup (gap, overnight bars)
+_prefetch_cache: dict = {}  # Pre-fetched data from warmup (gap bars)
 _bar4_triggered = False  # Prevent double-trigger from callback + schedule
 
 # Trade stream exit levels — used when IG stop fires server-side and /confirms returns 404
@@ -348,12 +347,12 @@ async def pre_trade_warmup():
     bar_count = broker.get_streaming_bar_count() if broker else 0
     logger.info(f"Pre-warm: {bar_count} streaming bars")
 
-    # Pre-fetch gap and overnight data (cached for morning routine)
+    # Pre-fetch gap data (cached for morning routine)
     try:
         prev_df = await broker.get_5min_bars("2 D")
         if not prev_df.empty:
             _prefetch_cache["prev_df"] = prev_df
-            logger.info(f"Pre-warm: cached {len(prev_df)} bars for gap/overnight")
+            logger.info(f"Pre-warm: cached {len(prev_df)} bars for gap")
     except Exception as e:
         logger.warning(f"Pre-warm: bar pre-fetch failed: {e}")
 
@@ -440,7 +439,7 @@ async def _morning_routine_inner():
     today_date = now.date()
 
     # FAST PATH: Get bar 4 from streaming FIRST, arm bracket immediately
-    # Gap and overnight are done AFTER bracket is armed
+    # Gap is done AFTER bracket is armed
     # Calculate levels directly — streaming bars are in CET, US open is 14:30 CET
     # We can't use DAX's candle_number() which is hardcoded to 09:00 CET
     from zoneinfo import ZoneInfo
@@ -561,8 +560,7 @@ async def _morning_routine_inner():
         await _alert(f"US30 ORDER FAILED: {result['error']}")
         return
 
-    # Use pre-fetched data from warmup if available, else do REST call
-    overnight_result = OvernightResult()
+    # Gap computation — use pre-fetched data from warmup if available
     try:
         prev_df = _prefetch_cache.pop("prev_df", None)
         if prev_df is None:
@@ -580,29 +578,6 @@ async def _morning_routine_inner():
     except Exception as e:
         logger.warning(f"Gap computation failed: {e}")
 
-    # For US30, "overnight" = pre-market bars before 14:30 CET (from streaming)
-    # These are bars from when IG starts quoting US30 (~08:00 CET) to US open
-    try:
-        from zoneinfo import ZoneInfo
-        cet = ZoneInfo("Europe/Berlin")
-        pre_market = df[df.index < now_cet.replace(hour=14, minute=30)]
-        if not pre_market.empty:
-            overnight_result = calculate_overnight_range(
-                pre_market, state.bar_high, state.bar_low
-            )
-            logger.info(f"US30 pre-market range: {overnight_result.range_high:.1f}-{overnight_result.range_low:.1f}, bias={overnight_result.bias.value}")
-    except Exception as e:
-        logger.warning(f"Pre-market range failed: {e}")
-
-    state.overnight_high = overnight_result.range_high
-    state.overnight_low = overnight_result.range_low
-    state.overnight_range = overnight_result.range_size
-    state.overnight_bias = overnight_result.bias.value
-
-    # Bias logged for reference but both sides always armed
-    bias = overnight_result.bias
-    logger.info(f"V58 bias: {bias.value} — OCA bracket armed (both sides)")
-
     state.save()
 
     # Send signal
@@ -611,7 +586,6 @@ async def _morning_routine_inner():
         f"Bar {state.bar_number}: H={state.bar_high:.1f} L={state.bar_low:.1f}\n"
         f"Range: {state.bar_range:.1f} ({state.range_flag})\n"
         f"Buy: {state.buy_level:.1f} | Sell: {state.sell_level:.1f}\n"
-        f"Bias: {state.overnight_bias}\n"
         f"Contracts: {state.position_size}"
     )
     logger.info("Orders placed — US30 morning routine complete")
@@ -807,14 +781,7 @@ async def session2_routine():
     if not morning_dir and state.trades:
         morning_dir = state.trades[0].get("direction", "")
     if not morning_dir:
-        # S1 didn't trade — use state overnight bias first
-        ob = state.overnight_bias
-        if ob in ("LONG_ONLY", "LONG"):
-            morning_dir = "LONG"
-        elif ob in ("SHORT_ONLY", "SHORT"):
-            morning_dir = "SHORT"
-    if not morning_dir:
-        # Still no direction — calculate from live bars (same as DAX S2)
+        # S1 didn't trade — calculate from live bars (same as DAX S2)
         try:
             s2_df = broker.get_streaming_bars_df()
             if s2_df is not None and not s2_df.empty:

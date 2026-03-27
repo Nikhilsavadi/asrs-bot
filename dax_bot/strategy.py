@@ -94,13 +94,6 @@ class DailyState:
     gap_size:          float = 0.0
     bar5_rule_matched: str = ""         # Which BAR5_RULE triggered bar 5 (e.g. "OVERLAP+WIDE")
 
-    # Overnight range (V58 theory)
-    overnight_high:    float = 0.0
-    overnight_low:     float = 0.0
-    overnight_range:   float = 0.0
-    overnight_bias:    str = ""       # SHORT_ONLY, LONG_ONLY, STANDARD, NO_DATA
-    bar4_vs_overnight: str = ""       # ABOVE, BELOW, INSIDE, PARTIAL_ABOVE, PARTIAL_BELOW
-
     # Re-entry after profitable exit
     reentry_direction: str = ""        # LONG or SHORT — same as profitable exit
     reentry_price:     float = 0.0     # Exit price — re-enter if price resumes through here
@@ -245,7 +238,6 @@ def should_use_bar5(state: DailyState) -> str:
         Context:   OVERLAP, CHOPPY, DIRECTIONAL
         Range:     WIDE, NARROW, NORMAL
         Gap:       GAP_UP, GAP_DOWN, FLAT
-        Overnight: LONG_ONLY, SHORT_ONLY, STANDARD
     """
     # Build set of active condition tags
     tags = set()
@@ -264,10 +256,6 @@ def should_use_bar5(state: DailyState) -> str:
     # Gap direction
     if state.gap_dir:
         tags.add(state.gap_dir)         # GAP_UP, GAP_DOWN, FLAT
-
-    # Overnight bias
-    if state.overnight_bias:
-        tags.add(state.overnight_bias)  # LONG_ONLY, SHORT_ONLY, STANDARD
 
     # Check each rule: all tokens in the rule must be present
     for rule in config.BAR5_RULES:

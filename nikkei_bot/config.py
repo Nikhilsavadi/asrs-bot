@@ -65,10 +65,6 @@ MAX_RISK_GBP       = float(os.getenv("NIKKEI_MAX_RISK_GBP", "75.0"))    # Max £
 MAX_BAR_RANGE      = int(os.getenv("NIKKEI_MAX_BAR_RANGE", "250"))       # Skip trade if bar range > this
 STALE_PRICE_SECS   = int(os.getenv("NIKKEI_STALE_PRICE_SECS", "30"))
 
-# -- SPX Regime Filter (not applicable for Nikkei -- disabled) -----------------
-SPX_REGIME_ENABLED = False
-SPX_EPIC           = IG_EPIC
-
 # -- Telegram ------------------------------------------------------------------
 TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
