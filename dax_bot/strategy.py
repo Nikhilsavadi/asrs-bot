@@ -684,20 +684,12 @@ def process_stop_hit(state: DailyState, exit_price: float) -> list[str]:
         state.last_add_price = 0.0
         state.oca_group = f"ASRS_{state.date}_{state.entries_used + 1}"
 
-        # Profitable exit → re-enter same direction on trend continuation
-        # Loss exit → re-enter same direction (second attempt at same levels)
-        # Flip to opposite direction only if ENABLE_FLIPS is on
-        if pnl_per_contract > 0 and exit_reason == "TRAILED_STOP":
-            state.reentry_direction = prev_direction
-            state.reentry_price = exit_price
-            events.append("CAN_REENTER")
-        elif config.ENABLE_FLIPS:
+        # Re-entry: arm BOTH directions using original bar 4/5 levels
+        # (no directional bias — let the market decide)
+        if config.ENABLE_FLIPS:
             events.append("CAN_FLIP")
         else:
-            # Re-enter same direction — second attempt with same bracket
-            state.reentry_direction = prev_direction
-            state.reentry_price = exit_price
-            events.append("CAN_REENTER_SAME")
+            events.append("CAN_REENTER")
     else:
         state.phase = Phase.DONE
         state.direction = ""

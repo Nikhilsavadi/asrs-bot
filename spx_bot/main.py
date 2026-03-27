@@ -599,14 +599,9 @@ async def _morning_routine_inner():
     state.overnight_range = overnight_result.range_size
     state.overnight_bias = overnight_result.bias.value
 
-    # Apply bias filter: narrow to one side if bias is clear
+    # Bias logged for reference but both sides always armed
     bias = overnight_result.bias
-    if bias == OvernightBias.LONG_ONLY:
-        logger.info("V58 bias: LONG ONLY — disabling sell side")
-        broker._pending_bracket["sell_price"] = 0.01
-    elif bias == OvernightBias.SHORT_ONLY:
-        logger.info("V58 bias: SHORT ONLY — disabling buy side")
-        broker._pending_bracket["buy_price"] = 999999.0
+    logger.info(f"V58 bias: {bias.value} — OCA bracket armed (both sides)")
 
     state.save()
 
@@ -738,18 +733,9 @@ async def monitor_cycle():
                         state.save()
                         logger.info(f"Re-entry blocked: max entries reached ({state.entries_used}/{config.MAX_ENTRIES})")
                     else:
-                        # Re-entry: stop at the trail stop level that just exited us
-                        reentry_stop = state.trailing_stop
-                        if state.reentry_direction == "LONG":
-                            state.buy_level = state.reentry_price
-                            state.sell_level = 0.01
-                            state.bar_low = reentry_stop - config.BUFFER_PTS
-                            state.bar_high = state.reentry_price + abs(state.reentry_price - reentry_stop)
-                        else:
-                            state.buy_level = 999999.0
-                            state.sell_level = state.reentry_price
-                            state.bar_high = reentry_stop + config.BUFFER_PTS
-                            state.bar_low = state.reentry_price - abs(reentry_stop - state.reentry_price)
+                        # Re-entry: arm BOTH directions using original bar levels
+                        state.buy_level = state.bar_high + config.BUFFER_PTS
+                        state.sell_level = state.bar_low - config.BUFFER_PTS
                         state.bar_range = abs(state.bar_high - state.bar_low)
                         state.save()
                         result = await broker.place_oca_bracket(
@@ -763,9 +749,9 @@ async def monitor_cycle():
                             state.phase = Phase.ORDERS_PLACED
                             state.save()
                         await _alert(
-                            f"RE-ENTRY ARMED US30\n"
-                            f"Direction: {state.reentry_direction}\n"
-                            f"Trigger: {state.reentry_price}"
+                            f"RE-ENTRY ARMED US30 (both sides)\n"
+                            f"Buy: {state.buy_level} | Sell: {state.sell_level}\n"
+                            f"Original bar levels — entry {state.entries_used}/{config.MAX_ENTRIES}"
                         )
 
             # Add-to-winners
@@ -901,15 +887,10 @@ async def session2_routine():
     state.s2_bar_low = s2_low
     state.s2_bar_range = s2_range
 
-    # Continuation bias from morning
-    if morning_dir in ("LONG", "LONG_ACTIVE"):
-        state.s2_buy_level = s2_high + config.BUFFER_PTS
-        state.s2_sell_level = 0.01
-        bias_dir = "LONG"
-    else:
-        state.s2_buy_level = 999999
-        state.s2_sell_level = s2_low - config.BUFFER_PTS
-        bias_dir = "SHORT"
+    # Log morning direction for reference (both sides always armed)
+    bias_dir = "LONG" if morning_dir in ("LONG", "LONG_ACTIVE") else "SHORT"
+    state.s2_buy_level = s2_high + config.BUFFER_PTS
+    state.s2_sell_level = s2_low - config.BUFFER_PTS
 
     state.s2_phase = "ORDERS_PLACED"
     state.save()

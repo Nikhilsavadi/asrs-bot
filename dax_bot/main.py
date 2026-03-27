@@ -871,15 +871,8 @@ async def session2_routine():
     state.s2_buy_level = s2_high + config.BUFFER_PTS
     state.s2_sell_level = s2_low - config.BUFFER_PTS
 
-    # Use morning direction as bias (continuation only)
-    if morning_dir == "LONG" or morning_dir == "LONG_ACTIVE":
-        bias_dir = "LONG"
-        state.s2_buy_level = s2_high + config.BUFFER_PTS
-        state.s2_sell_level = 0.01  # Disable sell
-    else:
-        bias_dir = "SHORT"
-        state.s2_buy_level = 999999  # Disable buy
-        state.s2_sell_level = s2_low - config.BUFFER_PTS
+    # Log morning direction for reference (both sides always armed)
+    bias_dir = "LONG" if morning_dir in ("LONG", "LONG_ACTIVE") else "SHORT"
 
     state.s2_phase = "ORDERS_PLACED"
     state.save()
@@ -974,33 +967,12 @@ async def place_single_order(state: DailyState, direction: str):
 
 async def place_orders_with_bias(state: DailyState, bias: OvernightBias):
     """
-    Place orders respecting overnight range bias.
+    Place OCA bracket orders (both sides always armed).
 
-    SHORT_ONLY → Only place sell stop (fade the overnight up move)
-    LONG_ONLY  → Only place buy stop (fade the overnight down move)
-    STANDARD   → Normal OCA bracket (both sides)
+    Bias is logged for reference but no longer disables either side.
     """
-    if bias == OvernightBias.SHORT_ONLY:
-        logger.info("V58 bias: SHORT ONLY — placing sell stop only")
-        await place_single_order(state, "SHORT")
-        await alerts.send(
-            f"🔴 <b>V58: SHORT ONLY</b>\n"
-            f"Signal bar above overnight range → fading the up move\n"
-            f"Sell stop: {state.sell_level}"
-        )
-
-    elif bias == OvernightBias.LONG_ONLY:
-        logger.info("V58 bias: LONG ONLY — placing buy stop only")
-        await place_single_order(state, "LONG")
-        await alerts.send(
-            f"🟢 <b>V58: LONG ONLY</b>\n"
-            f"Signal bar below overnight range → fading the down move\n"
-            f"Buy stop: {state.buy_level}"
-        )
-
-    else:
-        # STANDARD or NO_DATA — normal OCA bracket
-        await place_bracket_orders(state)
+    logger.info(f"V58 bias: {bias.value} — placing OCA bracket (both sides armed)")
+    await place_bracket_orders(state)
 
 
 async def _place_stop_with_retry(state: DailyState, max_attempts: int = 3) -> bool:
@@ -1274,28 +1246,18 @@ async def _handle_fill_event(data):
                     state.save()
                     return
                 try:
-                    # Re-entry: stop at the trail stop level that just exited us
-                    reentry_stop = state.trailing_stop
-                    if state.reentry_direction == "LONG":
-                        state.buy_level = state.reentry_price
-                        state.sell_level = 0.01
-                        state.bar_low = reentry_stop - config.BUFFER_PTS
-                        state.bar_high = state.reentry_price + abs(state.reentry_price - reentry_stop)
-                    else:
-                        state.buy_level = 999999.0
-                        state.sell_level = state.reentry_price
-                        state.bar_high = reentry_stop + config.BUFFER_PTS
-                        state.bar_low = state.reentry_price - abs(reentry_stop - state.reentry_price)
+                    # Re-entry: arm BOTH directions using original bar levels
+                    state.buy_level = state.bar_high + config.BUFFER_PTS
+                    state.sell_level = state.bar_low - config.BUFFER_PTS
                     state.bar_range = abs(state.bar_high - state.bar_low)
                     state.save()
                     await place_bracket_orders(state)
                     state = DailyState.load()
                     if state.phase == Phase.ORDERS_PLACED:
                         await alerts.send(
-                            f"🔄 <b>RE-ENTRY ARMED</b>\n"
-                            f"Direction: {state.reentry_direction}\n"
-                            f"Trigger: {state.reentry_price}\n"
-                            f"<i>Trend continuation — same direction as profitable exit</i>"
+                            f"🔄 <b>RE-ENTRY ARMED (both sides)</b>\n"
+                            f"Buy: {state.buy_level} | Sell: {state.sell_level}\n"
+                            f"<i>Original bar levels — entry {state.entries_used}/{config.MAX_ENTRIES}</i>"
                         )
                 except Exception as re_err:
                     logger.error(f"Re-entry bracket failed: {re_err}")
@@ -1728,28 +1690,18 @@ async def _monitor_cycle_inner():
                     state.save()
                     return
                 try:
-                    # Re-entry: stop at the trail stop level that just exited us
-                    reentry_stop = state.trailing_stop
-                    if state.reentry_direction == "LONG":
-                        state.buy_level = state.reentry_price
-                        state.sell_level = 0.01
-                        state.bar_low = reentry_stop - config.BUFFER_PTS
-                        state.bar_high = state.reentry_price + abs(state.reentry_price - reentry_stop)
-                    else:
-                        state.buy_level = 999999.0
-                        state.sell_level = state.reentry_price
-                        state.bar_high = reentry_stop + config.BUFFER_PTS
-                        state.bar_low = state.reentry_price - abs(reentry_stop - state.reentry_price)
+                    # Re-entry: arm BOTH directions using original bar levels
+                    state.buy_level = state.bar_high + config.BUFFER_PTS
+                    state.sell_level = state.bar_low - config.BUFFER_PTS
                     state.bar_range = abs(state.bar_high - state.bar_low)
                     state.save()
                     await place_bracket_orders(state)
                     state = DailyState.load()
                     if state.phase == Phase.ORDERS_PLACED:
                         await alerts.send(
-                            f"🔄 <b>RE-ENTRY ARMED</b>\n"
-                            f"Direction: {state.reentry_direction}\n"
-                            f"Trigger: {state.reentry_price}\n"
-                            f"<i>Trend continuation — same direction as profitable exit</i>"
+                            f"🔄 <b>RE-ENTRY ARMED (both sides)</b>\n"
+                            f"Buy: {state.buy_level} | Sell: {state.sell_level}\n"
+                            f"<i>Original bar levels — entry {state.entries_used}/{config.MAX_ENTRIES}</i>"
                         )
                 except Exception as re_err:
                     logger.error(f"Re-entry bracket failed: {re_err}")
