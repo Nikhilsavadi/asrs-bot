@@ -38,17 +38,8 @@ async def _alert(text: str):
         logger.info(f"ALERT (no TG): {text}")
 
 def _check_daily_loss_limit() -> bool:
-    """Return True if daily loss limit is breached."""
-    from shared.journal_db import get_trades_for_date
-    today_str = datetime.now(config.TZ_UK).strftime("%Y-%m-%d")
-    trades = get_trades_for_date(today_str, instrument="NIKKEI")
-    day_pnl = sum(t.get("pnl_gbp", 0) or 0 for t in trades)
-    if day_pnl <= -config.MAX_DAILY_LOSS_GBP:
-        logger.warning(f"Daily loss limit hit: {day_pnl:.2f} GBP (limit: -{config.MAX_DAILY_LOSS_GBP})")
-        return True
+    """Disabled — per-trade risk cap + max entries already protect capital."""
     return False
-
-
 async def _check_slippage(state, fill_price: float) -> bool:
     """Check if fill slipped too far from trigger level. Returns True if OK, False if excessive.
     Slippage limit is proportional to the trade's initial risk (bar range), not a fixed number.

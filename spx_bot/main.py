@@ -140,17 +140,8 @@ async def _check_slippage(state: US30DailyState, fill_price: float) -> bool:
 
 
 def _check_daily_loss_limit() -> bool:
-    """Return True if daily loss limit is breached."""
-    from shared.journal_db import get_trades_for_date
-    today_str = datetime.now(config.TZ_UK).strftime("%Y-%m-%d")
-    trades = get_trades_for_date(today_str, instrument="US30")
-    day_pnl = sum(t.get("pnl_gbp", 0) or 0 for t in trades)
-    if day_pnl <= -config.MAX_DAILY_LOSS_GBP:
-        logger.warning(f"Daily loss limit hit: {day_pnl:.2f} GBP (limit: -{config.MAX_DAILY_LOSS_GBP})")
-        return True
+    """Disabled — per-trade risk cap + max entries already protect capital."""
     return False
-
-
 async def _handle_fill_event(data):
     """
     Event-driven handler for IG streaming trade updates (OPU dict).
