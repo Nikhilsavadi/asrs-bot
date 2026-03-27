@@ -451,14 +451,20 @@ def get_monthly_report() -> str:
     if total_trades < 30:
         flags.append(f"⚠️ Only {total_trades} trades (expect 50-100)")
 
-    # Per instrument
+    # Per instrument with full stats
     instruments = {}
     for r in rows:
         inst = r.get("instrument", "?")
         if inst not in instruments:
-            instruments[inst] = {"trades": 0, "pnl": 0}
+            instruments[inst] = {"trades": 0, "pnl": 0, "wins": 0, "gross_win": 0, "gross_loss": 0}
         instruments[inst]["trades"] += 1
-        instruments[inst]["pnl"] += r["pnl_gbp"] if r["pnl_gbp"] else 0
+        pnl = r["pnl_gbp"] if r["pnl_gbp"] else 0
+        instruments[inst]["pnl"] += pnl
+        if pnl > 0:
+            instruments[inst]["wins"] += 1
+            instruments[inst]["gross_win"] += pnl
+        elif pnl < 0:
+            instruments[inst]["gross_loss"] += abs(pnl)
 
     status = "✅ ON TRACK" if not flags else "⚠️ REVIEW NEEDED"
     icon = "🟢" if net_pnl >= 0 else "🔴"
@@ -481,9 +487,20 @@ def get_monthly_report() -> str:
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
     )
 
+    msg += f"<b>Per Instrument:</b>\n"
     for inst, data in sorted(instruments.items()):
         sign = "+" if data["pnl"] >= 0 else ""
-        msg += f"  {inst}: {data['trades']} trades, {sign}£{data['pnl']:.2f}\n"
+        inst_wr = round(data["wins"] / data["trades"] * 100, 0) if data["trades"] else 0
+        inst_gl = data["gross_loss"] if data["gross_loss"] > 0 else 0.001
+        inst_pf = round(data["gross_win"] / inst_gl, 2)
+        inst_icon = "🟢" if data["pnl"] >= 0 else "🔴"
+        msg += (
+            f"  {inst_icon} {inst}: {sign}£{data['pnl']:.2f}\n"
+            f"     {data['trades']} trades | WR {inst_wr:.0f}% | PF {inst_pf}\n"
+        )
+        # Flag underperforming instrument
+        if inst_pf < 1.0 and data["trades"] >= 10:
+            flags.append(f"⚠️ {inst} PF {inst_pf} — underperforming")
 
     if flags:
         msg += f"━━━━━━━━━━━━━━━━━━━━━━\n"
