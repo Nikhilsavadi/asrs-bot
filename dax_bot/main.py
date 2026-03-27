@@ -792,6 +792,12 @@ async def session2_routine():
     if now.weekday() >= 5:
         return
 
+    # Cancel any remaining S1 bracket
+    if broker and hasattr(broker, '_pending_bracket') and broker._pending_bracket:
+        if broker._pending_bracket.get('active'):
+            broker._pending_bracket['active'] = False
+            logger.info("S1 bracket cancelled — S2 starting")
+
     state = DailyState.load()
 
     # Get morning direction — try state, then trades, then fall back to overnight bias

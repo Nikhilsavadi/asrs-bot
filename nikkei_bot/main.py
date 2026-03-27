@@ -633,10 +633,10 @@ async def _morning_routine_inner():
     except Exception as e:
         logger.warning(f"Gap computation failed: {e}")
 
-    # For Nikkei, "overnight" = pre-market prices before 09:00 JST
+    # For Nikkei, "overnight" = pre-market prices before session open (10:00 JST)
     # Try streaming bars first, fall back to hourly cache
     try:
-        pre_market = df[df.index < tokyo_open_cet]
+        pre_market = df[df.index < session_open_cet]
         if pre_market.empty:
             logger.info("Streaming pre-market empty — using cached overnight samples")
             pre_market = get_cached_overnight_df()
@@ -855,6 +855,12 @@ async def session2_routine():
     now = datetime.now(config.TZ_JST)
     if now.weekday() >= 5:
         return
+
+    # Cancel any remaining S1 bracket
+    if broker and hasattr(broker, '_pending_bracket') and broker._pending_bracket:
+        if broker._pending_bracket.get('active'):
+            broker._pending_bracket['active'] = False
+            logger.info("S1 bracket cancelled — S2 starting")
 
     state = NikkeiDailyState.load()
 

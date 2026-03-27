@@ -659,6 +659,13 @@ def process_stop_hit(state: DailyState, exit_price: float) -> list[str]:
             state.trades[-1].get("slippage_total", 0) + (exit_slip * state.contracts_active), 1)
         state.trades[-1]["pnl_pts"] = round(total_pnl, 1)
         state.trades[-1]["pnl_per_contract"] = pnl_per_contract
+        state.trades[-1]["pnl_original"] = round(pnl_per_contract * (state.contracts_active - len(state.add_positions)), 1)
+        state.trades[-1]["pnl_adds"] = round(add_pnl, 1)
+        state.trades[-1]["add_details"] = [
+            {"entry": a.get("entry_price", 0), "exit": exit_price,
+             "pnl": round((exit_price - a["entry_price"]) if state.direction == "LONG" else (a["entry_price"] - exit_price), 1)}
+            for a in state.add_positions
+        ]
         state.trades[-1]["contracts_stopped"] = state.contracts_active
         state.trades[-1]["tp1_filled"] = state.tp1_filled
         state.trades[-1]["tp2_filled"] = state.tp2_filled

@@ -32,7 +32,8 @@ class _TickListener(SubscriptionListener):
     def __init__(self, epic: str, prices: dict, events: dict,
                  tick_callbacks: dict,
                  loop: asyncio.AbstractEventLoop,
-                 tick_bars: dict = None, candle_bars: dict = None):
+                 tick_bars: dict = None, candle_bars: dict = None,
+                 candle_callbacks: dict = None):
         self._epic = epic
         self._prices = prices
         self._events = events
@@ -40,6 +41,7 @@ class _TickListener(SubscriptionListener):
         self._loop = loop
         self._tick_bars = tick_bars or {}      # shared tick-bar accumulator
         self._candle_bars = candle_bars or {}  # shared bar store (same as CONS_END)
+        self._candle_callbacks = candle_callbacks or {}  # fire on tick-bar complete
 
     def onItemUpdate(self, update):
         try:
@@ -105,6 +107,11 @@ class _TickListener(SubscriptionListener):
                         f"O={completed['Open']} H={completed['High']} "
                         f"L={completed['Low']} C={completed['Close']}"
                     )
+                    # Fire candle callbacks so bots get tick-bar completions
+                    for cb in self._candle_callbacks.get(self._epic, []):
+                        self._loop.call_soon_threadsafe(
+                            self._loop.create_task, cb(completed)
+                        )
 
             # Start new bar
             self._tick_bars[self._epic] = {
@@ -332,7 +339,8 @@ class IGStreamManager:
         )
         listener = _TickListener(
             epic, self._prices, self._price_events, self._tick_callbacks, self._loop,
-            tick_bars=self._tick_bars, candle_bars=self._candle_bars
+            tick_bars=self._tick_bars, candle_bars=self._candle_bars,
+            candle_callbacks=self._candle_callbacks
         )
         sub.addListener(listener)
         self._session.stream.subscribe(sub)
