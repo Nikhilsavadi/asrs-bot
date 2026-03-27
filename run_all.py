@@ -1,10 +1,11 @@
 """
-run_all.py — Run DAX ASRS + Gold ORB bots in a single process.
+run_all.py — Run DAX + US30 + Nikkei ASRS bots in a single process.
 ═══════════════════════════════════════════════════════════════
 Single container, single event loop. Shared IG REST + Lightstreamer
 session across all strategies. Each strategy is fully independent:
-  - DAX: scheduler-driven (08:21-17:35 UK time)
-  - Gold ORB: event-driven (Lightstreamer candle callbacks)
+  - DAX S1+S2: scheduler-driven (08:21-17:35 UK time)
+  - US30 S1+S2: scheduler-driven (09:30-16:00 ET)
+  - Nikkei S1+S2: scheduler-driven (10:00-15:00 JST)
 
 No shared state between strategies. Shutdown is sequential.
 
@@ -93,34 +94,10 @@ async def main():
     # ── Register tick-based entry trigger (sub-second vs 5s polling) ─────
     dax_broker.register_trigger_callback(dax_main.on_tick_trigger)
 
-    # ══════════════════════════════════════════════════════════════
-    # STRATEGY 3: Gold ORB (fully event-driven, no scheduler)
-    # Runs independently from DAX — triggered by Lightstreamer
-    # candle callbacks on Gold epic.
-    # Sessions: Gold Asian 00-07, London 07-12, US 13-18 UTC
-    # ══════════════════════════════════════════════════════════════
     import telegram_cmd
 
-    gold_main = None  # Will be set if init succeeds
-
-    async def tg_send_gold(text):
-        """Send Telegram message with [S2] prefix for Gold ORB."""
-        await telegram_cmd._send("[S2] " + text)
-
-    try:
-        import gold_bot.main as _gold_main
-        await _gold_main.setup(shared, stream_mgr, tg_send=tg_send_gold)
-        gold_main = _gold_main
-        logger.info("Strategy 2 (Gold ORB) initialized")
-    except Exception as e:
-        logger.error("Strategy 2 init failed: %s", e, exc_info=True)
-        try:
-            await tg_send_gold("Strategy 2 INIT FAILED: " + str(e))
-        except Exception:
-            pass
-
     # ══════════════════════════════════════════════════════════════
-    # STRATEGY 3: US30 ASRS (scheduler-driven, US market hours)
+    # STRATEGY 2: US30 ASRS (scheduler-driven, US market hours)
     # Same ASRS rules as DAX, adapted for S&P 500.
     # RTH: 09:30-16:00 ET, bar 4 at 09:50 ET
     # ══════════════════════════════════════════════════════════════
@@ -184,12 +161,6 @@ async def main():
             await dax_main.graceful_shutdown()
         except Exception as e:
             logger.error("DAX shutdown error: %s", e)
-        # Shutdown Gold ORB (close any open positions)
-        if gold_main is not None:
-            try:
-                await gold_main.graceful_shutdown()
-            except Exception as e:
-                logger.error("Gold ORB shutdown error: %s", e)
         dax_scheduler.shutdown(wait=False)
         await stream_mgr.unsubscribe_all()
         await shared.disconnect()
