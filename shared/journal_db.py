@@ -404,6 +404,95 @@ def get_weekly_pnl(instrument: str = None) -> dict:
     return {"pnl_gbp": row["pnl"], "trades": row["trades"]}
 
 
+def get_monthly_report() -> str:
+    """Generate monthly performance report comparing to backtest benchmarks.
+    Runs on 1st of each month, covers the previous month."""
+    from datetime import timedelta
+    conn = _get_conn()
+    today = datetime.now(TZ_UK).date()
+    # Previous month
+    first_of_this = today.replace(day=1)
+    last_of_prev = first_of_this - timedelta(days=1)
+    first_of_prev = last_of_prev.replace(day=1)
+
+    rows = conn.execute(
+        "SELECT * FROM trades WHERE date >= ? AND date <= ? ORDER BY id",
+        (first_of_prev.isoformat(), last_of_prev.isoformat()),
+    ).fetchall()
+
+    if not rows:
+        return (
+            f"📊 <b>MONTHLY REPORT</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📅 {first_of_prev.strftime('%B %Y')}\n"
+            f"No trades recorded."
+        )
+
+    total_trades = len(rows)
+    winners = [r for r in rows if r["pnl_gbp"] and r["pnl_gbp"] > 0]
+    losers = [r for r in rows if r["pnl_gbp"] and r["pnl_gbp"] < 0]
+    gross_win = sum(r["pnl_gbp"] for r in winners) if winners else 0
+    gross_loss = abs(sum(r["pnl_gbp"] for r in losers)) if losers else 0.001
+    pf = round(gross_win / gross_loss, 2)
+    wr = round(len(winners) / total_trades * 100, 1) if total_trades else 0
+    net_pnl = round(sum(r["pnl_gbp"] for r in rows if r["pnl_gbp"]), 2)
+    avg_win = round(sum(r["pnl_gbp"] for r in winners) / len(winners), 2) if winners else 0
+    avg_loss = round(sum(r["pnl_gbp"] for r in losers) / len(losers), 2) if losers else 0
+    wl_ratio = round(abs(avg_win / avg_loss), 1) if avg_loss != 0 else 0
+
+    # Benchmark comparison
+    flags = []
+    if pf < 1.3:
+        flags.append(f"⚠️ PF {pf} below 1.3 threshold")
+    if wr < 25:
+        flags.append(f"⚠️ Win rate {wr}% below 25% threshold")
+    if wl_ratio < 2.0:
+        flags.append(f"⚠️ W:L ratio {wl_ratio} below 2.0 threshold")
+    if total_trades < 30:
+        flags.append(f"⚠️ Only {total_trades} trades (expect 50-100)")
+
+    # Per instrument
+    instruments = {}
+    for r in rows:
+        inst = r.get("instrument", "?")
+        if inst not in instruments:
+            instruments[inst] = {"trades": 0, "pnl": 0}
+        instruments[inst]["trades"] += 1
+        instruments[inst]["pnl"] += r["pnl_gbp"] if r["pnl_gbp"] else 0
+
+    status = "✅ ON TRACK" if not flags else "⚠️ REVIEW NEEDED"
+    icon = "🟢" if net_pnl >= 0 else "🔴"
+
+    msg = (
+        f"📊 <b>MONTHLY REPORT</b> [{status}]\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📅 {first_of_prev.strftime('%B %Y')}\n"
+        f"{icon} Net P&L: <b>£{net_pnl:,.2f}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Trades: {total_trades} | Wins: {len(winners)} | WR: {wr}%\n"
+        f"PF: {pf} | W:L ratio: {wl_ratio}x\n"
+        f"Avg win: £{avg_win:.2f} | Avg loss: £{avg_loss:.2f}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>vs Backtest:</b>\n"
+        f"  PF: {pf} (target: 2.81, ok: 1.5-4.0)\n"
+        f"  WR: {wr}% (target: 36%, ok: 28-44%)\n"
+        f"  W:L: {wl_ratio}x (target: 3.5x, ok: 2.5-5x)\n"
+        f"  Trades: {total_trades} (target: 75, ok: 50-100)\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+    )
+
+    for inst, data in sorted(instruments.items()):
+        sign = "+" if data["pnl"] >= 0 else ""
+        msg += f"  {inst}: {data['trades']} trades, {sign}£{data['pnl']:.2f}\n"
+
+    if flags:
+        msg += f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        for f in flags:
+            msg += f"{f}\n"
+
+    return msg
+
+
 def get_stats(instrument: str = None) -> dict:
     """Comprehensive stats for dashboard / Telegram."""
     conn = _get_conn()

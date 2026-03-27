@@ -354,6 +354,19 @@ async def main():
     dax_scheduler.add_job(_safety_audit, "interval", minutes=5,
         id="safety_audit", misfire_grace_time=60)
 
+    # ── Monthly performance report (1st of each month at 08:00 UK) ──
+    async def _monthly_report():
+        try:
+            from shared.journal_db import get_monthly_report
+            report = get_monthly_report()
+            await telegram_cmd._send(report)
+        except Exception as e:
+            logger.warning(f"Monthly report failed: {e}")
+
+    dax_scheduler.add_job(_monthly_report, "cron",
+        day=1, hour=8, minute=0,
+        id="monthly_report", misfire_grace_time=3600)
+
     dax_scheduler.start()
 
     # ── Build gold status string ────────────────────────────────
