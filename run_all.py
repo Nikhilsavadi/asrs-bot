@@ -347,32 +347,15 @@ async def main():
 
     dax_scheduler.start()
 
-    # ── Build gold status string ────────────────────────────────
     ig_mode = "DEMO" if dax_config.IG_DEMO else "LIVE"
 
-    gold_str = "disabled"
-    try:
-        from gold_bot import config as gold_config
-        if gold_config.ENABLE_GOLD:
-            sessions = list(gold_config.INSTRUMENTS["GOLD"]["sessions"].keys())
-            weekly = " + Weekly" if gold_config.WEEKLY_ORB_ENABLED else ""
-            gold_str = "15m ORB (" + ", ".join(sessions) + ")" + weekly
-    except Exception:
-        pass
+    us30_str = f"ASRS bar4/5 ({spx_main.config.IG_EPIC})" if spx_main else "disabled"
+    nikkei_str = f"ASRS bar4/5 ({nikkei_main.config.IG_EPIC})" if nikkei_main else "disabled"
 
-    us30_str = "disabled"
-    if spx_main is not None:
-        us30_str = f"ASRS bar4/5 ({spx_main.config.IG_EPIC})"
+    await send_startup_alert(telegram_cmd._send, spx_str=us30_str, nikkei_str=nikkei_str)
 
-    nikkei_str = "disabled"
-    if nikkei_main is not None:
-        nikkei_str = f"ASRS bar4/5 ({nikkei_main.config.IG_EPIC})"
-
-    # ── Startup alert via Telegram (single combined message) ──
-    await send_startup_alert(telegram_cmd._send, gold_str=gold_str, spx_str=us30_str, nikkei_str=nikkei_str)
-
-    logger.info("Bot started: DAX=%s, S3 ORB=%s, US30=%s, Nikkei=%s, mode=%s",
-                dax_config.IG_EPIC, gold_str, us30_str, nikkei_str, ig_mode)
+    logger.info("Bot started: DAX=%s, US30=%s, Nikkei=%s, mode=%s",
+                dax_config.IG_EPIC, us30_str, nikkei_str, ig_mode)
 
     print("")
     print("=" * 56)
