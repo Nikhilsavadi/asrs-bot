@@ -295,36 +295,43 @@ async def main():
             id="spx_eod", misfire_grace_time=120,
             timezone=tz_et)
 
-    # ── Nikkei schedule (all times UTC; TSE 09:00-15:00 JST = 00:00-06:00 UTC) ──
+    # ── Nikkei schedule (JST timezone — immune to UK/EU clock changes) ──
     if nikkei_main is not None:
-        # Nikkei S1 at 10:00 JST = 01:00 UTC, S2 at 12:00 JST = 03:00 UTC
-        # Health check at 09:00 JST = 00:00 UTC, warmup at 09:50 JST = 00:50 UTC
+        from zoneinfo import ZoneInfo
+        tz_jst = ZoneInfo("Asia/Tokyo")
+
         dax_scheduler.add_job(nikkei_main.health_check, "cron",
-            day_of_week="mon-fri", hour=0, minute=0,
-            id="nikkei_health", misfire_grace_time=120)
+            day_of_week="mon-fri", hour=9, minute=0,
+            id="nikkei_health", misfire_grace_time=120,
+            timezone=tz_jst)
 
         dax_scheduler.add_job(nikkei_main.pre_trade_warmup, "cron",
-            day_of_week="mon-fri", hour=1, minute=10,
-            id="nikkei_prewarm", misfire_grace_time=120)
+            day_of_week="mon-fri", hour=10, minute=10,
+            id="nikkei_prewarm", misfire_grace_time=120,
+            timezone=tz_jst)
 
-        # S1: 10:21 JST = 01:21 UTC
+        # S1: 10:21 JST (bar 4 closes at 10:20 JST)
         dax_scheduler.add_job(nikkei_main.morning_routine, "cron",
-            day_of_week="mon-fri", hour=1, minute=21,
-            id="nikkei_morning", misfire_grace_time=120)
+            day_of_week="mon-fri", hour=10, minute=21,
+            id="nikkei_morning", misfire_grace_time=120,
+            timezone=tz_jst)
 
-        # S2: 12:21 JST = 03:21 UTC
+        # S2: 12:21 JST (bar 4 closes at 12:20 JST)
         if hasattr(nikkei_main, 'session2_routine'):
             dax_scheduler.add_job(nikkei_main.session2_routine, "cron",
-                day_of_week="mon-fri", hour=3, minute=21,
-                id="nikkei_session2", misfire_grace_time=120)
+                day_of_week="mon-fri", hour=12, minute=21,
+                id="nikkei_session2", misfire_grace_time=120,
+                timezone=tz_jst)
 
         dax_scheduler.add_job(nikkei_main.monitor_cycle, "cron",
-            day_of_week="mon-fri", hour="0-6", minute="*",
-            id="nikkei_monitor", misfire_grace_time=30)
+            day_of_week="mon-fri", hour="9-15", minute="*",
+            id="nikkei_monitor", misfire_grace_time=30,
+            timezone=tz_jst)
 
         dax_scheduler.add_job(nikkei_main.end_of_day, "cron",
-            day_of_week="mon-fri", hour=6, minute=5,
-            id="nikkei_eod", misfire_grace_time=120)
+            day_of_week="mon-fri", hour=15, minute=5,
+            id="nikkei_eod", misfire_grace_time=120,
+            timezone=tz_jst)
 
     # ── Session keepalive every 10 minutes ────────────────────────
     async def keepalive_with_stream_check():
