@@ -924,12 +924,12 @@ class Signal:
 
         # Step 3: REST fallback with retries
         logger.warning(f"[{self.name}] Stream failed -- REST fallback")
-        for attempt in range(1, 4):
+        for attempt in range(1, 7):  # 6 attempts x 15s = 90s window
             df = await self.broker.get_5min_bars("1 D")
             if df is not None and not df.empty:
                 if self._find_bar(df, 4) is not None:
                     return df
-            if attempt < 3:
+            if attempt < 6:
                 await asyncio.sleep(15)
 
         return pd.DataFrame()
