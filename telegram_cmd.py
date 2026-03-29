@@ -99,130 +99,69 @@ async def _get_offset() -> int | None:
 
 
 async def handle_status(dax_broker, **kwargs):
-    """Show bot health, IG connection, position, today's P&L."""
+    """Show bot health — reads from unified asrs.main.ALL_SIGNALS."""
     global paused
-    _cfg = dax_config
-    now = datetime.now(_cfg.TZ_UK)
-    mode = "DEMO" if getattr(_cfg, "IG_DEMO", True) else "LIVE"
-
-    # DAX state
-    dax_state = None
-    try:
-        from dax_bot.strategy import DailyState as DaxState
-        dax_state = DaxState.load()
-    except ImportError:
-        pass
-
-    # IG connection check
-    dax_ok = dax_broker.connected if dax_broker else False
-
-    # DAX position
-    dax_pos = "FLAT"
-    dax_phase = "N/A"
-    dax_pnl = ""
-    stream_bars = 0
-    if dax_state:
-        dax_phase = str(dax_state.phase)
-        if dax_state.direction:
-            dax_pos = f"{dax_state.direction} @ {dax_state.entry_price}"
-        if hasattr(dax_state, 'trades') and dax_state.trades:
-            total = sum(t.get("pnl_pts", 0) for t in dax_state.trades if isinstance(t.get("pnl_pts"), (int, float)))
-            dax_pnl = f"{'+' if total >= 0 else ''}{round(total, 1)} pts"
-    if dax_broker:
-        stream_bars = dax_broker.get_streaming_bar_count()
-
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo("Europe/London"))
+    mode = "DEMO"  # TODO: read from config
     pause_str = "PAUSED" if paused else "ACTIVE"
 
-    # US30 state
-    us30_phase = "N/A"
-    us30_pos = "FLAT"
-    us30_pnl = ""
-    us30_bars = 0
+    # Try new unified signals first
     try:
-        from spx_bot.main import broker as us30_broker
-        from spx_bot.strategy import US30DailyState
-        us30_state = US30DailyState.load()
-        us30_phase = str(us30_state.phase)
-        if us30_state.direction:
-            us30_pos = f"{us30_state.direction} @ {us30_state.entry_price}"
-        if hasattr(us30_state, 'trades') and us30_state.trades:
-            total_us = sum(t.get("pnl_pts", 0) for t in us30_state.trades if isinstance(t.get("pnl_pts"), (int, float)))
-            us30_pnl = f"{'+' if total_us >= 0 else ''}{round(total_us, 1)} pts"
-        if us30_broker:
-            us30_bars = us30_broker.get_streaming_bar_count()
-    except Exception:
-        pass
+        from asrs.main import ALL_SIGNALS
+        if ALL_SIGNALS:
+            ig_ok = ALL_SIGNALS[0].broker._shared.ig is not None
+            msg = (
+                f"📊 <b>BOT STATUS</b> [{mode}]\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🕐 {now.strftime('%Y-%m-%d %H:%M')} UK\n"
+                f"🔄 Trading: <b>{pause_str}</b>\n"
+                f"  IG: {'✅' if ig_ok else '❌'}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            )
+            for signal in ALL_SIGNALS:
+                state = signal.state
+                phase = state.phase.name if hasattr(state.phase, 'name') else str(state.phase)
+                pos = "FLAT"
+                if state.direction:
+                    pos = f"{state.direction} @ {state.entry_price}"
+                pnl_str = "N/A"
+                if state.trades:
+                    total = sum(t.get("pnl_pts", 0) for t in state.trades)
+                    pnl_str = f"{'+' if total >= 0 else ''}{round(total, 1)} pts"
+                bars = signal.broker.get_streaming_bar_count() if hasattr(signal.broker, 'get_streaming_bar_count') else 0
 
-    # S2 phases
-    dax_s2_phase = "N/A"
-    dax_s2_pos = ""
-    us30_s2_phase = "N/A"
-    us30_s2_pos = ""
-    if dax_state:
-        dax_s2_phase = getattr(dax_state, 's2_phase', 'IDLE')
-        if getattr(dax_state, 's2_direction', ''):
-            dax_s2_pos = f" | {dax_state.s2_direction} @ {dax_state.s2_entry_price}"
-    try:
-        us30_state_s2 = us30_state if 'us30_state' in dir() else None
-        if us30_state_s2:
-            us30_s2_phase = getattr(us30_state_s2, 's2_phase', 'IDLE')
-            if getattr(us30_state_s2, 's2_direction', ''):
-                us30_s2_pos = f" | {us30_state_s2.s2_direction} @ {us30_state_s2.s2_entry_price}"
-    except Exception:
-        pass
+                s2_info = ""
+                if signal.session == 2:
+                    s2_hour = signal.config.get('s2_open_hour', '?')
+                    tz_name = signal.config.get('timezone', '').split('/')[-1]
+                    s2_info = f" ({s2_hour}:00 {tz_name})"
 
+                msg += (
+                    f"<b>{signal.name}</b>{s2_info}\n"
+                    f"  Phase: {phase}\n"
+                    f"  Position: {pos}\n"
+                    f"  Today P&L: {pnl_str}\n"
+                    f"  Streaming bars: {bars}\n"
+                )
+
+                # Add separator between instruments (after S2)
+                if signal.session == 2:
+                    msg += f"━━━━━━━━━━━━━━━━━━━━━━\n"
+
+            await _send(msg)
+            return
+    except Exception as e:
+        pass  # Fall through to old handler
+
+    # Fallback: old-style status (for backwards compat)
     msg = (
         f"📊 <b>BOT STATUS</b> [{mode}]\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🕐 {now.strftime('%Y-%m-%d %H:%M')} UK\n"
         f"🔄 Trading: <b>{pause_str}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>DAX S1</b>\n"
-        f"  IG: {'✅' if dax_ok else '❌'} | Phase: {dax_phase}\n"
-        f"  Position: {dax_pos}\n"
-        f"  Today P&L: {dax_pnl or 'N/A'}\n"
-        f"  Streaming bars: {stream_bars}\n"
-        f"<b>DAX S2</b> (14:00 CET)\n"
-        f"  Phase: {dax_s2_phase}{dax_s2_pos}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>US30 S1</b>\n"
-        f"  Phase: {us30_phase}\n"
-        f"  Position: {us30_pos}\n"
-        f"  Today P&L: {us30_pnl or 'N/A'}\n"
-        f"  Streaming bars: {us30_bars}\n"
-        f"<b>US30 S2</b> (11:00 ET)\n"
-        f"  Phase: {us30_s2_phase}{us30_s2_pos}\n"
-    )
-
-    # Nikkei
-    nk_phase = "N/A"
-    nk_pos = "FLAT"
-    nk_pnl = ""
-    nk_bars = 0
-    nk_s2_phase = "N/A"
-    try:
-        from nikkei_bot.main import broker as nk_broker
-        from nikkei_bot.main import NikkeiDailyState
-        nk_state = NikkeiDailyState.load()
-        nk_phase = str(nk_state.phase)
-        if nk_state.direction:
-            nk_pos = f"{nk_state.direction} @ {nk_state.entry_price}"
-        if hasattr(nk_state, 'trades') and nk_state.trades:
-            total_nk = sum(t.get("pnl_pts", 0) for t in nk_state.trades if isinstance(t.get("pnl_pts"), (int, float)))
-            nk_pnl = f"{'+' if total_nk >= 0 else ''}{round(total_nk, 1)} pts"
-        if nk_broker:
-            nk_bars = nk_broker.get_streaming_bar_count()
-        nk_s2_phase = getattr(nk_state, 's2_phase', 'IDLE')
-    except Exception:
-        pass
-
-    msg += (
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>NIKKEI S1</b> (10:00 JST)\n"
-        f"  Phase: {nk_phase}\n"
-        f"  Position: {nk_pos}\n"
-        f"  Today P&L: {nk_pnl or 'N/A'}\n"
-        f"  Streaming bars: {nk_bars}\n"
+        f"Using old handler — signals not available\n"
         f"<b>NIKKEI S2</b> (12:00 JST)\n"
         f"  Phase: {nk_s2_phase}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━"
@@ -348,31 +287,20 @@ async def handle_kill(dax_broker, **kwargs):
                 except Exception as e:
                     results.append(f"  {epic} {direction}: FAILED ({e})")
 
-        # Reset DAX state
+        # Reset all signal states (new unified bot)
         try:
-            from dax_bot.strategy import DailyState as DaxState, Phase as DaxPhase
-            ds = DaxState.load()
-            ds.phase = DaxPhase.DONE
-            ds.s2_phase = "DONE"
-            ds.direction = ""
-            ds.contracts_active = 0
-            ds.save()
-            results.append("DAX state: RESET")
-        except Exception:
-            pass
-
-        # Reset US30 state
-        try:
-            from spx_bot.strategy import US30DailyState, Phase as US30Phase
-            us = US30DailyState.load()
-            us.phase = US30Phase.DONE
-            us.s2_phase = "DONE"
-            us.direction = ""
-            us.contracts_active = 0
-            us.save()
-            results.append("US30 state: RESET")
-        except Exception:
-            pass
+            from asrs.main import ALL_SIGNALS
+            from asrs.strategy import Phase
+            for signal in ALL_SIGNALS:
+                signal.state.phase = Phase.DONE
+                signal.state.direction = ""
+                signal.state.contracts_active = 0
+                signal.state.deal_ids = []
+                if hasattr(signal.broker, '_pending_bracket'):
+                    signal.broker._pending_bracket = None
+                results.append(f"{signal.name}: RESET")
+        except Exception as e:
+            results.append(f"State reset failed: {e}")
 
     except Exception as e:
         results.append(f"ERROR: {e}")
