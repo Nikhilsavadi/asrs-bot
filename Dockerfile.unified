@@ -9,9 +9,8 @@ RUN pip install --no-cache-dir -r requirements.txt -r requirements.ftse.txt
 
 # Copy all bot code
 COPY shared/ shared/
+COPY asrs/ asrs/
 COPY dax_bot/ dax_bot/
-COPY ftse_bot/ ftse_bot/
-COPY gold_bot/ gold_bot/
 COPY spx_bot/ spx_bot/
 COPY nikkei_bot/ nikkei_bot/
 COPY telegram_cmd.py .
@@ -23,4 +22,5 @@ RUN mkdir -p data
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 \
     CMD python -c "import os, signal; pid=int(open('/tmp/asrs.pid').read()); os.kill(pid, 0)" || exit 1
 
-CMD ["python", "run_all.py"]
+# New unified bot (asrs/) — switch back to run_all.py if issues
+CMD ["python", "-m", "asrs.main"]
