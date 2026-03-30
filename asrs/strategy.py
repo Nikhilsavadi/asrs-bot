@@ -902,6 +902,7 @@ class Signal:
         open_m = self.cfg[f"s{self.session}_open_minute"]
         today = datetime.now(self.tz).date()
 
+        bars_found = []
         for idx, row in df.iterrows():
             # Convert to instrument timezone (bars may be timestamped in CET)
             local_idx = idx.astimezone(self.tz) if hasattr(idx, 'astimezone') and idx.tzinfo else idx
@@ -913,6 +914,7 @@ class Signal:
             if mins_from_open < 0:
                 continue
             bn = mins_from_open // 5 + 1
+            bars_found.append(f"{h:02d}:{m:02d}=B{bn}")
             if bn == bar_num:
                 return {
                     "High": round(row["High"], 1),
@@ -920,6 +922,8 @@ class Signal:
                     "Open": round(row["Open"], 1),
                     "Close": round(row["Close"], 1),
                 }
+        logger.warning(f"[{self.name}] _find_bar({bar_num}) NOT FOUND in {len(df)} rows. "
+                       f"Bars: {bars_found} | open={open_h:02d}:{open_m:02d}")
         return None
 
     async def _get_bars_with_fallback(self):
