@@ -33,7 +33,7 @@ class _TickListener(SubscriptionListener):
                  tick_callbacks: dict,
                  loop: asyncio.AbstractEventLoop,
                  tick_bars: dict = None, candle_bars: dict = None,
-                 candle_callbacks: dict = None):
+                 candle_callbacks: dict = None, bar_emit_times: dict = None):
         self._epic = epic
         self._prices = prices
         self._events = events
@@ -42,6 +42,7 @@ class _TickListener(SubscriptionListener):
         self._tick_bars = tick_bars or {}      # shared tick-bar accumulator
         self._candle_bars = candle_bars or {}  # shared bar store (same as CONS_END)
         self._candle_callbacks = candle_callbacks or {}  # fire on tick-bar complete
+        self._bar_emit_times = bar_emit_times or {}  # track emission time per epic
 
     def onItemUpdate(self, update):
         try:
@@ -101,6 +102,7 @@ class _TickListener(SubscriptionListener):
                 already = any(b["time"] == completed["time"] for b in epic_bars)
                 if not already:
                     epic_bars.append(completed)
+                    self._bar_emit_times[self._epic] = datetime.now(CET)
                     logger.info(
                         f"Tick-bar ({self._epic}): {completed['time'].strftime('%H:%M')}-"
                         f"{end_time.strftime('%H:%M')} CET | "
@@ -143,11 +145,13 @@ class _CandleListener(SubscriptionListener):
     """Receives CHART:{epic}:MINUTE_5 updates and stores completed candles."""
 
     def __init__(self, epic: str, bars: dict, callbacks: dict,
-                 loop: asyncio.AbstractEventLoop, dedup_state: dict = None):
+                 loop: asyncio.AbstractEventLoop, dedup_state: dict = None,
+                 bar_emit_times: dict = None):
         self._epic = epic
         self._bars = bars
         self._callbacks = callbacks
         self._loop = loop
+        self._bar_emit_times = bar_emit_times or {}
         # BUG #2 FIX: dedup state lives at manager level, survives reconnects
         self._dedup = dedup_state if dedup_state is not None else {}
 
@@ -222,6 +226,7 @@ class _CandleListener(SubscriptionListener):
 
             epic_bars = self._bars.setdefault(self._epic, deque(maxlen=300))
             epic_bars.append(bar)
+            self._bar_emit_times[self._epic] = datetime.now(CET)
 
             # Log bar construction with OHLC
             logger.info(
@@ -304,6 +309,7 @@ class IGStreamManager:
 
         # 5-min candle accumulator per epic
         self._candle_bars: dict[str, deque] = {}
+        self._last_bar_emit: dict[str, datetime] = {}
         self._candle_callbacks: dict[str, list[Callable]] = {}
 
         # Trade event callbacks
@@ -340,7 +346,7 @@ class IGStreamManager:
         listener = _TickListener(
             epic, self._prices, self._price_events, self._tick_callbacks, self._loop,
             tick_bars=self._tick_bars, candle_bars=self._candle_bars,
-            candle_callbacks=self._candle_callbacks
+            candle_callbacks=self._candle_callbacks, bar_emit_times=self._last_bar_emit
         )
         sub.addListener(listener)
         self._session.stream.subscribe(sub)
@@ -403,7 +409,8 @@ class IGStreamManager:
         )
         listener = _CandleListener(
             epic, self._candle_bars, self._candle_callbacks, self._loop,
-            dedup_state=self._candle_dedup  # BUG #2 FIX: shared dedup state
+            dedup_state=self._candle_dedup,  # BUG #2 FIX: shared dedup state
+            bar_emit_times=self._last_bar_emit
         )
         sub.addListener(listener)
         self._session.stream.subscribe(sub)
@@ -455,15 +462,12 @@ class IGStreamManager:
         return sum(1 for b in bars if b["time"].date() == today)
 
     def get_last_bar_age(self, epic: str) -> float:
-        """Seconds since last bar was built for this epic. inf if none."""
-        bars = self._candle_bars.get(epic, [])
-        if not bars:
+        """Seconds since last bar was emitted for this epic. inf if none."""
+        emit_time = self._last_bar_emit.get(epic)
+        if emit_time is None:
             return float("inf")
-        last = bars[-1]["time"]
-        if last.tzinfo is None:
-            last = last.replace(tzinfo=CET)
         now = datetime.now(CET)
-        return (now - last).total_seconds()
+        return (now - emit_time).total_seconds()
 
     # ── Trade event streaming ──────────────────────────────────────
 
