@@ -335,7 +335,7 @@ async def main():
             logger.warning(f"Weekly report failed: {e}")
 
     scheduler.add_job(_weekly_report, "cron",
-        day_of_week="fri", hour=17, minute=0,
+        day_of_week="fri", hour=20, minute=0,
         id="weekly_report", misfire_grace_time=3600,
         timezone=config.TZ_UK)
 
