@@ -64,6 +64,7 @@ class SignalState:
     trailing_stop:     float = 0.0
     max_favourable:    float = 0.0
     breakeven_hit:     bool = False
+    trail_moved:       bool = False
     entries_used:      int = 0
 
     # Adds
@@ -155,11 +156,14 @@ class Signal:
         """
         Which 5-min bar from session open. Bar 1 starts at session open.
         Uses hour/minute comparison, NOT timestamp arithmetic (R-impl-1).
+        Converts bar_time to instrument timezone first (tick-bar builder uses CET).
         """
         open_h = self.cfg[f"s{self.session}_open_hour"]
         open_m = self.cfg[f"s{self.session}_open_minute"]
-        bar_h = bar_time.hour
-        bar_m = bar_time.minute
+        # Convert to instrument timezone (bars are timestamped in CET by tick-bar builder)
+        bar_local = bar_time.astimezone(self.tz) if bar_time.tzinfo else bar_time
+        bar_h = bar_local.hour
+        bar_m = bar_local.minute
         mins_from_open = (bar_h * 60 + bar_m) - (open_h * 60 + open_m)
         if mins_from_open < 0:
             return -1
@@ -174,9 +178,10 @@ class Signal:
         Called when a 5-min bar completes via Lightstreamer tick-bar builder.
         Checks if it is our bar 4 (or bar 5 in hybrid mode).
         """
-        bar_time = bar["time"]  # tz-aware datetime in instrument tz
+        bar_time = bar["time"]  # tz-aware datetime (CET from tick-bar builder)
+        bar_local = bar_time.astimezone(self.tz) if bar_time.tzinfo else bar_time
         today = datetime.now(self.tz).date()
-        if bar_time.date() != today:
+        if bar_local.date() != today:
             return
 
         bn = self._bar_number(bar_time)
@@ -455,6 +460,7 @@ class Signal:
         self.state.add_positions = []
         self.state.last_add_price = 0.0
         self.state.breakeven_hit = False
+        self.state.trail_moved = False
         self.state.max_favourable = fill_price
 
         if deal_id:
@@ -616,16 +622,23 @@ class Signal:
                 self.state.trailing_stop = round(new_stop, 1)
 
         if self.state.trailing_stop != old_stop:
+            self.state.trail_moved = True
             self.save_state()
             await self._update_ig_stop()
             move = abs(self.state.trailing_stop - old_stop)
             if move >= self.cfg["trail_min_move"]:
                 label = "TIGHT" if (self.state.direction == "LONG" and prev_close - self.state.entry_price >= self.cfg["tight_threshold"]) or \
                                    (self.state.direction == "SHORT" and self.state.entry_price - prev_close >= self.cfg["tight_threshold"]) else "TRAIL"
+                # Before breakeven: show risk reduction. After: show locked profit.
+                risk_pts = abs(self.state.trailing_stop - self.state.entry_price)
+                if self.state.breakeven_hit:
+                    risk_line = f"Locked: {risk_pts:.1f}pts"
+                else:
+                    old_risk = abs(old_stop - self.state.entry_price)
+                    risk_line = f"Risk: {old_risk:.1f} → {risk_pts:.1f}pts"
                 await self.alert(
                     f"[{self.name}] {label}: stop {old_stop} -> {self.state.trailing_stop}\n"
-                    f"Entry: {self.state.entry_price} | Locked: "
-                    f"{abs(self.state.trailing_stop - self.state.entry_price):.1f}pts"
+                    f"Entry: {self.state.entry_price} | {risk_line}"
                 )
 
     async def _check_add(self, current_price: float):
@@ -717,8 +730,8 @@ class Signal:
         # Exit reason
         if pnl_original == 0.0 and self.state.breakeven_hit:
             exit_reason = "BREAKEVEN_STOP"
-        elif self.state.breakeven_hit and self.state.trailing_stop != self.state.entry_price:
-            exit_reason = "TRAILED_STOP"
+        elif self.state.trail_moved and self.state.trailing_stop != self.state.initial_stop:
+            exit_reason = "TRAIL_STOP"
         else:
             exit_reason = "INITIAL_STOP"
 
@@ -763,6 +776,7 @@ class Signal:
         self.state.adds_used = 0
         self.state.last_add_price = 0.0
         self.state.breakeven_hit = False
+        self.state.trail_moved = False
 
         if self.state.entries_used < self.cfg["max_entries"]:
             # R20: Re-arm BOTH directions at ORIGINAL bar levels
@@ -894,10 +908,12 @@ class Signal:
         today = datetime.now(self.tz).date()
 
         for idx, row in df.iterrows():
-            if idx.date() != today:
+            # Convert to instrument timezone (bars may be timestamped in CET)
+            local_idx = idx.astimezone(self.tz) if hasattr(idx, 'astimezone') and idx.tzinfo else idx
+            if local_idx.date() != today:
                 continue
-            h = idx.hour
-            m = idx.minute
+            h = local_idx.hour
+            m = local_idx.minute
             mins_from_open = (h * 60 + m) - (open_h * 60 + open_m)
             if mins_from_open < 0:
                 continue

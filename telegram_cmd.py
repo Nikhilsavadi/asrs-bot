@@ -133,8 +133,8 @@ async def handle_status(dax_broker, **kwargs):
 
                 s2_info = ""
                 if signal.session == 2:
-                    s2_hour = signal.config.get('s2_open_hour', '?')
-                    tz_name = signal.config.get('timezone', '').split('/')[-1]
+                    s2_hour = signal.cfg.get('s2_open_hour', '?')
+                    tz_name = signal.cfg.get('timezone', '').split('/')[-1]
                     s2_info = f" ({s2_hour}:00 {tz_name})"
 
                 msg += (
@@ -152,21 +152,7 @@ async def handle_status(dax_broker, **kwargs):
             await _send(msg)
             return
     except Exception as e:
-        pass  # Fall through to old handler
-
-    # Fallback: old-style status (for backwards compat)
-    msg = (
-        f"📊 <b>BOT STATUS</b> [{mode}]\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🕐 {now.strftime('%Y-%m-%d %H:%M')} UK\n"
-        f"🔄 Trading: <b>{pause_str}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Using old handler — signals not available\n"
-        f"<b>NIKKEI S2</b> (12:00 JST)\n"
-        f"  Phase: {nk_s2_phase}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━"
-    )
-    await _send(msg)
+        await _send(f"❌ <b>STATUS ERROR</b>\n{e}")
 
 
 async def handle_positions(dax_broker, **kwargs):
@@ -174,35 +160,35 @@ async def handle_positions(dax_broker, **kwargs):
     lines = ["📈 <b>OPEN POSITIONS</b>\n━━━━━━━━━━━━━━━━━━━━━━"]
     found = False
 
-    # DAX
     try:
-        from dax_bot.strategy import DailyState as DaxState, Phase as DaxPhase
-        dax_state = DaxState.load()
-        if dax_state.phase in (DaxPhase.LONG_ACTIVE, DaxPhase.SHORT_ACTIVE):
-            price = None
-            if dax_broker and dax_broker.connected:
-                price = await dax_broker.get_current_price()
+        from asrs.main import ALL_SIGNALS
+        from asrs.strategy import Phase
+        for signal in ALL_SIGNALS:
+            s = signal.state
+            if s.phase not in (Phase.LONG, Phase.SHORT):
+                continue
+            price = await signal.broker.get_current_price()
             unrealised = ""
             if price:
-                if dax_state.direction == "LONG":
-                    ur = round(price - dax_state.entry_price, 1)
+                if s.direction == "LONG":
+                    ur = round(price - s.entry_price, 1)
                 else:
-                    ur = round(dax_state.entry_price - price, 1)
+                    ur = round(s.entry_price - price, 1)
                 unrealised = f"{'+' if ur >= 0 else ''}{ur} pts"
 
-            add_max = dax_config.ADD_STRENGTH_MAX if dax_config else 2
+            add_max = signal.cfg.get("add_max", 2)
             lines.append(
-                f"\n<b>DAX {dax_state.direction}</b>\n"
-                f"  Entry: {dax_state.entry_price}\n"
+                f"\n<b>{signal.name} {s.direction}</b>\n"
+                f"  Entry: {s.entry_price}\n"
                 f"  Current: {price or 'N/A'}\n"
-                f"  Stop: {dax_state.trailing_stop}\n"
-                f"  Contracts: {dax_state.contracts_active}\n"
-                f"  Adds: {dax_state.adds_used}/{add_max}\n"
+                f"  Stop: {s.trailing_stop}\n"
+                f"  Adds: {s.adds_used}/{add_max}\n"
+                f"  BE: {'Yes' if s.breakeven_hit else 'No'}\n"
                 f"  Unrealised: {unrealised or 'N/A'}"
             )
             found = True
-    except ImportError:
-        pass
+    except Exception as e:
+        lines.append(f"\nError: {e}")
 
     if not found:
         lines.append("\nNo open positions.")
@@ -361,9 +347,9 @@ async def handle_logs():
 
 
 async def handle_pnl():
-    """Today's realised P&L, trades, wins/losses."""
-    _cfg = dax_config
-    now = datetime.now(_cfg.TZ_UK)
+    """Today's realised P&L, trades, wins/losses — all from unified journal DB."""
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo("Europe/London"))
     today = now.strftime("%Y-%m-%d")
 
     lines = [
@@ -371,32 +357,9 @@ async def handle_pnl():
         f"━━━━━━━━━━━━━━━━━━━━━━"
     ]
 
-    # DAX journal
-    try:
-        from dax_bot import journal as dax_journal
-        dax_trades = dax_journal.load_all_trades()
-        dax_today = [t for t in dax_trades if t.get("date") == today]
-        if dax_today:
-            dax_pnl = sum(t.get("pnl_pts", 0) for t in dax_today)
-            dax_wins = sum(1 for t in dax_today if t.get("pnl_pts", 0) > 0)
-            dax_losses = sum(1 for t in dax_today if t.get("pnl_pts", 0) < 0)
-            ps = "+" if dax_pnl >= 0 else ""
-            lines.append(
-                f"\n<b>DAX</b>: {ps}{round(dax_pnl, 1)} pts\n"
-                f"  Trades: {len(dax_today)} | W: {dax_wins} L: {dax_losses}"
-            )
-            for t in dax_today:
-                p = t.get("pnl_pts", 0)
-                lines.append(f"  {t.get('direction', '?')} {'+' if p >= 0 else ''}{round(p, 1)} pts")
-        else:
-            lines.append("\n<b>DAX</b>: No trades today")
-    except ImportError:
-        lines.append("\n<b>DAX</b>: N/A")
-
-    # US30 + Nikkei from shared journal DB
     try:
         from shared import journal_db
-        for inst in ["US30", "NIKKEI"]:
+        for inst in ["DAX", "US30", "NIKKEI"]:
             inst_trades = journal_db.get_trades_for_date(today, instrument=inst)
             if inst_trades:
                 inst_pnl = sum(t.get("pnl_pts", 0) for t in inst_trades)
@@ -413,7 +376,7 @@ async def handle_pnl():
             else:
                 lines.append(f"\n<b>{inst}</b>: No trades today")
     except Exception as e:
-        lines.append(f"\n<b>US30/NIKKEI</b>: {e}")
+        lines.append(f"\nError: {e}")
 
     lines.append("━━━━━━━━━━━━━━━━━━━━━━")
     await _send("\n".join(lines))
