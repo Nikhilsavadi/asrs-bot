@@ -207,12 +207,27 @@ async def main():
             warmup_m += 60
             warmup_h -= 1
 
-        async def _warmup(b=s1.broker, epic=inst_cfg["epic"], name=inst_name):
+        async def _warmup(b=s1.broker, epic=inst_cfg["epic"], name=inst_name, s=s1):
             ok = await b.ensure_connected()
-            if not ok:
-                await tg_send(f"[{name}] Pre-trade: IG connection FAILED")
+            bar_count = b.get_streaming_bar_count()
+            tick_age = stream_mgr.get_tick_age(epic)
+            bar_age = stream_mgr.get_last_bar_age(epic) if hasattr(stream_mgr, 'get_last_bar_age') else 0
+
+            issues = []
+            if not ok: issues.append("IG connection FAILED")
+            if bar_count == 0: issues.append("No streaming bars")
+            if tick_age > 120: issues.append(f"Ticks stale ({tick_age:.0f}s)")
+            if bar_age > 600: issues.append(f"Bars stale ({bar_age:.0f}s)")
+
+            if issues:
+                await tg_send(f"⚠️ [{name}] PRE-TRADE CHECK\n" + "\n".join(f"  ❌ {i}" for i in issues))
             else:
-                logger.info(f"[{name}] Pre-trade warmup OK")
+                await tg_send(
+                    f"✅ [{name}] PRE-TRADE CHECK\n"
+                    f"  IG: Connected\n"
+                    f"  Bars: {bar_count}\n"
+                    f"  Morning routine in 10 mins"
+                )
 
         scheduler.add_job(_warmup, "cron",
             day_of_week="mon-fri", hour=warmup_h, minute=warmup_m,
