@@ -249,6 +249,15 @@ class Signal:
                 logger.info(f"[{self.name}] Cancelled S1 bracket")
                 await self.alert(f"[{self.name}] S1 bracket cancelled -- S2 starting")
 
+        # Status: morning routine starting
+        bar_count = self.broker.get_streaming_bar_count()
+        logger.info(f"[{self.name}] ═══ MORNING ROUTINE ═══ ({bar_count} bars)")
+        await self.alert(
+            f"[{self.name}] ═══ MORNING ROUTINE ═══\n"
+            f"Streaming bars: {bar_count}\n"
+            f"IG: {'✅' if await self.broker.ensure_connected() else '❌'}"
+        )
+
         # Ensure broker connected
         if not await self.broker.ensure_connected():
             await self.alert(f"[{self.name}] IG connection failed -- cannot calculate levels")
