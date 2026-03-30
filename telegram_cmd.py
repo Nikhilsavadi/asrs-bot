@@ -109,6 +109,9 @@ async def handle_status(dax_broker, **kwargs):
     # Try new unified signals first
     try:
         from asrs.main import ALL_SIGNALS
+        if not ALL_SIGNALS:
+            await _send(f"📊 <b>BOT STATUS</b> [{mode}]\n━━━━━━━━━━━━━━━━━━━━━━\nNo signals loaded yet — bot may still be starting.")
+            return
         if ALL_SIGNALS:
             ig_ok = ALL_SIGNALS[0].broker._shared.ig is not None
             msg = (
@@ -119,26 +122,49 @@ async def handle_status(dax_broker, **kwargs):
                 f"  IG: {'✅' if ig_ok else '❌'}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
             )
+            from datetime import datetime as dt
+            uk = ZoneInfo("Europe/London")
+
             for signal in ALL_SIGNALS:
                 state = signal.state
                 phase = state.phase.name if hasattr(state.phase, 'name') else str(state.phase)
                 pos = "FLAT"
                 if state.direction:
                     pos = f"{state.direction} @ {state.entry_price}"
+                # P&L: in-memory trades first, fall back to journal DB
                 pnl_str = "N/A"
                 if state.trades:
                     total = sum(t.get("pnl_pts", 0) for t in state.trades)
                     pnl_str = f"{'+' if total >= 0 else ''}{round(total, 1)} pts"
+                else:
+                    try:
+                        from shared import journal_db
+                        today_str = now.strftime("%Y-%m-%d")
+                        db_trades = journal_db.get_trades_for_date(today_str, instrument=signal.instrument)
+                        if db_trades:
+                            total = sum(t.get("pnl_pts", 0) for t in db_trades)
+                            pnl_str = f"{'+' if total >= 0 else ''}{round(total, 1)} pts (journal)"
+                    except Exception:
+                        pass
                 bars = signal.broker.get_streaming_bar_count() if hasattr(signal.broker, 'get_streaming_bar_count') else 0
 
-                s2_info = ""
-                if signal.session == 2:
-                    s2_hour = signal.cfg.get('s2_open_hour', '?')
-                    tz_name = signal.cfg.get('timezone', '').split('/')[-1]
-                    s2_info = f" ({s2_hour}:00 {tz_name})"
+                # Schedule times in local + UK
+                cfg = signal.cfg
+                sched_tz = ZoneInfo(cfg["scheduler_timezone"])
+                tz_label = cfg["timezone"].split("/")[-1]
+                s_key = f"s{signal.session}"
+                open_h = cfg[f"{s_key}_open_hour"]
+                open_m = cfg[f"{s_key}_open_minute"]
+                routine_m = open_m + 21
+                routine_h = open_h + routine_m // 60
+                routine_m = routine_m % 60
+                today = now.date()
+                local_time = dt(today.year, today.month, today.day, routine_h, routine_m, tzinfo=sched_tz)
+                uk_time = local_time.astimezone(uk)
+                time_str = f"{routine_h:02d}:{routine_m:02d} {tz_label} / {uk_time.strftime('%H:%M')} UK"
 
                 msg += (
-                    f"<b>{signal.name}</b>{s2_info}\n"
+                    f"<b>{signal.name}</b> ({time_str})\n"
                     f"  Phase: {phase}\n"
                     f"  Position: {pos}\n"
                     f"  Today P&L: {pnl_str}\n"

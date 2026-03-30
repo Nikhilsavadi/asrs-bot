@@ -344,4 +344,7 @@ async def main():
 
 
 if __name__ == "__main__":
+    # Ensure 'from asrs.main import ALL_SIGNALS' works even when run as __main__
+    import sys
+    sys.modules["asrs.main"] = sys.modules[__name__]
     asyncio.run(main())

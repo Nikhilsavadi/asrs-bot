@@ -427,14 +427,9 @@ class Signal:
                 f"[{self.name}] SLIPPAGE CLOSE: fill={fill_price}, "
                 f"trigger={trigger_price}, slip={slippage:.1f}pts > {max_slip:.1f}")
             await self.broker.close_position()
-            # Re-arm bracket if entries remain (R20)
-            if self.state.entries_used < self.cfg["max_entries"]:
-                self.state.phase = Phase.LEVELS_SET
-                self.save_state()
-                await self._arm_bracket()
-            else:
-                self.state.phase = Phase.DONE
-                self.save_state()
+            # Go DONE — price has moved too far from trigger levels to re-arm safely
+            self.state.phase = Phase.DONE
+            self.save_state()
             return
 
         # Process fill
