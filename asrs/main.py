@@ -275,6 +275,70 @@ async def main():
         day=1, hour=8, minute=0,
         id="monthly_report", misfire_grace_time=3600)
 
+    # -- Weekly report (Friday 17:00 UK) ----------------------------------------
+    async def _weekly_report():
+        try:
+            from shared.journal_db import get_weekly_pnl, get_cumulative_pnl_by_instrument
+            from datetime import datetime as dt
+            from zoneinfo import ZoneInfo
+            now = dt.now(ZoneInfo("Europe/London"))
+
+            week = get_weekly_pnl()
+            ytd_by_inst = get_cumulative_pnl_by_instrument()
+
+            # This month
+            first_of_month = now.replace(day=1).date().isoformat()
+            today_str = now.date().isoformat()
+            from shared.journal_db import _get_conn
+            conn = _get_conn()
+            month_row = conn.execute(
+                "SELECT COALESCE(SUM(pnl_pts), 0) as pnl, COUNT(*) as trades "
+                "FROM trades WHERE date >= ? AND date <= ?",
+                (first_of_month, today_str),
+            ).fetchone()
+            month_pnl = month_row["pnl"] if month_row else 0
+            month_trades = month_row["trades"] if month_row else 0
+
+            # YTD
+            year_start = f"{now.year}-01-01"
+            ytd_row = conn.execute(
+                "SELECT COALESCE(SUM(pnl_pts), 0) as pnl, COUNT(*) as trades "
+                "FROM trades WHERE date >= ? AND date <= ?",
+                (year_start, today_str),
+            ).fetchone()
+            ytd_pnl = ytd_row["pnl"] if ytd_row else 0
+            ytd_trades = ytd_row["trades"] if ytd_row else 0
+
+            # Per instrument this week
+            inst_lines = []
+            for inst in ["DAX", "US30", "NIKKEI"]:
+                iw = get_weekly_pnl(inst)
+                if iw["trades"] > 0:
+                    p = iw["pnl_gbp"]
+                    inst_lines.append(f"  {inst}: {'+' if p >= 0 else ''}{p:.1f}pts ({iw['trades']} trades)")
+
+            msg = (
+                f"<b>WEEKLY REPORT</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Week ending {now.strftime('%d %b %Y')}\n\n"
+                f"<b>This Week:</b> {'+' if week['pnl_gbp'] >= 0 else ''}{week['pnl_gbp']:.1f}pts ({week['trades']} trades)\n"
+            )
+            if inst_lines:
+                msg += "\n".join(inst_lines) + "\n"
+            msg += (
+                f"\n<b>This Month:</b> {'+' if month_pnl >= 0 else ''}{month_pnl:.1f}pts ({month_trades} trades)\n"
+                f"<b>YTD:</b> {'+' if ytd_pnl >= 0 else ''}{ytd_pnl:.1f}pts ({ytd_trades} trades)\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━"
+            )
+            await tg_send(msg)
+        except Exception as e:
+            logger.warning(f"Weekly report failed: {e}")
+
+    scheduler.add_job(_weekly_report, "cron",
+        day_of_week="fri", hour=17, minute=0,
+        id="weekly_report", misfire_grace_time=3600,
+        timezone=config.TZ_UK)
+
     # -- Dashboard sync (every 30 mins) ----------------------------------------
     async def _dashboard_sync():
         try:
