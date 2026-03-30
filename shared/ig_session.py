@@ -168,12 +168,23 @@ class IGSharedSession:
         return await self.ensure_connected()
 
     async def check_stream_health(self, stream_mgr, epic: str) -> bool:
-        """Check if Lightstreamer is delivering ticks. If stale >120s, resubscribe.
-        Called by the enhanced keepalive job in run_all.py.
+        """Check if Lightstreamer is delivering ticks AND bars. Resubscribe if stale.
+        Called by the enhanced keepalive job.
         """
         tick_age = stream_mgr.get_tick_age(epic)
-        if tick_age < 120:
+        bar_age = stream_mgr.get_last_bar_age(epic) if hasattr(stream_mgr, 'get_last_bar_age') else 0
+
+        # Ticks flowing AND bars building — healthy
+        if tick_age < 120 and bar_age < 600:  # bars within 10 mins
             return True
+
+        # Bars stale but ticks OK — tick-bar builder may be broken, resubscribe
+        if tick_age < 120 and bar_age >= 600:
+            logger.warning(f"Stream health: ticks OK but bars stale ({bar_age:.0f}s) — resubscribing")
+
+        # Both stale
+        elif tick_age >= 120:
+            pass  # fall through to existing logic
 
         if tick_age == float("inf"):
             logger.warning("Stream health: no ticks ever received — resubscribing")

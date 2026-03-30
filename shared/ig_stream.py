@@ -454,6 +454,17 @@ class IGStreamManager:
         today = datetime.now(CET).date()
         return sum(1 for b in bars if b["time"].date() == today)
 
+    def get_last_bar_age(self, epic: str) -> float:
+        """Seconds since last bar was built for this epic. inf if none."""
+        bars = self._candle_bars.get(epic, [])
+        if not bars:
+            return float("inf")
+        last = bars[-1]["time"]
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=CET)
+        now = datetime.now(CET)
+        return (now - last).total_seconds()
+
     # ── Trade event streaming ──────────────────────────────────────
 
     async def subscribe_trades(self, account_id: str):
