@@ -354,6 +354,36 @@ async def handle_resume():
     )
 
 
+async def handle_reset(text: str):
+    """Reset a signal to IDLE so it can re-run morning routine.
+    Usage: /reset US30_S1 or /reset all
+    """
+    parts = text.strip().split()
+    target = parts[1].upper() if len(parts) > 1 else ""
+
+    try:
+        from asrs.main import ALL_SIGNALS
+        from asrs.strategy import Phase
+        reset = []
+        for signal in ALL_SIGNALS:
+            if target == "ALL" or signal.name == target:
+                signal.state.phase = Phase.IDLE
+                signal.state.entries_used = 0
+                signal.state.direction = ""
+                signal.state.deal_ids = []
+                signal._bar4_triggered = False
+                signal.save_state()
+                signal.broker.deactivate_bracket()
+                reset.append(signal.name)
+        if reset:
+            await _send(f"🔄 Reset to IDLE: {', '.join(reset)}\nMorning routine will re-run on next bar 4.")
+        else:
+            names = [s.name for s in ALL_SIGNALS]
+            await _send(f"❌ Signal '{target}' not found.\nAvailable: {', '.join(names)}")
+    except Exception as e:
+        await _send(f"❌ Reset error: {e}")
+
+
 async def handle_logs():
     """Show last 20 lines from in-memory log buffer."""
     try:
@@ -631,6 +661,8 @@ async def poll_commands(dax_broker=None, **kwargs):
                             await handle_set(text)
                         elif cmd == "/config":
                             await handle_config()
+                        elif cmd.startswith("/reset"):
+                            await handle_reset(text)
                         elif cmd == "/help":
                             await _send(
                                 "🤖 <b>COMMANDS</b>\n"
@@ -646,6 +678,8 @@ async def poll_commands(dax_broker=None, **kwargs):
                                 "/config — View current config\n"
                                 "/set key val — Change config live\n"
                                 "/restart — Reconnect IG API\n"
+                                "/reset US30_S1 — Reset signal to IDLE\n"
+                                "/reset all — Reset all signals\n"
                                 "/help — This message"
                             )
                         else:
