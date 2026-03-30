@@ -200,8 +200,8 @@ async def main():
             id=f"{prefix}_eod", misfire_grace_time=120,
             timezone=sched_tz)
 
-        # -- Pre-trade warmup (10 min before S1 routine) ----------------------
-        warmup_m = s1_routine_m - 10
+        # -- Pre-trade warmup (30 min before S1 routine) ----------------------
+        warmup_m = s1_routine_m - 30
         warmup_h = s1_routine_h
         if warmup_m < 0:
             warmup_m += 60
@@ -226,7 +226,7 @@ async def main():
                     f"✅ [{name}] PRE-TRADE CHECK\n"
                     f"  IG: Connected\n"
                     f"  Bars: {bar_count}\n"
-                    f"  Morning routine in 10 mins"
+                    f"  Morning routine in 30 mins"
                 )
 
         scheduler.add_job(_warmup, "cron",
