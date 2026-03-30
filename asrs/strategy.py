@@ -427,8 +427,16 @@ class Signal:
                 f"[{self.name}] SLIPPAGE CLOSE: fill={fill_price}, "
                 f"trigger={trigger_price}, slip={slippage:.1f}pts > {max_slip:.1f}")
             await self.broker.close_position()
-            # Go DONE — price has moved too far from trigger levels to re-arm safely
-            self.state.phase = Phase.DONE
+            self.broker.deactivate_bracket()
+            self.state.entries_used += 1
+            if self.state.entries_used < self.cfg["max_entries"]:
+                # Keep levels but don't re-arm — wait for price to return
+                self.state.phase = Phase.LEVELS_SET
+                logger.info(f"[{self.name}] Slippage close: entry {self.state.entries_used}/{self.cfg['max_entries']}, "
+                            f"bracket deactivated, levels kept")
+            else:
+                self.state.phase = Phase.DONE
+                logger.info(f"[{self.name}] Slippage close: max entries reached, DONE")
             self.save_state()
             return
 
@@ -503,6 +511,15 @@ class Signal:
             # If bracket armed, poll for triggers (backup to tick trigger)
             if self.state.phase == Phase.BRACKET_ARMED:
                 await self._poll_bracket_trigger()
+                return
+
+            # If levels set but bracket not armed (e.g. after slippage close),
+            # re-arm once price is back between the levels
+            if self.state.phase == Phase.LEVELS_SET and self.state.buy_level > 0:
+                price = await self.broker.get_current_price()
+                if price and self.state.sell_level < price < self.state.buy_level:
+                    logger.info(f"[{self.name}] Price {price} back between levels — re-arming bracket")
+                    await self._arm_bracket()
                 return
 
             # If in active position, manage it
