@@ -275,6 +275,17 @@ async def main():
         day=1, hour=8, minute=0,
         id="monthly_report", misfire_grace_time=3600)
 
+    # -- Dashboard sync (every 30 mins) ----------------------------------------
+    async def _dashboard_sync():
+        try:
+            from sync_to_railway import sync_all
+            sync_all()
+        except Exception as e:
+            logger.warning(f"Dashboard sync failed: {e}")
+
+    scheduler.add_job(_dashboard_sync, "interval", minutes=30,
+        id="dashboard_sync", misfire_grace_time=120)
+
     # -- Telegram command handler ---------------------------------------------
     try:
         import telegram_cmd
