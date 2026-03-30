@@ -198,7 +198,9 @@ class Signal:
             self.load_state()
             if self.state.phase == Phase.IDLE:
                 self._bar4_triggered = True
+                import asyncio
                 logger.info(f"[{self.name}] Bar 4 complete -- triggering morning routine")
+                await asyncio.sleep(2)  # let bar store update before reading
                 await self.morning_routine()
 
         # Bar 5 trigger -- only if we are waiting for bar 5 (R2)
