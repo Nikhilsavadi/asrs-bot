@@ -68,7 +68,7 @@ INSTRUMENTS = {
         "session_end_hour": 17, "session_end_minute": 30,
         # Timezones
         "timezone": "Europe/Berlin",
-        "scheduler_timezone": "Europe/London",  # CET shifts same day as UK
+        "scheduler_timezone": "Europe/Berlin",  # Config hours are CET — scheduler must use CET
     },
     "US30": {
         "epic": "IX.D.DOW.DAILY.IP",
