@@ -514,12 +514,14 @@ class Signal:
 
         if direction == "LONG":
             self.state.phase = Phase.LONG
-            self.state.initial_stop = self.state.sell_level
-            self.state.trailing_stop = self.state.sell_level
+            # Stop at bar_low (may be tightened by risk cap), not sell_level (entry trigger)
+            self.state.initial_stop = self.state.bar_low
+            self.state.trailing_stop = self.state.bar_low
         else:
             self.state.phase = Phase.SHORT
-            self.state.initial_stop = self.state.buy_level
-            self.state.trailing_stop = self.state.buy_level
+            # Stop at bar_high (may be tightened by risk cap), not buy_level (entry trigger)
+            self.state.initial_stop = self.state.bar_high
+            self.state.trailing_stop = self.state.bar_high
 
         # Slippage tracking
         intended = self.state.buy_level if direction == "LONG" else self.state.sell_level
@@ -836,10 +838,9 @@ class Signal:
         self.state.trail_moved = False
 
         if self.state.entries_used < self.cfg["max_entries"]:
-            # R20: Re-arm BOTH directions at ORIGINAL bar levels
-            # R22: Uses original bar_high/bar_low + buffer
-            self.state.buy_level = round(self.state.bar_high + self.cfg["buffer"], 1)
-            self.state.sell_level = round(self.state.bar_low - self.cfg["buffer"], 1)
+            # R20: Re-arm BOTH directions at ORIGINAL entry levels
+            # buy_level/sell_level are already the correct entry triggers
+            # (bar_high/bar_low may be tightened by risk cap — those are stop levels)
             self.state.phase = Phase.LEVELS_SET
             self.save_state()
 
