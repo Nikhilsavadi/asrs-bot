@@ -134,14 +134,14 @@ async def main():
 
         # -- Morning routines + failsafes for each session --------------------
         for sn in range(1, max_session + 1):
-            sig = signals[f"{inst_name}_S{sn}"]
+            signal_obj = signals[f"{inst_name}_S{sn}"]
             open_h = inst_cfg[f"s{sn}_open_hour"]
             open_m = inst_cfg[f"s{sn}_open_minute"]
             routine_m = open_m + 21
             routine_h = open_h + routine_m // 60
             routine_m = routine_m % 60
 
-            scheduler.add_job(sig.morning_routine, "cron",
+            scheduler.add_job(signal_obj.morning_routine, "cron",
                 day_of_week="mon-fri", hour=routine_h, minute=routine_m,
                 id=f"{prefix}_s{sn}_morning", misfire_grace_time=120,
                 timezone=sched_tz)
@@ -151,11 +151,11 @@ async def main():
             fs_h = routine_h + fs_m // 60
             fs_m = fs_m % 60
 
-            async def _failsafe(s=sig):
-                s.load_state()
-                if s.state.phase == "IDLE":
-                    logger.warning(f"[{s.name}] Failsafe: still IDLE -- retrying")
-                    await s.morning_routine()
+            async def _failsafe(_s=signal_obj):
+                _s.load_state()
+                if _s.state.phase == "IDLE":
+                    logger.warning(f"[{_s.name}] Failsafe: still IDLE -- retrying")
+                    await _s.morning_routine()
 
             scheduler.add_job(_failsafe, "cron",
                 day_of_week="mon-fri", hour=fs_h, minute=fs_m,
