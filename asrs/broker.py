@@ -187,11 +187,27 @@ class IGBroker:
         try:
             self._stop_monitor["active"] = False  # prevent re-trigger
 
-            # Close all individual deals for this epic (handles force_open positions)
-            await self.close_position()
+            # Close all individual deals — retry up to 3 times
+            import asyncio
+            for attempt in range(1, 4):
+                closed = await self.close_position()
+                if closed:
+                    break
+                logger.error(f"Stop exit close attempt {attempt}/3 failed ({self.epic})")
+                if attempt < 3:
+                    await asyncio.sleep(2)
 
-            # Get actual exit price from current market
-            actual_exit = exit_price  # tick price at stop hit
+            # Verify position is flat
+            pos = await self.get_position()
+            actual_exit = exit_price
+            if pos["direction"] != "FLAT":
+                logger.error(f"STOP EXIT FAILED — position still open ({self.epic})")
+                # Re-enable monitor to try again on next tick
+                if self._stop_monitor:
+                    self._stop_monitor["active"] = True
+                self._stop_exit_active = False
+                return
+
             logger.info(f"Stop exit filled ({self.epic}): closed all deals @ ~{actual_exit}")
 
             # Fire callbacks to strategy
