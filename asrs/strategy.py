@@ -115,6 +115,7 @@ class Signal:
         self.state = SignalState()                             # fresh each day
         self._bar4_triggered = False                           # prevent double trigger
         self._bar4_from_callback = None                       # direct bar 4 data from tick callback
+        self._bar5_event = None                               # asyncio.Event for bar 5 notification
         self._morning_running = False                          # mutex
         self._sibling: "Signal | None" = None                  # S1<->S2 link
 
@@ -220,9 +221,9 @@ class Signal:
                 "Open": bar["Open"], "Close": bar["Close"],
             }
 
-        # Bar 5 trigger -- only if we are waiting for bar 5 (R2)
-        if bn == 5 and self.state.phase == Phase.IDLE and self.state.bar_number == 0:
-            pass  # morning_routine handles bar 5 wait internally
+        # Bar 5 trigger -- wake up morning_routine if it's waiting
+        if bn == 5 and self._bar5_event:
+            self._bar5_event.set()
 
     async def _on_stop_exit(self, result: dict):
         """Called by broker when tick-based stop monitor triggers a market close."""
@@ -349,25 +350,24 @@ class Signal:
                 bar4_range = round(bar5["High"] - bar5["Low"], 1)
                 logger.info(f"[{self.name}] Using bar 5 (bar 4 was {range_flag})")
             else:
-                # Wait up to 5 minutes for bar 5
-                logger.info(f"[{self.name}] Waiting for bar 5...")
+                # Wait for bar 5 callback (fires instantly when bar completes)
                 import asyncio
-                for i in range(6):
-                    await asyncio.sleep(50)
-                    # Check callback cache first, then store
-                    cache = getattr(self, '_bar_cache', {})
-                    if 5 in cache:
-                        bar5 = cache[5]
-                        logger.info(f"[{self.name}] Bar 5 from callback cache (wait {i+1})")
-                    else:
-                        df = self.broker.get_streaming_bars_df()
-                        bar5 = self._find_bar(df, 5) if df is not None and not df.empty else None
-                    if bar5 is not None:
-                        signal_bar = bar5
-                        bar_num = 5
-                        bar4_range = round(bar5["High"] - bar5["Low"], 1)
-                        break
-                if bar_num == 4:
+                self._bar5_event = asyncio.Event()
+                logger.info(f"[{self.name}] Waiting for bar 5 callback...")
+                try:
+                    await asyncio.wait_for(self._bar5_event.wait(), timeout=330)  # 5.5 min max
+                except asyncio.TimeoutError:
+                    pass
+                self._bar5_event = None
+
+                cache = getattr(self, '_bar_cache', {})
+                if 5 in cache:
+                    bar5 = cache[5]
+                    signal_bar = bar5
+                    bar_num = 5
+                    bar4_range = round(bar5["High"] - bar5["Low"], 1)
+                    logger.info(f"[{self.name}] Bar 5 received from callback")
+                else:
                     logger.info(f"[{self.name}] Bar 5 not available -- using bar 4")
 
         # Reclassify range for actual signal bar
