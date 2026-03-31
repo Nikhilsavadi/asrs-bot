@@ -77,6 +77,9 @@ class _TickListener(SubscriptionListener):
 
     def _update_tick_bar(self, mid: float):
         """Accumulate tick into current 5-min bar. Emit when clock crosses boundary."""
+        # Reject garbage ticks (negative, zero, or absurdly large)
+        if mid <= 0 or mid > 1_000_000:
+            return
         now = datetime.now(CET)
         bar_min = (now.minute // 5) * 5
         bar_start = now.replace(minute=bar_min, second=0, microsecond=0)

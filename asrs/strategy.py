@@ -222,7 +222,8 @@ class Signal:
                 await self.morning_routine()
 
         # Cache every bar from callback (for bar 5 fallback)
-        if bn > 0:
+        # Validate OHLC first — reject garbage ticks from IG
+        if bn > 0 and bar["High"] > 0 and bar["Low"] > 0 and bar["High"] >= bar["Low"]:
             self._bar_cache = getattr(self, '_bar_cache', {})
             self._bar_cache[bn] = {
                 "High": bar["High"], "Low": bar["Low"],
