@@ -296,18 +296,22 @@ class Signal:
             await self.alert(f"[{self.name}] IG connection failed -- cannot calculate levels")
             return
 
-        # Get today's bars from streaming (with REST fallback)
-        df = await self._get_bars_with_fallback()
-        if df is None or df.empty:
-            await self.alert(f"[{self.name}] No bar data available -- skipping")
-            return
-
-        # Find bar 4 using hour/minute matching (R-impl-1)
-        bar4 = self._find_bar(df, 4)
-        if bar4 is None and hasattr(self, '_bar4_from_callback') and self._bar4_from_callback:
+        # Find bar 4: callback cache first (instant), then streaming, then REST
+        bar4 = None
+        cache = getattr(self, '_bar_cache', {})
+        if 4 in cache:
+            bar4 = cache[4]
+            logger.info(f"[{self.name}] Bar 4 from callback: H={bar4['High']} L={bar4['Low']}")
+        elif hasattr(self, '_bar4_from_callback') and self._bar4_from_callback:
             bar4 = self._bar4_from_callback
-            logger.info(f"[{self.name}] Bar 4 from callback (not in store): "
-                        f"H={bar4['High']} L={bar4['Low']}")
+            logger.info(f"[{self.name}] Bar 4 from callback (legacy): H={bar4['High']} L={bar4['Low']}")
+
+        if bar4 is None:
+            # Fallback: streaming bars then REST
+            df = await self._get_bars_with_fallback()
+            if df is not None and not df.empty:
+                bar4 = self._find_bar(df, 4)
+
         if bar4 is None:
             await self.alert(f"[{self.name}] Bar 4 not found in data -- skipping")
             return
@@ -328,13 +332,17 @@ class Signal:
         bar_num = 4
 
         if use_bar5:
-            bar5 = self._find_bar(df, 5)
-            # Fallback: check callback cache
+            # Check callback cache first
+            bar5 = None
+            cache = getattr(self, '_bar_cache', {})
+            if 5 in cache:
+                bar5 = cache[5]
+                logger.info(f"[{self.name}] Bar 5 from callback cache")
+            # Then try streaming DataFrame
             if bar5 is None:
-                cache = getattr(self, '_bar_cache', {})
-                if 5 in cache:
-                    bar5 = cache[5]
-                    logger.info(f"[{self.name}] Bar 5 from callback cache")
+                df = self.broker.get_streaming_bars_df()
+                if df is not None and not df.empty:
+                    bar5 = self._find_bar(df, 5)
             if bar5 is not None:
                 signal_bar = bar5
                 bar_num = 5
