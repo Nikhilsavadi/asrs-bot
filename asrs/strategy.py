@@ -114,6 +114,7 @@ class Signal:
         self.alert = alert_fn                                 # async fn(text)
         self.state = SignalState()                             # fresh each day
         self._bar4_triggered = False                           # prevent double trigger
+        self._bar4_from_callback = None                       # direct bar 4 data from tick callback
         self._morning_running = False                          # mutex
         self._sibling: "Signal | None" = None                  # S1<->S2 link
 
@@ -203,7 +204,12 @@ class Signal:
                 self._bar4_triggered = True
                 import asyncio
                 logger.info(f"[{self.name}] Bar 4 complete -- triggering morning routine")
-                await asyncio.sleep(2)  # let bar store update before reading
+                # Store bar 4 directly from callback (avoids bar store race condition)
+                self._bar4_from_callback = {
+                    "High": bar["High"], "Low": bar["Low"],
+                    "Open": bar["Open"], "Close": bar["Close"],
+                }
+                await asyncio.sleep(2)
                 await self.morning_routine()
 
         # Bar 5 trigger -- only if we are waiting for bar 5 (R2)
@@ -290,6 +296,10 @@ class Signal:
 
         # Find bar 4 using hour/minute matching (R-impl-1)
         bar4 = self._find_bar(df, 4)
+        if bar4 is None and hasattr(self, '_bar4_from_callback') and self._bar4_from_callback:
+            bar4 = self._bar4_from_callback
+            logger.info(f"[{self.name}] Bar 4 from callback (not in store): "
+                        f"H={bar4['High']} L={bar4['Low']}")
         if bar4 is None:
             await self.alert(f"[{self.name}] Bar 4 not found in data -- skipping")
             return
