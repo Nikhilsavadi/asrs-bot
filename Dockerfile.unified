@@ -14,7 +14,9 @@ COPY dax_bot/ dax_bot/
 COPY spx_bot/ spx_bot/
 COPY nikkei_bot/ nikkei_bot/
 COPY telegram_cmd.py .
+COPY sync_to_railway.py .
 COPY run_all.py .
+COPY backtest.py .
 
 # Create data directory
 RUN mkdir -p data

@@ -187,30 +187,12 @@ class IGBroker:
         try:
             self._stop_monitor["active"] = False  # prevent re-trigger
 
-            # Close all deals for this epic
-            close_action = "SELL" if direction == "LONG" else "BUY"
-            pos = await self.get_position()
-            total_size = abs(pos.get("position", 0))
-            if total_size <= 0:
-                logger.warning(f"Stop exit ({self.epic}): position already flat")
-                self._stop_exit_active = False
-                return
+            # Close all individual deals for this epic (handles force_open positions)
+            await self.close_position()
 
-            result = await self._shared.rest_call(
-                self._shared.ig.create_open_position,
-                currency_code=self.currency, direction=close_action,
-                epic=self.epic, expiry="DFB", force_open=False,
-                guaranteed_stop=False, level=None, limit_distance=None,
-                limit_level=None, order_type="MARKET", quote_id=None,
-                size=total_size, stop_distance=None, stop_level=None,
-                trailing_stop=False, trailing_stop_increment=None,
-            )
-
-            deal_ref = result.get("dealReference", "")
-            confirm = await self._confirm_deal(deal_ref)
-            actual_exit = float(confirm.get("level", exit_price))
-
-            logger.info(f"Stop exit filled ({self.epic}): {close_action} {total_size} @ {actual_exit}")
+            # Get actual exit price from current market
+            actual_exit = exit_price  # tick price at stop hit
+            logger.info(f"Stop exit filled ({self.epic}): closed all deals @ ~{actual_exit}")
 
             # Fire callbacks to strategy
             for cb in self._on_stop_callbacks:
