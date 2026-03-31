@@ -193,10 +193,18 @@ class Signal:
         if bn <= 0:
             return
 
-        # Log bar 1 for stream-alive confirmation
+        # Bar 1: stream alive confirmation via Telegram (once per signal)
         if bn == 1:
-            logger.info(f"[{self.name}] Bar 1 complete -- stream alive "
-                        f"O={bar['Open']} H={bar['High']} L={bar['Low']} C={bar['Close']}")
+            cache = getattr(self, '_bar_cache', {})
+            if 1 not in cache:
+                logger.info(f"[{self.name}] Bar 1 complete -- stream alive "
+                            f"O={bar['Open']} H={bar['High']} L={bar['Low']} C={bar['Close']}")
+                import asyncio
+                asyncio.get_event_loop().create_task(self.alert(
+                    f"[{self.name}] SESSION ACTIVE\n"
+                    f"Bar 1: H={bar['High']} L={bar['Low']}\n"
+                    f"Bar 4 close in 15 mins"
+                ))
 
         # Bar 4 trigger (R1)
         if bn == 4 and not self._bar4_triggered:
