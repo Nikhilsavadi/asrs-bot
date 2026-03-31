@@ -115,6 +115,7 @@ INSTRUMENTS = {
         "add_max": 2,
         "s1_open_hour": 10, "s1_open_minute": 0,
         "s2_open_hour": 12, "s2_open_minute": 0,
+        "s3_open_hour": 13, "s3_open_minute": 0,
         "session_end_hour": 15, "session_end_minute": 0,
         "timezone": "Asia/Tokyo",
         "scheduler_timezone": "Asia/Tokyo",
