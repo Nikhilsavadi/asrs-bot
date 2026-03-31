@@ -193,13 +193,18 @@ async def main():
             timezone=sched_tz)
 
         # -- Pre-trade warmup (30 min before S1 routine) ----------------------
+        s1_open_h = inst_cfg["s1_open_hour"]
+        s1_open_m = inst_cfg["s1_open_minute"]
+        s1_routine_m = s1_open_m + 21
+        s1_routine_h = s1_open_h + s1_routine_m // 60
+        s1_routine_m = s1_routine_m % 60
         warmup_m = s1_routine_m - 30
         warmup_h = s1_routine_h
         if warmup_m < 0:
             warmup_m += 60
             warmup_h -= 1
 
-        async def _warmup(b=s1.broker, epic=inst_cfg["epic"], name=inst_name, s=s1):
+        async def _warmup(b=inst_sigs[0].broker, epic=inst_cfg["epic"], name=inst_name):
             ok = await b.ensure_connected()
             bar_count = b.get_streaming_bar_count()
             tick_age = stream_mgr.get_tick_age(epic)
