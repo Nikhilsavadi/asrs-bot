@@ -559,7 +559,7 @@ class Signal:
         if price is None or price <= 0:
             return
 
-        # Check stop hit (R18)
+        # Check stop hit (R18) — verify via IG position, not just price
         stopped = False
         if self.state.direction == "LONG" and price <= self.state.trailing_stop:
             stopped = True
@@ -567,7 +567,19 @@ class Signal:
             stopped = True
 
         if stopped:
-            await self._process_exit(self.state.trailing_stop)
+            # Verify with IG — is the position actually closed?
+            import asyncio
+            await asyncio.sleep(2)  # give IG time to process the stop
+            ig_pos = await self.broker.get_position()
+            if ig_pos["direction"] == "FLAT":
+                # Position closed — use current price as exit (closest to actual fill)
+                exit_price = price
+                logger.info(f"[{self.name}] Stop confirmed by IG (position FLAT), exit ~{exit_price}")
+            else:
+                # IG still shows position open — stop hasn't triggered on IG yet
+                logger.warning(f"[{self.name}] Price crossed stop but IG position still open — skipping exit")
+                return
+            await self._process_exit(exit_price)
             return
 
         # Update MFE
@@ -898,11 +910,20 @@ class Signal:
 
     async def _update_ig_stop(self):
         """Update stop on ALL deal IDs (R-impl-4: adds have separate deals)."""
+        failed = []
         for deal_id in self.state.deal_ids:
             try:
-                await self.broker.modify_stop(deal_id, self.state.trailing_stop)
+                ok = await self.broker.modify_stop(deal_id, self.state.trailing_stop)
+                if not ok:
+                    failed.append(deal_id)
             except Exception as e:
                 logger.error(f"[{self.name}] Stop update failed for {deal_id}: {e}")
+                failed.append(deal_id)
+        if failed:
+            await self.alert(
+                f"[{self.name}] STOP UPDATE FAILED on {len(failed)}/{len(self.state.deal_ids)} deals!\n"
+                f"Target: {self.state.trailing_stop} | Failed: {failed}"
+            )
 
     # =========================================================================
     #  Bar helpers

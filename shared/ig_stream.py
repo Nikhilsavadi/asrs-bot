@@ -430,10 +430,12 @@ class IGStreamManager:
         Returns DataFrame with CET DatetimeIndex and O/H/L/C columns,
         compatible with strategy.calculate_levels().
         """
-        bars = self._candle_bars.get(epic, [])
-        if not bars:
+        raw = self._candle_bars.get(epic, [])
+        if not raw:
             return pd.DataFrame()
 
+        # Snapshot deque to avoid thread-safety issues during iteration
+        bars = list(raw)
         today = datetime.now(CET).date()
         today_bars = [b for b in bars if b["time"].date() == today]
 
@@ -457,7 +459,7 @@ class IGStreamManager:
 
     def get_bar_count_today(self, epic: str) -> int:
         """How many completed 5-min bars today."""
-        bars = self._candle_bars.get(epic, [])
+        bars = list(self._candle_bars.get(epic, []))
         today = datetime.now(CET).date()
         return sum(1 for b in bars if b["time"].date() == today)
 
