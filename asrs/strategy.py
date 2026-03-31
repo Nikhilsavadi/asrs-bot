@@ -212,6 +212,14 @@ class Signal:
                 await asyncio.sleep(2)
                 await self.morning_routine()
 
+        # Cache every bar from callback (for bar 5 fallback)
+        if bn > 0:
+            self._bar_cache = getattr(self, '_bar_cache', {})
+            self._bar_cache[bn] = {
+                "High": bar["High"], "Low": bar["Low"],
+                "Open": bar["Open"], "Close": bar["Close"],
+            }
+
         # Bar 5 trigger -- only if we are waiting for bar 5 (R2)
         if bn == 5 and self.state.phase == Phase.IDLE and self.state.bar_number == 0:
             pass  # morning_routine handles bar 5 wait internally
@@ -321,6 +329,12 @@ class Signal:
 
         if use_bar5:
             bar5 = self._find_bar(df, 5)
+            # Fallback: check callback cache
+            if bar5 is None:
+                cache = getattr(self, '_bar_cache', {})
+                if 5 in cache:
+                    bar5 = cache[5]
+                    logger.info(f"[{self.name}] Bar 5 from callback cache")
             if bar5 is not None:
                 signal_bar = bar5
                 bar_num = 5
@@ -332,8 +346,14 @@ class Signal:
                 import asyncio
                 for i in range(6):
                     await asyncio.sleep(50)
-                    df = self.broker.get_streaming_bars_df()
-                    bar5 = self._find_bar(df, 5) if df is not None and not df.empty else None
+                    # Check callback cache first, then store
+                    cache = getattr(self, '_bar_cache', {})
+                    if 5 in cache:
+                        bar5 = cache[5]
+                        logger.info(f"[{self.name}] Bar 5 from callback cache (wait {i+1})")
+                    else:
+                        df = self.broker.get_streaming_bars_df()
+                        bar5 = self._find_bar(df, 5) if df is not None and not df.empty else None
                     if bar5 is not None:
                         signal_bar = bar5
                         bar_num = 5
