@@ -92,7 +92,11 @@ async def main():
         # and stream manager -- only the local order state differs.
         # Note: S2's broker registers a second tick callback on the same
         # epic, which is fine -- IGStreamManager supports multiple callbacks.
-        for sn in (1, 2):
+        # Determine how many sessions (2 or 3) based on config
+        max_session = 3 if f"s3_open_hour" in inst_cfg else 2
+        inst_signals = []
+
+        for sn in range(1, max_session + 1):
             broker = IGBroker(
                 shared, stream_mgr, epic, currency,
                 disaster_stop_pts=inst_cfg["disaster_stop_pts"],
@@ -102,21 +106,21 @@ async def main():
             key = f"{inst_name}_S{sn}"
             signals[key] = signal
             ALL_SIGNALS.append(signal)
+            inst_signals.append(signal)
 
             # Register tick trigger callback on this signal's broker
             broker.register_trigger_callback(signal.on_tick_trigger)
             logger.info(f"Signal created: {key} (epic={epic})")
 
-        # Link S1 <-> S2 siblings (R24: S2 cancels S1 bracket)
-        s1 = signals[f"{inst_name}_S1"]
-        s2 = signals[f"{inst_name}_S2"]
-        s1.set_sibling(s2)
-        s2.set_sibling(s1)
+        # Link siblings: each session cancels previous session's bracket
+        for i in range(1, len(inst_signals)):
+            inst_signals[i - 1].set_sibling(inst_signals[i])
+            inst_signals[i].set_sibling(inst_signals[i - 1])
 
-        # Register candle callback -- fires on_bar_complete for both S1 and S2
-        async def _on_bar(bar, _s1=s1, _s2=s2):
-            await _s1.on_bar_complete(bar)
-            await _s2.on_bar_complete(bar)
+        # Register candle callback -- fires on_bar_complete for all sessions
+        async def _on_bar(bar, _sigs=inst_signals):
+            for sig in _sigs:
+                await sig.on_bar_complete(bar)
         register_bar_callback(stream_mgr, epic, _on_bar)
 
     # -- Scheduler ------------------------------------------------------------
@@ -124,61 +128,49 @@ async def main():
 
     for inst_name, inst_cfg in config.INSTRUMENTS.items():
         sched_tz = ZoneInfo(inst_cfg["scheduler_timezone"])
-        s1 = signals[f"{inst_name}_S1"]
-        s2 = signals[f"{inst_name}_S2"]
         prefix = inst_name.lower()
+        max_session = 3 if "s3_open_hour" in inst_cfg else 2
+        inst_sigs = [signals[f"{inst_name}_S{sn}"] for sn in range(1, max_session + 1)]
 
-        # -- S1 morning routine (1 min after bar 4 close) --------------------
-        s1_open_h = inst_cfg["s1_open_hour"]
-        s1_open_m = inst_cfg["s1_open_minute"]
-        # Bar 4 closes at open + 20min. Schedule at open + 21min.
-        s1_routine_m = s1_open_m + 21
-        s1_routine_h = s1_open_h + s1_routine_m // 60
-        s1_routine_m = s1_routine_m % 60
+        # -- Morning routines + failsafes for each session --------------------
+        for sn in range(1, max_session + 1):
+            sig = signals[f"{inst_name}_S{sn}"]
+            open_h = inst_cfg[f"s{sn}_open_hour"]
+            open_m = inst_cfg[f"s{sn}_open_minute"]
+            routine_m = open_m + 21
+            routine_h = open_h + routine_m // 60
+            routine_m = routine_m % 60
 
-        scheduler.add_job(s1.morning_routine, "cron",
-            day_of_week="mon-fri", hour=s1_routine_h, minute=s1_routine_m,
-            id=f"{prefix}_s1_morning", misfire_grace_time=120,
-            timezone=sched_tz)
+            scheduler.add_job(sig.morning_routine, "cron",
+                day_of_week="mon-fri", hour=routine_h, minute=routine_m,
+                id=f"{prefix}_s{sn}_morning", misfire_grace_time=120,
+                timezone=sched_tz)
 
-        # Failsafe: retry 4 minutes later if still IDLE
-        fs_m = s1_routine_m + 4
-        fs_h = s1_routine_h + fs_m // 60
-        fs_m = fs_m % 60
+            # Failsafe: retry 4 minutes later if still IDLE
+            fs_m = routine_m + 4
+            fs_h = routine_h + fs_m // 60
+            fs_m = fs_m % 60
 
-        async def _failsafe(sig=s1):
-            sig.load_state()
-            if sig.state.phase == "IDLE":
-                logger.warning(f"[{sig.name}] Failsafe: still IDLE -- retrying")
-                await sig.morning_routine()
+            async def _failsafe(s=sig):
+                s.load_state()
+                if s.state.phase == "IDLE":
+                    logger.warning(f"[{s.name}] Failsafe: still IDLE -- retrying")
+                    await s.morning_routine()
 
-        scheduler.add_job(_failsafe, "cron",
-            day_of_week="mon-fri", hour=fs_h, minute=fs_m,
-            id=f"{prefix}_s1_failsafe", misfire_grace_time=120,
-            timezone=sched_tz)
-
-        # -- S2 morning routine (1 min after S2 bar 4 close) -----------------
-        s2_open_h = inst_cfg["s2_open_hour"]
-        s2_open_m = inst_cfg["s2_open_minute"]
-        s2_routine_m = s2_open_m + 21
-        s2_routine_h = s2_open_h + s2_routine_m // 60
-        s2_routine_m = s2_routine_m % 60
-
-        scheduler.add_job(s2.morning_routine, "cron",
-            day_of_week="mon-fri", hour=s2_routine_h, minute=s2_routine_m,
-            id=f"{prefix}_s2_morning", misfire_grace_time=120,
-            timezone=sched_tz)
+            scheduler.add_job(_failsafe, "cron",
+                day_of_week="mon-fri", hour=fs_h, minute=fs_m,
+                id=f"{prefix}_s{sn}_failsafe", misfire_grace_time=120,
+                timezone=sched_tz)
 
         # -- Monitor cycle: every minute during trading hours -----------------
-        # From 1 hour before S1 open to session end
+        s1_open_h = inst_cfg["s1_open_hour"]
         monitor_start_h = max(0, s1_open_h - 1)
         monitor_end_h = inst_cfg["session_end_hour"]
-
         hour_range = f"{monitor_start_h}-{monitor_end_h}"
 
-        async def _monitor(s1=s1, s2=s2):
-            await s1.monitor_cycle()
-            await s2.monitor_cycle()
+        async def _monitor(_sigs=inst_sigs):
+            for sig in _sigs:
+                await sig.monitor_cycle()
 
         scheduler.add_job(_monitor, "cron",
             day_of_week="mon-fri", hour=hour_range, minute="*",
@@ -187,13 +179,13 @@ async def main():
 
         # -- End of day: force close ------------------------------------------
         eod_h = inst_cfg["session_end_hour"]
-        eod_m = inst_cfg["session_end_minute"] + 5  # 5 min after session end
+        eod_m = inst_cfg["session_end_minute"] + 5
         eod_h = eod_h + eod_m // 60
         eod_m = eod_m % 60
 
-        async def _eod(s1=s1, s2=s2):
-            await s1.end_of_day()
-            await s2.end_of_day()
+        async def _eod(_sigs=inst_sigs):
+            for sig in _sigs:
+                await sig.end_of_day()
 
         scheduler.add_job(_eod, "cron",
             day_of_week="mon-fri", hour=eod_h, minute=eod_m,

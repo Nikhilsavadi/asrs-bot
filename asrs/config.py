@@ -90,6 +90,7 @@ INSTRUMENTS = {
         "add_max": 2,
         "s1_open_hour": 9, "s1_open_minute": 30,
         "s2_open_hour": 11, "s2_open_minute": 0,
+        "s3_open_hour": 13, "s3_open_minute": 0,
         "session_end_hour": 16, "session_end_minute": 0,
         "timezone": "America/New_York",
         "scheduler_timezone": "America/New_York",
