@@ -909,21 +909,43 @@ class Signal:
         return False
 
     async def _update_ig_stop(self):
-        """Update stop on ALL deal IDs (R-impl-4: adds have separate deals)."""
+        """Update stop on ALL deal IDs, then verify IG actually applied it."""
+        import asyncio
+        target = self.state.trailing_stop
         failed = []
         for deal_id in self.state.deal_ids:
             try:
-                ok = await self.broker.modify_stop(deal_id, self.state.trailing_stop)
+                ok = await self.broker.modify_stop(deal_id, target)
                 if not ok:
                     failed.append(deal_id)
             except Exception as e:
                 logger.error(f"[{self.name}] Stop update failed for {deal_id}: {e}")
                 failed.append(deal_id)
+
         if failed:
             await self.alert(
                 f"[{self.name}] STOP UPDATE FAILED on {len(failed)}/{len(self.state.deal_ids)} deals!\n"
-                f"Target: {self.state.trailing_stop} | Failed: {failed}"
+                f"Target: {target} | Failed: {failed}"
             )
+            return
+
+        # Verify stops were actually applied on IG
+        await asyncio.sleep(1)
+        ig_pos = await self.broker.get_position()
+        ig_stops = ig_pos.get("stop_levels", {})
+        if ig_stops:
+            mismatched = []
+            for deal_id, actual_stop in ig_stops.items():
+                if abs(actual_stop - target) > 1.0:  # allow 1pt tolerance
+                    mismatched.append(f"{deal_id}: {actual_stop}")
+            if mismatched:
+                logger.error(f"[{self.name}] STOP MISMATCH! Target={target}, IG has: {mismatched}")
+                await self.alert(
+                    f"[{self.name}] STOP MISMATCH!\n"
+                    f"Bot target: {target}\n"
+                    f"IG actual: {', '.join(mismatched)}\n"
+                    f"CHECK IG IMMEDIATELY"
+                )
 
     # =========================================================================
     #  Bar helpers

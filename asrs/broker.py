@@ -477,16 +477,20 @@ class IGBroker:
             total_size = 0.0
             weighted_level = 0.0
             direction = ""
+            stop_levels = {}
             for pos in pos_list:
                 if pos.get("epic") == self.epic:
                     d = pos.get("direction", "")
                     size = float(pos.get("dealSize") or pos.get("size", 0))
                     level = float(pos.get("level") or pos.get("openLevel", 0))
+                    stop = pos.get("stopLevel") or pos.get("stop_level")
                     deal_id = pos.get("dealId", "")
                     if deal_id:
                         self._position_deal_ids[deal_id] = {
                             "direction": d, "size": size, "level": level,
                         }
+                        if stop is not None:
+                            stop_levels[deal_id] = float(stop)
                     if not direction:
                         direction = d
                     total_size += size
@@ -498,6 +502,7 @@ class IGBroker:
                     "position": total_size if direction == "BUY" else -total_size,
                     "avg_cost": avg_cost,
                     "direction": "LONG" if direction == "BUY" else "SHORT",
+                    "stop_levels": stop_levels,
                 }
 
             return {"position": 0, "avg_cost": 0, "direction": "FLAT"}
