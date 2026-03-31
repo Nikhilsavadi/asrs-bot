@@ -45,6 +45,11 @@ class IGBroker:
         self._tick_trigger_active = False
         self._on_trigger_callbacks: list = []
 
+        # Tick-based stop monitoring (exit via market order)
+        self._stop_monitor: dict | None = None
+        self._stop_exit_active = False
+        self._on_stop_callbacks: list = []
+
         # Track open position deal IDs (for multi-deal stop updates)
         self._position_deal_ids: dict[str, dict] = {}
 
@@ -148,12 +153,100 @@ class IGBroker:
         if self._pending_bracket:
             self._pending_bracket["active"] = False
 
+    # -- Tick-based stop monitor (exits via market order, not IG stop) ---------
+
+    def activate_stop_monitor(self, direction: str, stop_level: float):
+        """Activate tick-level stop monitoring. Exit via market order on hit."""
+        self._stop_monitor = {
+            "active": True,
+            "direction": direction,
+            "stop_level": stop_level,
+        }
+        logger.info(f"Stop monitor active ({self.epic}): {direction} stop={stop_level}")
+
+    def update_stop_level(self, new_stop: float):
+        """Update the monitored stop level (called on trail/breakeven)."""
+        if self._stop_monitor and self._stop_monitor["active"]:
+            old = self._stop_monitor["stop_level"]
+            self._stop_monitor["stop_level"] = new_stop
+            if abs(new_stop - old) > 0.1:
+                logger.info(f"Stop monitor updated ({self.epic}): {old} -> {new_stop}")
+
+    def deactivate_stop_monitor(self):
+        """Deactivate stop monitoring (after exit or EOD)."""
+        if self._stop_monitor:
+            self._stop_monitor["active"] = False
+            self._stop_monitor = None
+
+    def register_stop_callback(self, callback):
+        """Register async callback for tick-triggered stop exits."""
+        self._on_stop_callbacks.append(callback)
+
+    async def _execute_stop_exit(self, direction: str, exit_price: float):
+        """Close all positions via market order when stop is hit."""
+        try:
+            self._stop_monitor["active"] = False  # prevent re-trigger
+
+            # Close all deals for this epic
+            close_action = "SELL" if direction == "LONG" else "BUY"
+            pos = await self.get_position()
+            total_size = abs(pos.get("position", 0))
+            if total_size <= 0:
+                logger.warning(f"Stop exit ({self.epic}): position already flat")
+                self._stop_exit_active = False
+                return
+
+            result = await self._shared.rest_call(
+                self._shared.ig.create_open_position,
+                currency_code=self.currency, direction=close_action,
+                epic=self.epic, expiry="DFB", force_open=False,
+                guaranteed_stop=False, level=None, limit_distance=None,
+                limit_level=None, order_type="MARKET", quote_id=None,
+                size=total_size, stop_distance=None, stop_level=None,
+                trailing_stop=False, trailing_stop_increment=None,
+            )
+
+            deal_ref = result.get("dealReference", "")
+            confirm = await self._confirm_deal(deal_ref)
+            actual_exit = float(confirm.get("level", exit_price))
+
+            logger.info(f"Stop exit filled ({self.epic}): {close_action} {total_size} @ {actual_exit}")
+
+            # Fire callbacks to strategy
+            for cb in self._on_stop_callbacks:
+                try:
+                    await cb({"exit_price": actual_exit, "direction": direction})
+                except Exception as e:
+                    logger.error(f"Stop exit callback error: {e}", exc_info=True)
+
+        except Exception as e:
+            logger.error(f"Stop exit execution failed ({self.epic}): {e}", exc_info=True)
+        finally:
+            self._stop_exit_active = False
+
     def _on_tick(self, mid: float, bid: float = 0.0, ofr: float = 0.0):
         """
         Called on every tick from Lightstreamer.
-        R5: BUY triggers on offer >= buy_level, SELL on bid <= sell_level.
-        R8: Skip if spread > max_spread.
+        Handles: bracket entry triggers AND stop exit monitoring.
         """
+        # Stop monitor: check if price hit trailing stop
+        if self._stop_monitor and self._stop_monitor.get("active") and not self._stop_exit_active:
+            sm = self._stop_monitor
+            stop = sm["stop_level"]
+            hit = False
+            if sm["direction"] == "LONG" and bid > 0 and bid <= stop:
+                hit = True
+            elif sm["direction"] == "SHORT" and ofr > 0 and ofr >= stop:
+                hit = True
+            if hit:
+                self._stop_exit_active = True
+                exit_price = bid if sm["direction"] == "LONG" else ofr
+                logger.info(f"Stop hit ({self.epic}): {sm['direction']} stop={stop} "
+                            f"exit_price={exit_price:.1f} (bid={bid:.1f} ofr={ofr:.1f})")
+                loop = asyncio.get_event_loop()
+                loop.create_task(self._execute_stop_exit(sm["direction"], exit_price))
+
+        # Bracket trigger: entry signals
         if not self._pending_bracket or not self._pending_bracket.get("active"):
             return
         if self._tick_trigger_active:

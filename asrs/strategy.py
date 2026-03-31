@@ -116,6 +116,9 @@ class Signal:
         self._bar4_triggered = False                           # prevent double trigger
         self._morning_running = False                          # mutex
         self._sibling: "Signal | None" = None                  # S1<->S2 link
+
+        # Register tick-based stop exit callback
+        self.broker.register_stop_callback(self._on_stop_exit)
         self._state_dir = os.path.join(
             os.path.dirname(__file__), "..", "data", "state"
         )
@@ -205,8 +208,17 @@ class Signal:
 
         # Bar 5 trigger -- only if we are waiting for bar 5 (R2)
         if bn == 5 and self.state.phase == Phase.IDLE and self.state.bar_number == 0:
-            # morning_routine already ran and decided to wait for bar 5
             pass  # morning_routine handles bar 5 wait internally
+
+    async def _on_stop_exit(self, result: dict):
+        """Called by broker when tick-based stop monitor triggers a market close."""
+        exit_price = result["exit_price"]
+        logger.info(f"[{self.name}] Tick stop exit at {exit_price}")
+        self.load_state()
+        if self.state.phase not in (Phase.LONG, Phase.SHORT):
+            logger.warning(f"[{self.name}] Stop exit but phase={self.state.phase} — ignoring")
+            return
+        await self._process_exit(exit_price)
 
     # =========================================================================
     #  morning_routine -- calculate levels, arm bracket (R1-R11)
@@ -445,9 +457,8 @@ class Signal:
         # Process fill
         self._process_fill(direction, fill_price, deal_id)
 
-        # R12: Set disaster stop on IG immediately
-        if not await self._place_stop_with_retry():
-            return  # emergency close happened
+        # Activate tick-based stop monitor (IG disaster stop already set via market order)
+        self.broker.activate_stop_monitor(direction, self.state.trailing_stop)
 
         await self.alert(
             f"<b>{self.name} {direction} ENTRY</b>\n"
@@ -559,27 +570,14 @@ class Signal:
         if price is None or price <= 0:
             return
 
-        # Check stop hit (R18) — verify via IG position, not just price
-        stopped = False
-        if self.state.direction == "LONG" and price <= self.state.trailing_stop:
-            stopped = True
-        elif self.state.direction == "SHORT" and price >= self.state.trailing_stop:
-            stopped = True
-
-        if stopped:
-            # Verify with IG — is the position actually closed?
-            import asyncio
-            await asyncio.sleep(2)  # give IG time to process the stop
-            ig_pos = await self.broker.get_position()
-            if ig_pos["direction"] == "FLAT":
-                # Position closed — use current price as exit (closest to actual fill)
-                exit_price = price
-                logger.info(f"[{self.name}] Stop confirmed by IG (position FLAT), exit ~{exit_price}")
-            else:
-                # IG still shows position open — stop hasn't triggered on IG yet
-                logger.warning(f"[{self.name}] Price crossed stop but IG position still open — skipping exit")
-                return
-            await self._process_exit(exit_price)
+        # Check if tick-based stop already closed the position
+        ig_pos = await self.broker.get_position()
+        if ig_pos["direction"] == "FLAT" and self.state.direction:
+            logger.info(f"[{self.name}] Position closed (detected by monitor cycle)")
+            # _on_stop_exit callback should have handled this already
+            # but if not, process exit now with current price
+            if self.state.phase in (Phase.LONG, Phase.SHORT):
+                await self._process_exit(price)
             return
 
         # Update MFE
@@ -795,6 +793,9 @@ class Signal:
         )
         logger.info(f"[{self.name}] Exit: {direction} {total_pnl:+.1f}pts ({exit_reason})")
 
+        # Deactivate stop monitor
+        self.broker.deactivate_stop_monitor()
+
         # R20-R22: Re-entry check
         self.state.direction = ""
         self.state.deal_ids = []
@@ -834,6 +835,7 @@ class Signal:
 
         if self.state.phase in (Phase.LONG, Phase.SHORT):
             logger.info(f"[{self.name}] EOD force close")
+            self.broker.deactivate_stop_monitor()
             price = await self.broker.get_current_price()
             await self.broker.close_position()
             await self.broker.cancel_all_orders()
@@ -909,43 +911,8 @@ class Signal:
         return False
 
     async def _update_ig_stop(self):
-        """Update stop on ALL deal IDs, then verify IG actually applied it."""
-        import asyncio
-        target = self.state.trailing_stop
-        failed = []
-        for deal_id in self.state.deal_ids:
-            try:
-                ok = await self.broker.modify_stop(deal_id, target)
-                if not ok:
-                    failed.append(deal_id)
-            except Exception as e:
-                logger.error(f"[{self.name}] Stop update failed for {deal_id}: {e}")
-                failed.append(deal_id)
-
-        if failed:
-            await self.alert(
-                f"[{self.name}] STOP UPDATE FAILED on {len(failed)}/{len(self.state.deal_ids)} deals!\n"
-                f"Target: {target} | Failed: {failed}"
-            )
-            return
-
-        # Verify stops were actually applied on IG
-        await asyncio.sleep(1)
-        ig_pos = await self.broker.get_position()
-        ig_stops = ig_pos.get("stop_levels", {})
-        if ig_stops:
-            mismatched = []
-            for deal_id, actual_stop in ig_stops.items():
-                if abs(actual_stop - target) > 1.0:  # allow 1pt tolerance
-                    mismatched.append(f"{deal_id}: {actual_stop}")
-            if mismatched:
-                logger.error(f"[{self.name}] STOP MISMATCH! Target={target}, IG has: {mismatched}")
-                await self.alert(
-                    f"[{self.name}] STOP MISMATCH!\n"
-                    f"Bot target: {target}\n"
-                    f"IG actual: {', '.join(mismatched)}\n"
-                    f"CHECK IG IMMEDIATELY"
-                )
+        """Update tick-based stop monitor level. IG disaster stop stays fixed."""
+        self.broker.update_stop_level(self.state.trailing_stop)
 
     # =========================================================================
     #  Bar helpers
