@@ -863,16 +863,15 @@ class Signal:
 
         if self.state.entries_used < self.cfg["max_entries"]:
             # R20: Re-arm BOTH directions at ORIGINAL entry levels
-            # buy_level/sell_level are already the correct entry triggers
-            # (bar_high/bar_low may be tightened by risk cap — those are stop levels)
+            # Don't arm immediately — price may have moved past levels during exit
+            # Monitor cycle will re-arm when price is between levels
             self.state.phase = Phase.LEVELS_SET
             self.save_state()
-
-            await self._arm_bracket()
             await self.alert(
-                f"[{self.name}] RE-ENTRY ARMED (both sides)\n"
+                f"[{self.name}] RE-ENTRY READY (both sides)\n"
                 f"BUY: {self.state.buy_level} | SELL: {self.state.sell_level}\n"
-                f"Entry {self.state.entries_used}/{self.cfg['max_entries']}"
+                f"Entry {self.state.entries_used}/{self.cfg['max_entries']}\n"
+                f"Will arm when price between levels"
             )
         else:
             # R11: Max entries reached
