@@ -117,7 +117,9 @@ class _TickListener(SubscriptionListener):
                     if cbs:
                         logger.info(f"Firing {len(cbs)} candle callback(s) for {self._epic}")
                     else:
-                        logger.warning(f"No candle callbacks for {self._epic}!")
+                        logger.warning(f"No candle callbacks for {self._epic}! "
+                                       f"dict id: {id(self._candle_callbacks)}, "
+                                       f"keys: {list(self._candle_callbacks.keys())}")
                     for cb in cbs:
                         self._loop.call_soon_threadsafe(
                             self._loop.create_task, cb(completed)
@@ -431,6 +433,8 @@ class IGStreamManager:
     def register_candle_callback(self, epic: str, callback: Callable):
         """Register async callback for completed 5-min candles."""
         self._candle_callbacks.setdefault(epic, []).append(callback)
+        logger.info(f"Candle callback registered for {epic} (total: {len(self._candle_callbacks[epic])}, "
+                     f"dict id: {id(self._candle_callbacks)})")
 
     def register_tick_callback(self, epic: str, callback: Callable):
         """Register sync callback for every tick (runs on event loop thread via call_soon_threadsafe)."""
