@@ -190,6 +190,9 @@ class Signal:
             return
 
         bn = self._bar_number(bar_time)
+        if bn in (1, 4, 5):
+            logger.info(f"[{self.name}] on_bar_complete: bn={bn} time={bar_time} "
+                        f"H={bar['High']} L={bar['Low']} triggered={self._bar4_triggered}")
         if bn <= 0:
             return
 
