@@ -415,12 +415,19 @@ async def handle_pnl():
 
     try:
         from shared import journal_db
+        day_total = 0
+        day_trades = 0
+        day_wins = 0
+
         for inst in ["DAX", "US30", "NIKKEI"]:
             inst_trades = journal_db.get_trades_for_date(today, instrument=inst)
             if inst_trades:
                 inst_pnl = sum(t.get("pnl_pts", 0) for t in inst_trades)
                 inst_wins = sum(1 for t in inst_trades if t.get("pnl_pts", 0) > 0)
                 inst_losses = sum(1 for t in inst_trades if t.get("pnl_pts", 0) < 0)
+                day_total += inst_pnl
+                day_trades += len(inst_trades)
+                day_wins += inst_wins
                 ps = "+" if inst_pnl >= 0 else ""
                 lines.append(
                     f"\n<b>{inst}</b>: {ps}{round(inst_pnl, 1)} pts\n"
@@ -431,6 +438,13 @@ async def handle_pnl():
                     lines.append(f"  {t.get('direction', '?')} {'+' if p >= 0 else ''}{round(p, 1)} pts")
             else:
                 lines.append(f"\n<b>{inst}</b>: No trades today")
+
+        # Total at top
+        icon = "🟢" if day_total >= 0 else "🔴"
+        lines.insert(1,
+            f"\n{icon} <b>{'+'if day_total>=0 else ''}{round(day_total,1)} pts</b> "
+            f"({day_trades} trades, {day_wins} wins)\n"
+        )
     except Exception as e:
         lines.append(f"\nError: {e}")
 
