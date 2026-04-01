@@ -810,8 +810,10 @@ class Signal:
         # Exit reason
         if pnl_original == 0.0 and self.state.breakeven_hit:
             exit_reason = "BREAKEVEN_STOP"
-        elif self.state.trail_moved and self.state.trailing_stop != self.state.initial_stop:
+        elif self.state.trail_moved and self.state.trailing_stop != self.state.initial_stop and pnl_original > 0:
             exit_reason = "TRAIL_STOP"
+        elif self.state.trail_moved and self.state.trailing_stop != self.state.initial_stop:
+            exit_reason = "REDUCED_STOP"  # trail tightened but still a loss
         else:
             exit_reason = "INITIAL_STOP"
 
