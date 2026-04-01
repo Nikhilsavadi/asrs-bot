@@ -197,9 +197,12 @@ class IGBroker:
                 if attempt < 3:
                     await asyncio.sleep(2)
 
-            # Verify position is flat
+            # Verify position is flat and get actual fill
             pos = await self.get_position()
-            actual_exit = exit_price
+            fills = getattr(self, '_last_close_fills', [])
+            actual_exit = sum(fills) / len(fills) if fills else exit_price
+            if fills:
+                logger.info(f"Actual close fills ({self.epic}): {fills} avg={actual_exit:.1f}")
             if pos["direction"] != "FLAT":
                 logger.error(f"STOP EXIT FAILED — position still open ({self.epic})")
                 # Re-enable monitor to try again on next tick
@@ -527,6 +530,7 @@ class IGBroker:
                         else [])
 
             closed = []
+            fill_levels = []
             for pos in pos_list:
                 if pos.get("epic") == self.epic:
                     deal_id = pos.get("dealId", "")
@@ -534,18 +538,26 @@ class IGBroker:
                     size = pos.get("dealSize") or pos.get("size", 0)
                     close_dir = "SELL" if direction == "BUY" else "BUY"
                     try:
-                        await self._shared.rest_call(
+                        result = await self._shared.rest_call(
                             self._shared.ig.close_open_position,
                             deal_id=deal_id, direction=close_dir,
                             epic=None, expiry="DFB", level=None,
                             order_type="MARKET", quote_id=None, size=size,
                         )
                         closed.append(deal_id)
+                        # Get actual fill level from confirmation
+                        deal_ref = result.get("dealReference", "") if result else ""
+                        if deal_ref:
+                            confirm = await self._confirm_deal(deal_ref)
+                            level = confirm.get("level")
+                            if level:
+                                fill_levels.append(float(level))
                     except Exception as e:
                         logger.error(f"Close failed for {deal_id}: {e}")
 
             for did in closed:
                 self._position_deal_ids.pop(did, None)
+            self._last_close_fills = fill_levels
             return len(self._position_deal_ids) == 0
 
         except Exception as e:
