@@ -334,6 +334,8 @@ class IGStreamManager:
 
     async def subscribe_ticks(self, epic: str):
         """Subscribe to real-time tick prices for an epic."""
+        if epic in self._tick_subs:
+            return  # already subscribed
         if not self._session.stream or not self._session.stream.ls_client:
             logger.warning(f"Cannot subscribe ticks for {epic} — no stream connection")
             return
@@ -395,6 +397,8 @@ class IGStreamManager:
 
     async def subscribe_candles(self, epic: str):
         """Subscribe to 5-minute candle completions for an epic."""
+        if epic in self._candle_subs:
+            return  # already subscribed
         if not self._session.stream or not self._session.stream.ls_client:
             logger.warning(f"Cannot subscribe candles for {epic} — no stream")
             return
