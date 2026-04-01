@@ -39,10 +39,10 @@ class _TickListener(SubscriptionListener):
         self._events = events
         self._tick_callbacks = tick_callbacks
         self._loop = loop
-        self._tick_bars = tick_bars or {}      # shared tick-bar accumulator
-        self._candle_bars = candle_bars or {}  # shared bar store (same as CONS_END)
-        self._candle_callbacks = candle_callbacks or {}  # fire on tick-bar complete
-        self._bar_emit_times = bar_emit_times or {}  # track emission time per epic
+        self._tick_bars = tick_bars if tick_bars is not None else {}
+        self._candle_bars = candle_bars if candle_bars is not None else {}
+        self._candle_callbacks = candle_callbacks if candle_callbacks is not None else {}
+        self._bar_emit_times = bar_emit_times if bar_emit_times is not None else {}
 
     def onItemUpdate(self, update):
         try:
@@ -161,7 +161,7 @@ class _CandleListener(SubscriptionListener):
         self._bars = bars
         self._callbacks = callbacks
         self._loop = loop
-        self._bar_emit_times = bar_emit_times or {}
+        self._bar_emit_times = bar_emit_times if bar_emit_times is not None else {}
         # BUG #2 FIX: dedup state lives at manager level, survives reconnects
         self._dedup = dedup_state if dedup_state is not None else {}
 
