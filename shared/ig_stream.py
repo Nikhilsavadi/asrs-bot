@@ -113,7 +113,12 @@ class _TickListener(SubscriptionListener):
                         f"L={completed['Low']} C={completed['Close']}"
                     )
                     # Fire candle callbacks so bots get tick-bar completions
-                    for cb in self._candle_callbacks.get(self._epic, []):
+                    cbs = self._candle_callbacks.get(self._epic, [])
+                    if cbs:
+                        logger.info(f"Firing {len(cbs)} candle callback(s) for {self._epic}")
+                    else:
+                        logger.warning(f"No candle callbacks for {self._epic}!")
+                    for cb in cbs:
                         self._loop.call_soon_threadsafe(
                             self._loop.create_task, cb(completed)
                         )
