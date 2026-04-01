@@ -366,6 +366,10 @@ class Signal:
                 import asyncio
                 self._bar5_event = asyncio.Event()
                 logger.info(f"[{self.name}] Waiting for bar 5 callback...")
+                await self.alert(
+                    f"[{self.name}] Bar 4 ({range_flag}) — waiting for bar 5\n"
+                    f"Bar 4: H={bar4['High']} L={bar4['Low']} Range={bar4_range}pts"
+                )
                 try:
                     await asyncio.wait_for(self._bar5_event.wait(), timeout=330)  # 5.5 min max
                 except asyncio.TimeoutError:
