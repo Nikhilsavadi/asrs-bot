@@ -35,8 +35,18 @@ def _get_conn() -> sqlite3.Connection:
 
 
 def init_db():
-    """Create tables if they don't exist."""
+    """Create tables if they don't exist, and migrate schema."""
     conn = _get_conn()
+
+    # Migration: add mode column if missing
+    try:
+        conn.execute("SELECT mode FROM trades LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE trades ADD COLUMN mode TEXT DEFAULT 'demo'")
+        conn.execute("UPDATE trades SET mode = 'demo'")
+        conn.commit()
+        logger.info("Migrated: added 'mode' column, marked existing trades as demo")
+
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS trades (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,7 +84,8 @@ def init_db():
             exit_reason     TEXT DEFAULT '',
             stake_per_point REAL DEFAULT 1,
             cumulative_pnl  REAL DEFAULT 0,
-            created_at      TEXT DEFAULT (datetime('now'))
+            created_at      TEXT DEFAULT (datetime('now')),
+            mode            TEXT DEFAULT 'live'
         );
 
         CREATE TABLE IF NOT EXISTS scaling_ladder (
@@ -263,7 +274,7 @@ def insert_trade(instrument: str, trade: dict, state=None) -> int:
             tp1_filled, tp2_filled, tp1_slippage, tp2_slippage,
             mfe, bar_range, range_flag, bar_type,
             signal_bar, bar5_rule, gap_dir, overnight_bias,
-            exit_reason, stake_per_point, cumulative_pnl
+            exit_reason, stake_per_point, cumulative_pnl, mode
         ) VALUES (
             ?, ?, ?, ?,
             ?, ?, ?, ?,
@@ -274,7 +285,7 @@ def insert_trade(instrument: str, trade: dict, state=None) -> int:
             ?, ?, ?, ?,
             ?, ?, ?, ?,
             ?, ?, ?, ?,
-            ?, ?, ?
+            ?, ?, ?, ?
         )
     """, (
         instrument,
@@ -311,6 +322,7 @@ def insert_trade(instrument: str, trade: dict, state=None) -> int:
         trade.get("exit_reason", ""),
         trade.get("stake_per_point", trade.get("stake", 1)),
         cum_pnl,
+        "demo" if os.environ.get("IG_DEMO", "true").lower() == "true" else "live",
     ))
     conn.commit()
 
