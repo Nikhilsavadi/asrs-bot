@@ -18,6 +18,7 @@ COPY sync_to_railway.py .
 COPY reports.py .
 COPY run_all.py .
 COPY backtest.py .
+COPY watchdog.py .
 
 # Create data directory
 RUN mkdir -p data

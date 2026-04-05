@@ -175,11 +175,11 @@ class IGSharedSession:
         bar_age = stream_mgr.get_last_bar_age(epic) if hasattr(stream_mgr, 'get_last_bar_age') else 0
 
         # Ticks flowing AND bars building — healthy
-        if tick_age < 120 and bar_age < 600:  # bars within 10 mins
+        if tick_age < 120 and bar_age < 330:  # bars within ~1 bar interval + margin
             return True
 
         # Bars stale but ticks OK — tick-bar builder may be broken, resubscribe
-        if tick_age < 120 and bar_age >= 600:
+        if tick_age < 120 and bar_age >= 330:
             logger.warning(f"Stream health: ticks OK but bars stale ({bar_age:.0f}s) — resubscribing")
 
         # Both stale

@@ -13,6 +13,7 @@ Usage:
 import asyncio
 import os
 import sys
+import time
 import signal as sig
 import logging
 from logging.handlers import RotatingFileHandler
@@ -43,6 +44,174 @@ logger = logging.getLogger("ASRS")
 
 # Global registry of all signals (for Telegram commands)
 ALL_SIGNALS: list[Signal] = []
+
+# Heartbeat file path -- must be inside /app/data (volume-mounted to host ./data)
+HEARTBEAT_FILE = "/app/data/heartbeat"
+
+# Stream health: track consecutive resubscribe failures per epic
+_resub_fail_count: dict[str, int] = {}
+
+
+async def reconcile_positions(signals, shared_session, stream_mgr, tg_send):
+    """
+    Reconcile open IG positions with signal state on startup.
+
+    After a VPS restart mid-trade, the bot has no in-memory state.
+    This fetches all open positions from IG and matches each to the
+    correct signal by epic + direction, restoring LONG/SHORT state
+    and activating the disaster stop monitor.
+    """
+    try:
+        positions = await shared_session.rest_call(
+            shared_session.ig.fetch_open_positions
+        )
+        if positions is None:
+            logger.info("Reconciliation: No open positions -- clean start")
+            return
+
+        pos_list = (positions if isinstance(positions, list)
+                    else positions.to_dict("records") if hasattr(positions, "to_dict")
+                    else [])
+
+        if not pos_list:
+            logger.info("Reconciliation: No open positions -- clean start")
+            return
+
+        # Build epic -> list of positions
+        epic_positions: dict[str, list] = {}
+        for pos in pos_list:
+            epic = pos.get("epic", "")
+            epic_positions.setdefault(epic, []).append(pos)
+
+        matched = 0
+        for key, signal in signals.items():
+            epic = signal.cfg["epic"]
+            if epic not in epic_positions:
+                continue
+
+            for pos in epic_positions[epic]:
+                direction_raw = pos.get("direction", "")
+                direction = "LONG" if direction_raw == "BUY" else "SHORT"
+                entry_level = float(pos.get("level") or pos.get("openLevel", 0))
+                size = float(pos.get("dealSize") or pos.get("size", 0))
+                deal_id = pos.get("dealId", "")
+
+                if entry_level <= 0:
+                    continue
+
+                # Only reconcile signals that are currently IDLE or have no position
+                from asrs.strategy import Phase
+                if signal.state.phase in (Phase.LONG, Phase.SHORT):
+                    continue  # already tracking a position
+
+                # Set signal state
+                signal.state.phase = Phase.LONG if direction == "LONG" else Phase.SHORT
+                signal.state.direction = direction
+                signal.state.entry_price = entry_level
+                if deal_id:
+                    signal.state.deal_ids = [deal_id]
+
+                # Track deal in broker
+                signal.broker._position_deal_ids[deal_id] = {
+                    "direction": direction_raw, "size": size, "level": entry_level,
+                }
+
+                # Activate disaster stop monitor
+                disaster_pts = signal.cfg["disaster_stop_pts"]
+                if direction == "LONG":
+                    stop_level = entry_level - disaster_pts
+                else:
+                    stop_level = entry_level + disaster_pts
+
+                signal.state.initial_stop = stop_level
+                signal.state.trailing_stop = stop_level
+                signal.broker.activate_stop_monitor(direction, stop_level)
+
+                signal.save_state()
+                matched += 1
+
+                msg = (
+                    f"[{signal.name}] RECONCILED: {direction} @ {entry_level}, "
+                    f"stop monitor active @ {stop_level}"
+                )
+                logger.info(msg)
+                await tg_send(msg)
+
+                # Remove this position so it doesn't match another signal
+                epic_positions[epic].remove(pos)
+                break  # one position per signal
+
+        if matched == 0:
+            logger.info("Reconciliation: Positions found but none matched signals")
+
+    except Exception as e:
+        logger.error(f"Reconciliation failed: {e}", exc_info=True)
+        try:
+            await tg_send(f"RECONCILIATION FAILED: {e}")
+        except Exception:
+            pass
+
+
+def write_heartbeat():
+    """Write current timestamp to heartbeat file for external watchdog."""
+    try:
+        with open(HEARTBEAT_FILE, "w") as f:
+            f.write(str(time.time()))
+    except Exception as e:
+        logger.warning(f"Heartbeat write failed: {e}")
+
+
+async def check_stream_health_all(shared_session, stream_mgr, tg_send):
+    """
+    Check stream health for all epics. Send Telegram alerts on staleness.
+    Track consecutive resubscribe failures -- critical alert after 3.
+    """
+    for inst_name, inst_cfg in config.INSTRUMENTS.items():
+        epic = inst_cfg["epic"]
+
+        tick_age = stream_mgr.get_tick_age(epic)
+        bar_age = stream_mgr.get_last_bar_age(epic)
+
+        # Healthy: ticks within 120s AND bars within 330s (just over one 5-min bar)
+        if tick_age < 120 and bar_age < 330:
+            _resub_fail_count[epic] = 0
+            continue
+
+        # Build alert message
+        issues = []
+        if tick_age >= 120:
+            issues.append(f"ticks stale ({tick_age:.0f}s)")
+        if bar_age >= 330:
+            issues.append(f"bars stale ({bar_age:.0f}s)")
+
+        alert_msg = f"[{inst_name}] Stream: {', '.join(issues)} -- resubscribing..."
+        logger.warning(alert_msg)
+        await tg_send(alert_msg)
+
+        # Attempt resubscribe via existing check_stream_health
+        try:
+            ok = await shared_session.check_stream_health(stream_mgr, epic)
+            if ok:
+                _resub_fail_count[epic] = 0
+                logger.info(f"[{inst_name}] Stream resubscribe successful")
+            else:
+                count = _resub_fail_count.get(epic, 0) + 1
+                _resub_fail_count[epic] = count
+                logger.error(f"[{inst_name}] Stream resubscribe failed ({count}/3)")
+                if count >= 3:
+                    await tg_send(
+                        f"CRITICAL: [{inst_name}] Stream resubscribe failed {count} times! "
+                        f"Manual intervention may be needed."
+                    )
+        except Exception as e:
+            count = _resub_fail_count.get(epic, 0) + 1
+            _resub_fail_count[epic] = count
+            logger.error(f"[{inst_name}] Stream health check exception: {e}")
+            if count >= 3:
+                await tg_send(
+                    f"CRITICAL: [{inst_name}] Stream resubscribe failed {count} times! "
+                    f"Error: {e}"
+                )
 
 
 async def main():
@@ -122,6 +291,9 @@ async def main():
             for sig in _sigs:
                 await sig.on_bar_complete(bar)
         register_bar_callback(stream_mgr, epic, _on_bar)
+
+    # -- Position Reconciliation (before scheduler starts) --------------------
+    await reconcile_positions(signals, shared, stream_mgr, tg_send)
 
     # -- Scheduler ------------------------------------------------------------
     scheduler = AsyncIOScheduler(timezone=config.TZ_UK)
@@ -237,6 +409,21 @@ async def main():
 
     scheduler.add_job(_keepalive, "interval", minutes=10,
         id="ig_keepalive", misfire_grace_time=60)
+
+    # -- Heartbeat writer (every 60s for external watchdog) ------------------
+    def _write_heartbeat():
+        write_heartbeat()
+
+    scheduler.add_job(_write_heartbeat, "interval", seconds=60,
+        id="heartbeat_writer", misfire_grace_time=30)
+    write_heartbeat()  # Write immediately on startup
+
+    # -- Stream health check (every 5 minutes, with Telegram alerts) ---------
+    async def _stream_health():
+        await check_stream_health_all(shared, stream_mgr, tg_send)
+
+    scheduler.add_job(_stream_health, "interval", minutes=5,
+        id="stream_health", misfire_grace_time=60)
 
     # -- Monitoring: missed job alerts ----------------------------------------
     try:
