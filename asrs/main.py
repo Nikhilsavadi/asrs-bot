@@ -272,6 +272,41 @@ async def main():
         day=1, hour=8, minute=0,
         id="monthly_report", misfire_grace_time=3600)
 
+    # -- Visual performance report (PNG) ----------------------------------------
+    async def _send_visual_report():
+        try:
+            from reports import generate_full_report
+            from telegram_cmd import _send_photo
+            image_bytes = generate_full_report()
+            await _send_photo(image_bytes, caption="ASRS Performance Report")
+        except Exception as e:
+            logger.warning(f"Visual report failed: {e}")
+
+    # Sunday 08:00 UK
+    scheduler.add_job(_send_visual_report, "cron",
+        day_of_week="sun", hour=8, minute=0,
+        id="weekly_visual_report", misfire_grace_time=3600,
+        timezone=config.TZ_UK)
+
+    # 1st of month 08:00 UK
+    scheduler.add_job(_send_visual_report, "cron",
+        day=1, hour=8, minute=5,
+        id="monthly_visual_report", misfire_grace_time=3600,
+        timezone=config.TZ_UK)
+
+    # -- Governance alerts (every 5 minutes) ------------------------------------
+    async def _governance_check():
+        try:
+            from reports import check_governance_alerts
+            alerts = check_governance_alerts()
+            for alert in alerts:
+                await tg_send(f"🚨 <b>GOVERNANCE</b>\n{alert}")
+        except Exception as e:
+            logger.warning(f"Governance check failed: {e}")
+
+    scheduler.add_job(_governance_check, "interval", minutes=5,
+        id="governance_check", misfire_grace_time=60)
+
     # -- Weekly report (Friday 17:00 UK) ----------------------------------------
     async def _weekly_report():
         try:

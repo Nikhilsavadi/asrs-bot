@@ -80,6 +80,20 @@ async def _send(text: str):
         logger.error(f"TG send failed: {e}")
 
 
+async def _send_photo(image_bytes: bytes, caption: str = ""):
+    """Send a photo (PNG bytes) to Telegram."""
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"{API_BASE}/sendPhoto",
+                data={"chat_id": TG_CHAT_ID, "caption": caption},
+                files={"photo": ("report.png", image_bytes, "image/png")},
+                timeout=30,
+            )
+    except Exception as e:
+        logger.error(f"TG photo send failed: {e}")
+
+
 async def _get_offset() -> int | None:
     """Get latest update offset to skip old messages."""
     try:
@@ -530,6 +544,30 @@ async def handle_journal(text: str):
     await _send("\n".join(lines))
 
 
+async def handle_report():
+    """Generate and send full performance report as image."""
+    try:
+        await _send("Generating full report...")
+        from reports import generate_full_report
+        image_bytes = generate_full_report()
+        await _send_photo(image_bytes, caption="ASRS Performance Report")
+    except Exception as e:
+        logger.error(f"Report generation failed: {e}", exc_info=True)
+        await _send(f"Report generation failed: {e}")
+
+
+async def handle_chart():
+    """Generate and send equity curve chart as image."""
+    try:
+        await _send("Generating chart...")
+        from reports import generate_chart_only
+        image_bytes = generate_chart_only()
+        await _send_photo(image_bytes, caption="ASRS Equity Curves")
+    except Exception as e:
+        logger.error(f"Chart generation failed: {e}", exc_info=True)
+        await _send(f"Chart generation failed: {e}")
+
+
 async def handle_set(text: str):
     """Handle /set key value — hot-reload config."""
     from shared.config_reload import apply_set
@@ -600,6 +638,8 @@ async def poll_commands(dax_broker=None, **kwargs):
                     {"command": "restart", "description": "Reconnect IG API"},
                     {"command": "logs", "description": "Last 20 log lines"},
                     {"command": "journal", "description": "Trade journal & scaling"},
+                    {"command": "report", "description": "Full performance report (image)"},
+                    {"command": "chart", "description": "Equity curves only (image)"},
                     {"command": "config", "description": "View current config"},
                     {"command": "set", "description": "Change config: /set key value"},
                 ]},
@@ -675,6 +715,10 @@ async def poll_commands(dax_broker=None, **kwargs):
                             await handle_set(text)
                         elif cmd == "/config":
                             await handle_config()
+                        elif cmd == "/report":
+                            await handle_report()
+                        elif cmd == "/chart":
+                            await handle_chart()
                         elif cmd.startswith("/reset"):
                             await handle_reset(text)
                         elif cmd == "/help":
@@ -689,6 +733,8 @@ async def poll_commands(dax_broker=None, **kwargs):
                                 "/logs — Last 20 log lines\n"
                                 "/pnl — Today's P&L\n"
                                 "/journal — Trade journal & scaling\n"
+                                "/report — Full performance report (image)\n"
+                                "/chart — Equity curves only (image)\n"
                                 "/config — View current config\n"
                                 "/set key val — Change config live\n"
                                 "/restart — Reconnect IG API\n"
