@@ -161,13 +161,35 @@ def write_heartbeat():
         logger.warning(f"Heartbeat write failed: {e}")
 
 
+def _is_market_open(inst_name: str) -> bool:
+    """Check if market should be active right now (not weekend/holiday)."""
+    from zoneinfo import ZoneInfo
+    inst_cfg = config.INSTRUMENTS[inst_name]
+    tz = ZoneInfo(inst_cfg["timezone"])
+    now = datetime.now(tz)
+    # Weekend check (Sat=5, Sun=6)
+    if now.weekday() >= 5:
+        return False
+    # Within session hours (with 30 min buffer either side)
+    s1_open = inst_cfg["s1_open_hour"] * 60 + inst_cfg["s1_open_minute"]
+    eod = inst_cfg["session_end_hour"] * 60 + inst_cfg["session_end_minute"]
+    cur = now.hour * 60 + now.minute
+    return (s1_open - 30) <= cur <= (eod + 30)
+
+
 async def check_stream_health_all(shared_session, stream_mgr, tg_send):
     """
     Check stream health for all epics. Send Telegram alerts on staleness.
     Track consecutive resubscribe failures -- critical alert after 3.
+    Only checks during market hours to avoid weekend/holiday false alarms.
     """
     for inst_name, inst_cfg in config.INSTRUMENTS.items():
         epic = inst_cfg["epic"]
+
+        # Skip if market is closed (weekend or outside session hours)
+        if not _is_market_open(inst_name):
+            _resub_fail_count[epic] = 0
+            continue
 
         tick_age = stream_mgr.get_tick_age(epic)
         bar_age = stream_mgr.get_last_bar_age(epic)
