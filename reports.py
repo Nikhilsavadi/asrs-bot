@@ -40,18 +40,19 @@ TEXT_COLOR = "#e0e0e0"
 MUTED = "#888888"
 
 
-def _fetch_trades(since: str | None = None) -> list[dict]:
-    """Fetch trades from journal DB, optionally filtered by date."""
+def _fetch_trades(since: str | None = None, live_only: bool = True) -> list[dict]:
+    """Fetch trades from journal DB, optionally filtered by date and mode."""
     from shared.journal_db import _get_conn
     conn = _get_conn()
+    mode_filter = " AND mode='live'" if live_only else ""
     if since:
         rows = conn.execute(
-            "SELECT * FROM trades WHERE date >= ? ORDER BY id ASC",
+            f"SELECT * FROM trades WHERE date >= ?{mode_filter} ORDER BY id ASC",
             (since,),
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT * FROM trades ORDER BY id ASC"
+            f"SELECT * FROM trades WHERE 1=1{mode_filter} ORDER BY id ASC"
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -377,51 +378,92 @@ def generate_chart_only() -> bytes:
     return buf.read()
 
 
+_ALERT_STATE_FILE = "/app/data/alert_state.json"
+
+
+def _load_alert_state() -> dict:
+    import json, os
+    if os.path.exists(_ALERT_STATE_FILE):
+        try:
+            with open(_ALERT_STATE_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_alert_state(state: dict):
+    import json, os
+    os.makedirs(os.path.dirname(_ALERT_STATE_FILE), exist_ok=True)
+    with open(_ALERT_STATE_FILE, "w") as f:
+        json.dump(state, f)
+
+
 def check_governance_alerts() -> list[str]:
-    """Check governance thresholds and return list of alert messages."""
+    """Check governance thresholds and return list of NEW alert messages.
+    Deduplicates so each unique alert fires once per occurrence."""
     alerts = []
     now = datetime.now(TZ_UK)
+    state = _load_alert_state()
 
-    # All trades for streak checks
-    all_trades = _fetch_trades()
+    # Live trades only
+    all_trades = _fetch_trades(live_only=True)
     if not all_trades:
         return alerts
 
     all_stats = _calc_stats(all_trades)
 
-    # Consecutive losses
-    if all_stats["consec_loss"] >= 40:
-        alerts.append(
-            f"CRITICAL: {all_stats['consec_loss']} consecutive losses -- "
-            f"trading should be halted immediately"
-        )
-    elif all_stats["consec_loss"] >= 20:
-        alerts.append(
-            f"WARNING: {all_stats['consec_loss']} consecutive losses -- "
-            f"review strategy and consider reducing size"
-        )
+    # Consecutive losses — only alert when streak crosses threshold (not on every check)
+    consec = all_stats["consec_loss"]
+    last_consec_alert = state.get("last_consec_alert", 0)
+    if consec >= 40 and last_consec_alert < 40:
+        alerts.append(f"CRITICAL: {consec} consecutive losses -- halt immediately")
+        state["last_consec_alert"] = consec
+    elif consec >= 20 and last_consec_alert < 20:
+        alerts.append(f"WARNING: {consec} consecutive losses -- review strategy")
+        state["last_consec_alert"] = consec
+    elif consec == 0:
+        state["last_consec_alert"] = 0  # reset on a winner
 
-    # Largest single loss
-    if all_stats["largest_loss_r"] < -1.5:
-        alerts.append(
-            f"ALERT: Single loss of {all_stats['largest_loss_r']:.2f}R "
-            f"exceeds 1.5R threshold"
-        )
+    # Largest single loss — only alert on NEW trades exceeding threshold
+    last_alerted_trade_id = state.get("last_loss_alert_trade_id", 0)
+    risk_map = RISK_MAP
+    for t in all_trades:
+        tid = t.get("id", 0)
+        if tid <= last_alerted_trade_id:
+            continue
+        risk = risk_map.get(t.get("instrument", ""), 50)
+        r_val = (t.get("pnl_pts", 0) or 0) / risk
+        if r_val < -1.5:
+            alerts.append(
+                f"ALERT: {t.get('instrument','?')} {t.get('date','?')} "
+                f"loss of {r_val:.2f}R ({t.get('pnl_pts',0):+.0f}pts) exceeds 1.5R"
+            )
+    if all_trades:
+        state["last_loss_alert_trade_id"] = max(t.get("id", 0) for t in all_trades)
 
-    # Monthly drawdown
+    # Monthly drawdown — only alert when crossing threshold
     m1 = now.date().replace(day=1).isoformat()
-    monthly_trades = _fetch_trades(m1)
+    monthly_trades = _fetch_trades(m1, live_only=True)
     monthly_stats = _calc_stats(monthly_trades)
+    monthly_r = monthly_stats["cum_r"]
+    last_monthly_alert = state.get("last_monthly_alert", 0)
 
-    if monthly_stats["cum_r"] <= -40:
-        alerts.append(
-            f"CRITICAL: Monthly R at {monthly_stats['cum_r']:.1f}R -- "
-            f"exceeds -40R limit, halt trading"
-        )
-    elif monthly_stats["cum_r"] <= -20:
-        alerts.append(
-            f"WARNING: Monthly R at {monthly_stats['cum_r']:.1f}R -- "
-            f"approaching -40R limit"
-        )
+    if monthly_r <= -40 and last_monthly_alert > -40:
+        alerts.append(f"CRITICAL: Monthly R at {monthly_r:.1f}R -- halt trading")
+        state["last_monthly_alert"] = monthly_r
+    elif monthly_r <= -20 and last_monthly_alert > -20:
+        alerts.append(f"WARNING: Monthly R at {monthly_r:.1f}R -- approaching -40R")
+        state["last_monthly_alert"] = monthly_r
+    elif monthly_r > -20:
+        state["last_monthly_alert"] = 0  # reset when recovered
 
+    # Reset monthly state on 1st of month
+    last_month = state.get("last_month", "")
+    cur_month = now.strftime("%Y-%m")
+    if last_month != cur_month:
+        state["last_monthly_alert"] = 0
+        state["last_month"] = cur_month
+
+    _save_alert_state(state)
     return alerts
