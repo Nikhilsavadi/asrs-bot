@@ -164,6 +164,7 @@ def write_heartbeat():
 def _is_market_open(inst_name: str) -> bool:
     """Check if market should be active right now (not weekend/holiday)."""
     from zoneinfo import ZoneInfo
+    from datetime import datetime
     inst_cfg = config.INSTRUMENTS[inst_name]
     tz = ZoneInfo(inst_cfg["timezone"])
     now = datetime.now(tz)
