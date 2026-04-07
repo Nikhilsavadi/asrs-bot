@@ -41,27 +41,27 @@ SPECS: dict[str, ContractSpec] = {
         symbol="DAX",
         exchange="EUREX",
         currency="EUR",
-        trading_class="FDXM",          # Mini DAX €5/pt
-        description="Mini DAX Future (€5/pt, EUREX)",
-        expected_multiplier=5.0,
+        trading_class="FDXS",          # Sub-mini DAX €1/pt (~£0.85/pt)
+        description="Sub-Mini DAX Future (€1/pt, EUREX)",
+        expected_multiplier=1.0,
     ),
     "US30": ContractSpec(
         instrument="US30",
-        symbol="MYM",                  # Micro Dow $0.50/pt
+        symbol="MYM",                  # Micro Dow $0.50/pt (~£0.40/pt)
         exchange="CBOT",
         currency="USD",
-        trading_class="",              # MYM doesn't need it
+        trading_class="",
         description="Micro Dow Future ($0.50/pt, CBOT)",
         expected_multiplier=0.5,
     ),
     "NIKKEI": ContractSpec(
         instrument="NIKKEI",
-        symbol="NKD",                  # Nikkei USD $5/pt — matches firstrate backtest
+        symbol="NIY",                  # Nikkei Yen ¥500/pt (~£2.65/pt)
         exchange="CME",
-        currency="USD",
+        currency="JPY",
         trading_class="",
-        description="Nikkei 225 USD Future ($5/pt, CME)",
-        expected_multiplier=5.0,
+        description="Nikkei 225 Yen Future (¥500/pt, CME)",
+        expected_multiplier=500.0,
     ),
 }
 
@@ -78,12 +78,19 @@ def _make_search_contract(spec: ContractSpec) -> Future:
     return Future(**kwargs)
 
 
+QUARTERLY_MONTHS = {3, 6, 9, 12}
+
+
 async def resolve_front_month(
     instrument: str, session, lookahead_days: int = 3,
+    quarterly_only: bool = True,
 ) -> tuple[Contract | None, str | None]:
     """
     Query IBKR for the actual contract calendar of `instrument` and pick
-    the nearest expiry that is > today + lookahead_days.
+    the nearest expiry that is > today + lookahead_days. By default only
+    quarterly (Mar/Jun/Sep/Dec) expiries are considered — skips monthly
+    serials that may exist (e.g. NIY May/Jul/Aug) which are usually low
+    liquidity.
 
     Returns (contract, expiry_str) or (None, None) on failure.
     """
@@ -110,10 +117,21 @@ async def resolve_front_month(
             exp_date = datetime.strptime(c.lastTradeDateOrContractMonth, "%Y%m%d").date()
         except Exception:
             continue
-        if exp_date > cutoff:
-            candidates.append((exp_date, c))
+        if exp_date <= cutoff:
+            continue
+        if quarterly_only and exp_date.month not in QUARTERLY_MONTHS:
+            continue
+        candidates.append((exp_date, c))
 
     if not candidates:
+        # Fallback: relax quarterly filter if nothing found
+        if quarterly_only:
+            logger.warning(
+                f"{instrument}: no quarterly expiry found, falling back to any month"
+            )
+            return await resolve_front_month(
+                instrument, session, lookahead_days, quarterly_only=False
+            )
         logger.error(f"No future expiries found for {instrument}")
         return None, None
 

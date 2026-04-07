@@ -322,7 +322,7 @@ def insert_trade(instrument: str, trade: dict, state=None) -> int:
         trade.get("exit_reason", ""),
         trade.get("stake_per_point", trade.get("stake", 1)),
         cum_pnl,
-        "demo" if os.environ.get("IG_DEMO", "true").lower() == "true" else "live",
+        _trade_mode_label(),
     ))
     conn.commit()
 
@@ -342,6 +342,16 @@ def _state_or(state, attr, default):
     if state and hasattr(state, attr):
         return getattr(state, attr)
     return default
+
+
+def _trade_mode_label() -> str:
+    """Return 'paper'/'demo'/'live' based on the broker stack and its sub-mode."""
+    broker = os.environ.get("BROKER_TYPE", "ig").lower()
+    if broker == "ib" or broker == "ibkr":
+        ib_mode = os.environ.get("IB_TRADING_MODE", "paper").lower()
+        return "paper" if ib_mode == "paper" else "live"
+    # IG path (existing semantics)
+    return "demo" if os.environ.get("IG_DEMO", "true").lower() == "true" else "live"
 
 
 # ── Queries ───────────────────────────────────────────────────────────────
