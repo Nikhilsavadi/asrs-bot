@@ -216,7 +216,11 @@ class IGBroker:
             # Fire callbacks to strategy
             for cb in self._on_stop_callbacks:
                 try:
-                    await cb({"exit_price": actual_exit, "direction": direction})
+                    await cb({
+                        "exit_price": actual_exit,
+                        "exit_intended": exit_price,  # tick price at detection
+                        "direction": direction,
+                    })
                 except Exception as e:
                     logger.error(f"Stop exit callback error: {e}", exc_info=True)
 

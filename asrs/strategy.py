@@ -240,12 +240,13 @@ class Signal:
     async def _on_stop_exit(self, result: dict):
         """Called by broker when tick-based stop monitor triggers a market close."""
         exit_price = result["exit_price"]
+        exit_intended = result.get("exit_intended", exit_price)
         logger.info(f"[{self.name}] Tick stop exit at {exit_price}")
         self.load_state()
         if self.state.phase not in (Phase.LONG, Phase.SHORT):
             logger.warning(f"[{self.name}] Stop exit but phase={self.state.phase} — ignoring")
             return
-        await self._process_exit(exit_price)
+        await self._process_exit(exit_price, exit_intended=exit_intended)
 
     # =========================================================================
     #  morning_routine -- calculate levels, arm bracket (R1-R11)
@@ -775,16 +776,15 @@ class Signal:
     #  Exit processing (R18, R19, R20, R21, R22)
     # =========================================================================
 
-    async def _process_exit(self, exit_price: float):
+    async def _process_exit(self, exit_price: float, exit_intended: float | None = None):
         """
         Stop hit or EOD close. Log trade, check re-entry.
-        R18: Process exit, log to journal.
-        R20: After ANY exit, re-arm BOTH directions at ORIGINAL bar levels.
-        R21: MAX_ENTRIES check before re-entry.
-        R22: Re-entry uses original bar_high/bar_low + buffer.
+        exit_intended: tick price at stop detection (for slippage calculation)
         """
         direction = self.state.direction
         entry = self.state.entry_price
+        if exit_intended is None:
+            exit_intended = exit_price
 
         # P&L calculation
         if direction == "LONG":
@@ -817,10 +817,18 @@ class Signal:
         else:
             exit_reason = "INITIAL_STOP"
 
+        # Exit slippage: difference between actual fill and tick at detection
+        if direction == "LONG":
+            exit_slip = round(exit_price - exit_intended, 1)
+        else:
+            exit_slip = round(exit_intended - exit_price, 1)
+
         # Update trade log
         if self.state.trades:
             t = self.state.trades[-1]
             t["exit"] = exit_price
+            t["exit_intended"] = exit_intended
+            t["exit_slippage"] = exit_slip
             t["exit_time"] = datetime.now(self.tz).strftime("%H:%M")
             t["pnl_pts"] = round(total_pnl, 1)
             t["pnl_original"] = pnl_original
