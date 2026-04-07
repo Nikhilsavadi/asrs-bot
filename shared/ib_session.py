@@ -32,7 +32,9 @@ class IBSharedSession:
     def __init__(self):
         self.ib: IB = IB()
         self._host = os.getenv("IB_HOST", "127.0.0.1")
-        self._port = int(os.getenv("IB_PORT", "7497"))  # 7497 paper, 7496 live
+        # IB Gateway: 4002 paper / 4001 live
+        # TWS desktop: 7497 paper / 7496 live
+        self._port = int(os.getenv("IB_PORT", "4002"))
         self._client_id = int(os.getenv("IB_CLIENT_ID", "1"))
         self._timeout = int(os.getenv("IB_TIMEOUT", "15"))
         self._lock = asyncio.Lock()
@@ -54,7 +56,7 @@ class IBSharedSession:
 
     @property
     def is_paper(self) -> bool:
-        return self._port == 7497
+        return self._port in (4002, 7497)
 
     @property
     def mode(self) -> str:
@@ -123,6 +125,13 @@ class IBSharedSession:
                 f"IB connected ({self.mode}) "
                 f"{self._host}:{self._port} clientId={self._client_id}"
             )
+            # Market data type: 1=live, 2=frozen, 3=delayed, 4=delayed-frozen.
+            # Default to 3 (delayed) so the bot works without paid subscriptions
+            # in paper. Override via IB_MARKET_DATA_TYPE env when subscriptions
+            # are active.
+            mdt = int(os.getenv("IB_MARKET_DATA_TYPE", "3"))
+            self.ib.reqMarketDataType(mdt)
+            logger.info(f"Market data type: {mdt} (1=live, 3=delayed)")
             return True
         except (asyncio.TimeoutError, ConnectionRefusedError) as e:
             logger.error(f"IB connect failed: {type(e).__name__}: {e}")

@@ -39,7 +39,9 @@ from ib_async import (
 
 from shared.ib_session import IBSharedSession
 from shared.ib_stream import IBStreamManager, contract_key
-from asrs.contract_resolver import ContractSpec, get_spec, make_future, days_to_expiry
+from asrs.contract_resolver import (
+    ContractSpec, get_spec, resolve_front_month, days_to_expiry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -92,15 +94,23 @@ class IBBroker:
     # ── Connection ───────────────────────────────────────────────────
 
     async def connect(self) -> bool:
-        """Connect via shared session, qualify contract, subscribe streams."""
+        """Connect via shared session, resolve front-month, subscribe streams."""
         if not await self._shared.ensure_connected():
             self.connected = False
             return False
 
-        contract = make_future(self.instrument, self._expiry)
+        # Dynamically resolve front-month from IBKR's contract calendar
+        # (handles CBOT/CME/EUREX expiry quirks without hardcoding rules)
+        contract, expiry = await resolve_front_month(self.instrument, self._shared)
+        if contract is None:
+            logger.error(f"Failed to resolve {self.instrument} front-month")
+            self.connected = False
+            return False
+
+        # qualify to populate conId + secIdList
         qualified = await self._shared.qualify(contract)
         if qualified is None:
-            logger.error(f"Failed to qualify {self.instrument} future")
+            logger.error(f"Failed to qualify {self.instrument} contract")
             self.connected = False
             return False
 
@@ -483,15 +493,23 @@ class IBBroker:
                 await asyncio.sleep(0.1)
                 if trade.orderStatus.status in ("Filled", "Cancelled", "Inactive"):
                     break
+                if trade.fills:
+                    break
 
             status = trade.orderStatus.status
-            if status != "Filled":
+            # Some statuses like "Submitted" with fills present mean it filled
+            # before the status field caught up. Treat fills as authoritative.
+            if status not in ("Filled",) and not trade.fills:
                 logger.error(
                     f"Market order not filled ({self.instrument}): status={status}"
                 )
                 return {"error": f"status={status}"}
 
             fill_price = float(trade.orderStatus.avgFillPrice or 0)
+            if not fill_price and trade.fills:
+                prices = [float(f.execution.price) for f in trade.fills if f.execution.price]
+                if prices:
+                    fill_price = sum(prices) / len(prices)
             order_id = str(trade.order.orderId)
 
             # Track deal — use orderId as the key (mirrors IG deal_id)
@@ -616,19 +634,30 @@ class IBBroker:
                     continue
                 action = "SELL" if pos.position > 0 else "BUY"
                 qty = abs(int(pos.position))
-                order = MarketOrder(action=action, totalQuantity=qty)
+                order = MarketOrder(
+                    action=action, totalQuantity=qty,
+                    tif="DAY",  # explicit to avoid IBKR preset warning 10349
+                )
                 trade = self._shared.ib.placeOrder(self.contract, order)
 
-                # Wait for fill
+                # Wait for fill (Filled OR fills list populated)
                 for _ in range(50):
                     await asyncio.sleep(0.1)
                     if trade.orderStatus.status in ("Filled", "Cancelled", "Inactive"):
                         break
-                if trade.orderStatus.status == "Filled":
-                    fill = float(trade.orderStatus.avgFillPrice or 0)
-                    if fill:
-                        closed_fills.append(fill)
-                    total_closed += qty
+                    if trade.fills:  # paper sometimes fills before status updates
+                        break
+
+                # Capture fill price — try avgFillPrice first, then trade.fills
+                fill = float(trade.orderStatus.avgFillPrice or 0)
+                if not fill and trade.fills:
+                    # Average the executions
+                    prices = [float(f.execution.price) for f in trade.fills if f.execution.price]
+                    if prices:
+                        fill = sum(prices) / len(prices)
+                if fill:
+                    closed_fills.append(fill)
+                total_closed += qty
 
             self._last_close_fills = closed_fills
 
@@ -661,6 +690,10 @@ class IBBroker:
             total = 0.0
             weighted = 0.0
             direction = ""
+            try:
+                mult = float(self.contract.multiplier or 1) or 1.0
+            except (ValueError, TypeError):
+                mult = 1.0
             for pos in self._shared.ib.positions():
                 if pos.contract.conId != self.contract.conId:
                     continue
@@ -668,9 +701,8 @@ class IBBroker:
                     continue
                 sign_dir = "BUY" if pos.position > 0 else "SELL"
                 size = abs(float(pos.position))
-                avg = float(pos.avgCost or 0) / (self.contract.multiplier or 1) \
-                    if isinstance(self.contract.multiplier, (int, float)) and self.contract.multiplier \
-                    else float(pos.avgCost or 0)
+                # IBKR's avgCost is fill_price * multiplier; divide back to get per-unit price
+                avg = float(pos.avgCost or 0) / mult
                 if not direction:
                     direction = sign_dir
                 total += size

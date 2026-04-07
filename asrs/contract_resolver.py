@@ -1,14 +1,15 @@
 """
-contract_resolver.py — Map ASRS instrument names to IBKR Future contract specs.
+contract_resolver.py — Map ASRS instrument names to IBKR Future specs.
 
-Handles:
-  - Per-instrument symbol / exchange / multiplier metadata
-  - Quarterly front-month resolution (3rd Friday of Mar/Jun/Sep/Dec)
-  - Days-to-expiry calculation
-  - Roll-warning threshold
+Strategy: store the "search template" for each instrument (symbol +
+exchange + currency + tradingClass), then query IBKR's reqContractDetails
+at resolve time to pick the actual front-month contract. This works
+across all the quirks of different exchanges (CBOT 3rd Thursday,
+EUREX 3rd Friday, CME 2nd Thursday for NKD, etc.) without hardcoding
+calendar rules.
 
-The actual qualification (resolving to a real contract) happens via
-IBSharedSession.qualify() — this module just builds the spec.
+Note: requires an active IBSharedSession to resolve (it's a network
+call). Specs alone are static.
 """
 from __future__ import annotations
 
@@ -16,133 +17,137 @@ import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
-from ib_async import Future
+from ib_async import Future, Contract
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class ContractSpec:
-    instrument: str          # ASRS name: "DAX" / "US30" / "NIKKEI"
-    symbol: str              # IBKR symbol: "DAX" / "MYM" / "NIY"
-    trading_class: str       # IBKR tradingClass (often = symbol but not always)
-    exchange: str            # "EUREX" / "CBOT" / "OSE.JPN"
-    currency: str            # "EUR" / "USD" / "JPY"
-    multiplier: int          # contract multiplier in points (€5/pt, $0.50/pt → 0.5, ¥500/pt)
-    multiplier_str: str      # how IBKR labels it (e.g. "5", "0.5")
-    min_tick: float          # minimum price increment
-    description: str         # human-readable label
+    instrument: str
+    symbol: str               # IBKR symbol
+    exchange: str
+    currency: str
+    trading_class: str        # often empty; FDXM uses it
+    description: str
+    expected_multiplier: float  # for sanity checking after resolve
 
 
-# Default sizing strategy: smallest practical contract per instrument
+# Search templates — DO NOT include expiry or multiplier
+# (we let IBKR fill those in via reqContractDetails)
 SPECS: dict[str, ContractSpec] = {
     "DAX": ContractSpec(
         instrument="DAX",
         symbol="DAX",
-        trading_class="FDXM",         # Mini DAX (€5/pt)
         exchange="EUREX",
         currency="EUR",
-        multiplier=5,
-        multiplier_str="5",
-        min_tick=1.0,
-        description="Mini DAX Future (€5/pt)",
+        trading_class="FDXM",          # Mini DAX €5/pt
+        description="Mini DAX Future (€5/pt, EUREX)",
+        expected_multiplier=5.0,
     ),
     "US30": ContractSpec(
         instrument="US30",
-        symbol="MYM",                  # Micro Dow ($0.50/pt)
-        trading_class="MYM",
+        symbol="MYM",                  # Micro Dow $0.50/pt
         exchange="CBOT",
         currency="USD",
-        multiplier=0.5,                # 0.5 USD per index point
-        multiplier_str="0.5",
-        min_tick=1.0,
-        description="Micro Dow Future ($0.50/pt)",
+        trading_class="",              # MYM doesn't need it
+        description="Micro Dow Future ($0.50/pt, CBOT)",
+        expected_multiplier=0.5,
     ),
     "NIKKEI": ContractSpec(
         instrument="NIKKEI",
-        symbol="NIY",                  # Nikkei 225 Yen (¥500/pt)
-        trading_class="NIY",
-        exchange="OSE.JPN",
-        currency="JPY",
-        multiplier=500,                # 500 JPY per index point
-        multiplier_str="500",
-        min_tick=5.0,
-        description="Nikkei 225 Yen Future (¥500/pt)",
+        symbol="NKD",                  # Nikkei USD $5/pt — matches firstrate backtest
+        exchange="CME",
+        currency="USD",
+        trading_class="",
+        description="Nikkei 225 USD Future ($5/pt, CME)",
+        expected_multiplier=5.0,
     ),
 }
 
 
-# ── Quarterly expiry helpers ─────────────────────────────────────────
+def _make_search_contract(spec: ContractSpec) -> Future:
+    """Build a Future spec for reqContractDetails (no expiry, no multiplier)."""
+    kwargs = dict(
+        symbol=spec.symbol,
+        exchange=spec.exchange,
+        currency=spec.currency,
+    )
+    if spec.trading_class:
+        kwargs["tradingClass"] = spec.trading_class
+    return Future(**kwargs)
 
-QUARTERLY_MONTHS = (3, 6, 9, 12)
 
-
-def _third_friday(year: int, month: int) -> date:
-    """3rd Friday of the given month."""
-    first = date(year, month, 1)
-    # weekday(): Mon=0..Sun=6 ; Friday=4
-    days_to_first_friday = (4 - first.weekday()) % 7
-    return first + timedelta(days=days_to_first_friday + 14)
-
-
-def front_month_expiry(today: date | None = None, lookahead_days: int = 0) -> str:
+async def resolve_front_month(
+    instrument: str, session, lookahead_days: int = 3,
+) -> tuple[Contract | None, str | None]:
     """
-    Return the YYYYMMDD string for the next quarterly expiry from `today`.
+    Query IBKR for the actual contract calendar of `instrument` and pick
+    the nearest expiry that is > today + lookahead_days.
 
-    If today is within `lookahead_days` of the current quarterly expiry,
-    return the NEXT quarter (so we don't qualify a contract about to expire).
+    Returns (contract, expiry_str) or (None, None) on failure.
     """
-    today = today or date.today()
-    cutoff = today + timedelta(days=lookahead_days)
+    spec = get_spec(instrument)
+    if not await session.ensure_connected():
+        return None, None
 
-    for offset in range(0, 13):
-        m = today.month + offset
-        y = today.year + (m - 1) // 12
-        m = (m - 1) % 12 + 1
-        if m not in QUARTERLY_MONTHS:
+    search = _make_search_contract(spec)
+    try:
+        details = await session.ib.reqContractDetailsAsync(search)
+    except Exception as e:
+        logger.error(f"reqContractDetails failed for {instrument}: {e}")
+        return None, None
+
+    if not details:
+        logger.error(f"No contracts returned for {instrument}")
+        return None, None
+
+    cutoff = date.today() + timedelta(days=lookahead_days)
+    candidates: list[tuple[date, Contract]] = []
+    for d in details:
+        c = d.contract
+        try:
+            exp_date = datetime.strptime(c.lastTradeDateOrContractMonth, "%Y%m%d").date()
+        except Exception:
             continue
-        expiry = _third_friday(y, m)
-        if expiry > cutoff:
-            return expiry.strftime("%Y%m%d")
-    raise RuntimeError("front_month_expiry: no expiry found in 12 months")
+        if exp_date > cutoff:
+            candidates.append((exp_date, c))
+
+    if not candidates:
+        logger.error(f"No future expiries found for {instrument}")
+        return None, None
+
+    # Sort by date ascending → first one is front-month
+    candidates.sort(key=lambda t: t[0])
+    exp_date, contract = candidates[0]
+
+    # Sanity check multiplier
+    try:
+        mult = float(contract.multiplier)
+        if abs(mult - spec.expected_multiplier) > 0.01:
+            logger.warning(
+                f"{instrument}: multiplier mismatch — got {mult}, expected {spec.expected_multiplier}"
+            )
+    except (ValueError, TypeError):
+        pass
+
+    expiry_str = contract.lastTradeDateOrContractMonth
+    days_left = (exp_date - date.today()).days
+    logger.info(
+        f"Resolved {instrument} front-month: {contract.localSymbol or contract.symbol} "
+        f"expiry={expiry_str} ({days_left}d) mult={contract.multiplier}"
+    )
+    return contract, expiry_str
 
 
 def days_to_expiry(expiry_str: str, today: date | None = None) -> int:
-    """Days from `today` until the expiry date (YYYYMMDD)."""
     today = today or date.today()
     expiry = datetime.strptime(expiry_str, "%Y%m%d").date()
     return (expiry - today).days
 
 
 def should_roll(expiry_str: str, today: date | None = None, threshold_days: int = 7) -> bool:
-    """True if expiry is within `threshold_days` of today."""
     return days_to_expiry(expiry_str, today) <= threshold_days
-
-
-# ── Contract construction ────────────────────────────────────────────
-
-def make_future(instrument: str, expiry: str | None = None) -> Future:
-    """
-    Build an unqualified ib_async.Future for the given ASRS instrument.
-
-    If expiry is None, the front-month is selected (with a 3-day buffer
-    so we never grab a contract about to expire).
-    """
-    spec = SPECS.get(instrument)
-    if spec is None:
-        raise ValueError(f"Unknown instrument: {instrument}")
-
-    if expiry is None:
-        expiry = front_month_expiry(lookahead_days=3)
-
-    return Future(
-        symbol=spec.symbol,
-        lastTradeDateOrContractMonth=expiry,
-        exchange=spec.exchange,
-        currency=spec.currency,
-        tradingClass=spec.trading_class,
-        multiplier=spec.multiplier_str,
-    )
 
 
 def get_spec(instrument: str) -> ContractSpec:
@@ -154,3 +159,25 @@ def get_spec(instrument: str) -> ContractSpec:
 
 def all_instruments() -> list[str]:
     return list(SPECS.keys())
+
+
+# ── Compatibility shim for code that imports the old static API ─────
+# (kept so existing tests / scripts don't break)
+
+def make_future(instrument: str, expiry: str | None = None) -> Future:
+    """
+    Build an unqualified Future spec for an instrument.
+    If expiry is given, use it directly; otherwise return a search-style
+    spec that resolve_front_month() can use to look up the actual contract.
+
+    Note: when expiry is None this returns a contract WITHOUT a specific
+    expiry, which is only useful for reqContractDetails search — not for
+    qualifyContractsAsync. Use resolve_front_month() for actual qualification.
+    """
+    spec = get_spec(instrument)
+    kwargs = dict(symbol=spec.symbol, exchange=spec.exchange, currency=spec.currency)
+    if spec.trading_class:
+        kwargs["tradingClass"] = spec.trading_class
+    if expiry:
+        kwargs["lastTradeDateOrContractMonth"] = expiry
+    return Future(**kwargs)

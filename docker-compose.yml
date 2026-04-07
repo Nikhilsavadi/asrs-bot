@@ -1,4 +1,28 @@
 services:
+  ibgateway:
+    image: ghcr.io/gnzsnz/ib-gateway:latest
+    container_name: asrs-ibgateway
+    restart: unless-stopped
+    profiles: ["ib"]    # only starts when --profile ib is passed
+    network_mode: host  # bot connects via 127.0.0.1, no IP whitelist gymnastics
+    environment:
+      TWS_USERID: ${IB_USERNAME}
+      TWS_PASSWORD: ${IB_PASSWORD}
+      TRADING_MODE: ${IB_TRADING_MODE:-paper}      # paper | live
+      READ_ONLY_API: "no"
+      BYPASS_WARNING: "yes"
+      TWS_ACCEPT_INCOMING: "accept"
+      AUTO_RESTART_TIME: "11:59 PM"
+      RELOGIN_AFTER_TWOFA_TIMEOUT: "yes"
+      TIME_ZONE: "Europe/London"
+    volumes:
+      - ibgateway-data:/home/ibgateway/Jts
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   bot:
     build:
       context: .
@@ -12,7 +36,20 @@ services:
         max-file: "3"
     env_file:
       - .env
+    environment:
+      # When BROKER_TYPE=ib, point at the gateway container hostname
+      IB_HOST: ${IB_HOST:-ibgateway}
+      IB_PORT: ${IB_PORT:-4002}
     ports:
       - "8080:8080"
     volumes:
       - ./data:/app/data
+    depends_on:
+      ibgateway:
+        condition: service_started
+        required: false
+
+volumes:
+  ibgateway-data:
+    name: asrs-bot_ibgateway-data    # reuse the existing volume from prior IBKR setup
+    external: true
