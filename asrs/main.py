@@ -24,7 +24,7 @@ from apscheduler.events import EVENT_JOB_MISSED, EVENT_JOB_ERROR, EVENT_JOB_EXEC
 
 from asrs import config
 from asrs.strategy import Signal
-from asrs.broker import IGBroker
+from asrs.broker_factory import get_broker_stack
 from asrs.stream import register_bar_callback
 from asrs.alerts import send as tg_send
 
@@ -253,47 +253,28 @@ async def main():
     migrate_csv()
     seed_scaling_ladder(os.getenv("SCALING_LADDER", ""), "ALL")
 
-    # -- Shared IG session (ONE REST + ONE Lightstreamer) ---------------------
-    from shared.ig_session import IGSharedSession
-    from shared.ig_stream import IGStreamManager
-
-    shared = IGSharedSession.get_instance()
-    await shared.connect()
-    stream_mgr = IGStreamManager(shared)
-
-    # Subscribe to trades stream
-    if shared.acc_number:
-        await stream_mgr.subscribe_trades(shared.acc_number)
-
-    # Re-subscribe all streams after reconnect
-    shared.on_reconnect(stream_mgr.resubscribe_all)
+    # -- Broker stack (IG or IBKR based on BROKER_TYPE env) ------------------
+    stack = get_broker_stack()
+    await stack.connect_session()
+    shared = stack.shared
+    stream_mgr = stack.stream
+    await stack.post_session_setup()
 
     # -- Create broker + signal instances per instrument ----------------------
     signals: dict[str, Signal] = {}  # keyed by "DAX_S1", "DAX_S2", etc.
 
     for inst_name, inst_cfg in config.INSTRUMENTS.items():
-        epic = inst_cfg["epic"]
-        currency = inst_cfg["currency"]
-
-        # Subscribe to streaming for this epic (safe to call multiple times)
-        await stream_mgr.subscribe_ticks(epic)
-        await stream_mgr.subscribe_candles(epic)
-
-        # One broker PER SIGNAL (not per epic) so each signal tracks its
-        # own deal IDs independently. Brokers share the same IG session
-        # and stream manager -- only the local order state differs.
-        # Note: S2's broker registers a second tick callback on the same
-        # epic, which is fine -- IGStreamManager supports multiple callbacks.
         # Determine how many sessions (2 or 3) based on config
         max_session = 3 if f"s3_open_hour" in inst_cfg else 2
         inst_signals = []
 
+        # One broker PER SIGNAL (not per epic) so each signal tracks its
+        # own deal IDs independently. Brokers share the same session
+        # and stream manager -- only the local order state differs.
         for sn in range(1, max_session + 1):
-            broker = IGBroker(
-                shared, stream_mgr, epic, currency,
-                disaster_stop_pts=inst_cfg["disaster_stop_pts"],
-                max_spread_pts=inst_cfg["max_spread"],
-            )
+            broker = stack.make_broker(inst_name, inst_cfg)
+            await broker.connect()
+
             signal = Signal(inst_name, sn, broker, stream_mgr, tg_send)
             key = f"{inst_name}_S{sn}"
             signals[key] = signal
@@ -302,7 +283,7 @@ async def main():
 
             # Register tick trigger callback on this signal's broker
             broker.register_trigger_callback(signal.on_tick_trigger)
-            logger.info(f"Signal created: {key} (epic={epic})")
+            logger.info(f"Signal created: {key} (broker={stack.kind}, epic={broker.epic})")
 
         # Link siblings: each session cancels previous session's bracket
         for i in range(1, len(inst_signals)):
@@ -310,10 +291,12 @@ async def main():
             inst_signals[i].set_sibling(inst_signals[i - 1])
 
         # Register candle callback -- fires on_bar_complete for all sessions
+        # Use the first broker's epic/contract_key as the stream key
+        stream_key = inst_signals[0].broker.epic
         async def _on_bar(bar, _sigs=inst_signals):
             for sig in _sigs:
                 await sig.on_bar_complete(bar)
-        register_bar_callback(stream_mgr, epic, _on_bar)
+        register_bar_callback(stream_mgr, stream_key, _on_bar)
 
     # -- Position Reconciliation (before scheduler starts) --------------------
     await reconcile_positions(signals, shared, stream_mgr, tg_send)
