@@ -59,6 +59,10 @@ class IBStreamManager:
         self._candle_bars: dict[str, deque] = {}
         self._last_bar_emit: dict[str, datetime] = {}
 
+        # In-progress 5-min bar being built from ticks per key
+        # Schema: {"start": datetime, "open": f, "high": f, "low": f, "close": f, "volume": int}
+        self._building_bar: dict[str, dict] = {}
+
         # Callbacks: key → list of callables
         self._tick_callbacks: dict[str, list[Callable]] = {}
         self._candle_callbacks: dict[str, list[Callable]] = {}
@@ -97,9 +101,13 @@ class IBStreamManager:
         self, contract: Contract, what: str = "TRADES", use_rth: bool = True,
     ) -> str:
         """
-        Subscribe to live-updating 5-min historical bars for a contract.
-        Uses reqHistoricalDataAsync with keepUpToDate=True so IBKR streams
-        bar updates as they form.
+        Pre-load today's 5-min bars from IBKR REST then rely on the
+        in-process tick-bar builder for live updates.
+
+        Why no keepUpToDate=True: in production we observed bar update
+        events stalling 10+ minutes. The tick aggregator (fed by
+        pendingTickersEvent) is more reliable because we control the
+        timing — every tick → bar update.
         """
         key = contract_key(contract)
         if key in self._bar_lists:
@@ -119,8 +127,8 @@ class IBStreamManager:
                 barSizeSetting="5 mins",
                 whatToShow=what,
                 useRTH=use_rth,
-                formatDate=2,             # UTC
-                keepUpToDate=True,
+                formatDate=2,
+                keepUpToDate=False,        # one-shot warmup; live updates via ticks
             )
             if bars is None:
                 logger.error(f"reqHistoricalDataAsync returned None for {key}")
@@ -133,10 +141,10 @@ class IBStreamManager:
             for b in bars:
                 self._record_bar(key, b)
 
-            # Wire updateEvent so we get notified on every bar update
-            bars.updateEvent += lambda bl, has_new_bar: self._on_bar_update(key, bl, has_new_bar)
-
-            logger.info(f"IB candles subscribed: {key} ({len(bars)} initial bars)")
+            logger.info(
+                f"IB candles pre-loaded: {key} ({len(bars)} bars). "
+                f"Live updates via tick aggregator."
+            )
         except Exception as e:
             logger.error(f"reqHistoricalDataAsync failed for {key}: {e}", exc_info=True)
         return key
@@ -173,12 +181,79 @@ class IBStreamManager:
             self._prices[f"{key}_ofr"] = ofr
             self._prices[f"{key}_time"] = now_ts
 
+            # Feed the in-process 5-min bar builder
+            self._feed_tick_to_bar(key, mid)
+
             # Fire tick callbacks
             for cb in self._tick_callbacks.get(key, []):
                 try:
                     cb(mid, bid, ofr)
                 except Exception as e:
                     logger.error(f"Tick callback error ({key}): {e}", exc_info=True)
+
+    def _feed_tick_to_bar(self, key: str, price: float) -> None:
+        """
+        Aggregate ticks into 5-min OHLC bars in-process. Replaces the
+        unreliable reqHistoricalData(keepUpToDate=True) update path.
+
+        Bar boundary: floor of UTC minute / 5 * 5 (00, 05, 10, 15, ...).
+        When a tick arrives in a new 5-min window, finalise the in-progress
+        bar (write to deque, fire candle callbacks) and start a new one.
+        """
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        bar_start = now.replace(minute=(now.minute // 5) * 5)
+        cur = self._building_bar.get(key)
+
+        if cur is None:
+            self._building_bar[key] = {
+                "start": bar_start,
+                "open": price, "high": price, "low": price, "close": price,
+                "volume": 1,
+            }
+            return
+
+        if cur["start"] == bar_start:
+            # same window — update OHLC
+            if price > cur["high"]:
+                cur["high"] = price
+            if price < cur["low"]:
+                cur["low"] = price
+            cur["close"] = price
+            cur["volume"] += 1
+            return
+
+        # New window — finalise the previous bar and start fresh
+        completed = {
+            "time": cur["start"],
+            "Open": cur["open"], "High": cur["high"],
+            "Low": cur["low"], "Close": cur["close"],
+            "Volume": cur["volume"],
+        }
+        deck = self._candle_bars.setdefault(key, deque(maxlen=500))
+        # Replace if last bar has same timestamp (e.g. from REST pre-load)
+        if deck and deck[-1]["time"] == completed["time"]:
+            deck[-1] = completed
+        else:
+            deck.append(completed)
+        self._last_bar_emit[key] = datetime.now(timezone.utc)
+
+        # Fire candle callbacks for the completed bar
+        for cb in self._candle_callbacks.get(key, []):
+            try:
+                if asyncio.iscoroutinefunction(cb):
+                    if self._loop:
+                        self._loop.create_task(cb(completed))
+                else:
+                    cb(completed)
+            except Exception as e:
+                logger.error(f"Candle callback error ({key}): {e}", exc_info=True)
+
+        # Start new in-progress bar
+        self._building_bar[key] = {
+            "start": bar_start,
+            "open": price, "high": price, "low": price, "close": price,
+            "volume": 1,
+        }
 
     # ── Candle handling ────────────────────────────────────────────
 

@@ -598,9 +598,21 @@ async def main():
             return
         shutdown_triggered = True
         logger.info("=== SHUTDOWN ===")
-        scheduler.shutdown(wait=False)
-        await stream_mgr.unsubscribe_all()
-        await shared.disconnect()
+        try:
+            scheduler.shutdown(wait=False)
+        except Exception:
+            pass
+        # IG stream has unsubscribe_all; IB stream doesn't (its lifecycle
+        # is tied to the IB connection itself)
+        if hasattr(stream_mgr, "unsubscribe_all"):
+            try:
+                await stream_mgr.unsubscribe_all()
+            except Exception as e:
+                logger.warning(f"Stream unsubscribe failed: {e}")
+        try:
+            await shared.disconnect()
+        except Exception:
+            pass
         loop.stop()
 
     def _handle_signal():
