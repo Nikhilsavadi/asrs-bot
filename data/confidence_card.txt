@@ -1,56 +1,47 @@
 ============================================================
   CONFIDENCE CARD — ASRS STRATEGY
-  Keep this for bad days
+  8 signals | 3 entries | Updated April 2026
 ============================================================
 
   THE EDGE
   ──────────────────────────────────────────────────
-  PF: 2.58 | 21,127 trades | 6+ years
-  Win rate: 51% | Avg win: +52pts | Avg loss: -21pts
-  Zero losing years. Zero losing signals.
+  PF: 3.86 | 42,564 trades | 8+ years
+  Win rate: 54% | Avg win: +66pts | Avg loss: -20pts
+  Reward:Risk: 3.3:1
+  Zero losing years. Zero losing months.
   10,000 Monte Carlo sims: ALL profitable
 
   LOSING IS NORMAL
   ──────────────────────────────────────────────────
-  25% of days are losing days (521 out of 2,121)
-  75% of days are winning days
-  Only 3% of days have zero wins
-  Max consecutive losing days: 5
-
-  WORST LOSING STREAKS & THEIR RECOVERIES
-  ──────────────────────────────────────────────────
-  2021-04-14 to 2021-04-20: 5 days, -288pts → recovered in 3 days
+  11% of days are losing days (237 out of 2,121)
+  89% of days are winning days
+  Only 1% of weeks are losing weeks (3 out of 429)
+  Max consecutive losing days: 3
 
   MONTHLY CONSISTENCY
   ──────────────────────────────────────────────────
   Losing months: 0/99 (0%)
-  Worst month: +267pts
-  Best month: +8,307pts
-  Average month: +3,288pts
+  Worst month: +1,108pts
+  Best month: +31,028pts
+  Average month: +11,083pts
 
   AFTER A BAD DAY (-50pts or worse)
   ──────────────────────────────────────────────────
-  Bad days (≤-50pts): 262
-  Next day avg: +148.8pts (71% positive)
-  Next 5 days avg: +799.9pts (95% positive)
+  Bad days (<=−50pts): 133
+  Next day avg: +388pts (86% positive)
+  Next 5 days avg: +2173pts (100% positive)
 
-  10 WORST DAYS & WHAT FOLLOWED
+  CONSERVATIVE PROJECTIONS (50% haircut)
   ──────────────────────────────────────────────────
-  2026-03-09:     -631pts (12 trades) → next day:     +409pts
-  2025-03-05:     -398pts (12 trades) → next day:      +25pts
-  2021-12-06:     -377pts (12 trades) → next day:     +595pts
-  2026-01-20:     -315pts (12 trades) → next day:      +32pts
-  2023-03-10:     -296pts (12 trades) → next day:      -99pts
-  2021-03-05:     -261pts (12 trades) → next day:     -106pts
-  2025-03-21:     -254pts (12 trades) → next day:     +266pts
-  2022-05-09:     -251pts (12 trades) → next day:     -227pts
-  2022-05-03:     -248pts (12 trades) → next day:     +100pts
-  2026-03-13:     -246pts (4 trades) → next day:    +1098pts
+  At £1/pt fixed: ~£64,544/year
+  Monte Carlo (£6k start): £18,538,691
+  Risk of ruin: 0.0%
 
   ══════════════════════════════════════════════════
   TODAY'S LOSS IS THE PRICE OF TOMORROW'S GAIN
   ──────────────────────────────────────────────────
-  Every £1 risked has returned £2.58
-  The strategy has NEVER had a losing year
-  After the worst days, average next-5-day return: +800pts
+  Every £1 risked has returned £3.86
+  The strategy has NEVER had a losing month
+  89% of days are winners
+  Only 3/429 weeks lost money in 8 years
   ══════════════════════════════════════════════════

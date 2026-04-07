@@ -193,9 +193,17 @@ async def check_stream_health_all(shared_session, stream_mgr, tg_send, signals=N
         logger.warning(alert_msg)
         await tg_send(alert_msg)
 
-        # Attempt resubscribe via existing check_stream_health
+        # Attempt resubscribe — broker-agnostic path
         try:
-            ok = await shared_session.check_stream_health(stream_mgr, epic)
+            if hasattr(shared_session, "check_stream_health"):
+                # IG path: shared.check_stream_health() exists on IGSharedSession
+                ok = await shared_session.check_stream_health(stream_mgr, epic)
+            elif hasattr(stream_mgr, "resubscribe_all"):
+                # IB path: just resubscribe everything
+                await stream_mgr.resubscribe_all()
+                ok = True
+            else:
+                ok = False
             if ok:
                 _resub_fail_count[epic] = 0
                 logger.info(f"[{inst_name}] Stream resubscribe successful")
@@ -395,7 +403,12 @@ async def main():
 
     # -- Session keepalive every 10 minutes -----------------------------------
     async def _keepalive():
-        await shared.keepalive()
+        # IG path: REST keepalive ping. IB path: ensure_connected keeps the
+        # ib_async socket alive (no equivalent REST endpoint).
+        if hasattr(shared, "keepalive"):
+            await shared.keepalive()
+        elif hasattr(shared, "ensure_connected"):
+            await shared.ensure_connected()
 
     scheduler.add_job(_keepalive, "interval", minutes=10,
         id="ig_keepalive", misfire_grace_time=60)
@@ -563,11 +576,17 @@ async def main():
     # -- Telegram command handler ---------------------------------------------
     try:
         import telegram_cmd
+        # Pass any available broker as fallback for legacy commands.
+        # Order: prefer DAX_S1, then US30_S1, then NIKKEI_S1, then any.
+        fallback_broker = None
+        for key in ("DAX_S1", "US30_S1", "NIKKEI_S1"):
+            if key in signals:
+                fallback_broker = signals[key].broker
+                break
+        if fallback_broker is None and signals:
+            fallback_broker = next(iter(signals.values())).broker
         loop.create_task(
-            telegram_cmd.poll_commands(
-                # Pass first DAX broker for backward compat with /kill etc
-                dax_broker=signals["DAX_S1"].broker
-            )
+            telegram_cmd.poll_commands(dax_broker=fallback_broker)
         )
     except ImportError:
         logger.warning("telegram_cmd not available")

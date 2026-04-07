@@ -39,36 +39,32 @@ BAR5_RULES = [r.strip() for r in os.getenv("BAR5_RULES", "NORMAL,WIDE").split(",
 # -- Per-instrument configuration ---------------------------------------------
 INSTRUMENTS = {
     "DAX": {
+        # Re-enabled 2026-04-07 after IBKR FDAX 2yr backtest:
+        # PF 6.20 (filtered liquid days), max DD -227pts, 64% win rate.
+        # Realistic live expectation 3.5-4.5 after slippage. Trades FDXS
+        # (sub-mini €1/pt = £0.85/pt) for £43 max loss per trade on £5k.
         "epic": "IX.D.DAX.DAILY.IP",
         "currency": "GBP",
         "label": "DAX 40",
-        # Entry levels
         "buffer": 2.0,
         "narrow_range": 15,
         "wide_range": 40,
-        # Risk management
         "max_risk_gbp": 50.0,
         "max_entries": 3,
         "max_bar_range": 120,
         "max_spread": 10.0,
         "max_slippage_pct": 0.5,
         "disaster_stop_pts": 200,
-        # Trail
         "breakeven_pts": 15.0,
         "tight_threshold": 100.0,
         "trail_min_move": 3.0,
-        # Adds
         "add_trigger": 25.0,
         "add_max": 2,
-        # Session 1: times in instrument timezone
         "s1_open_hour": 9, "s1_open_minute": 0,
-        # Session 2
         "s2_open_hour": 14, "s2_open_minute": 0,
-        # Session end (force close)
         "session_end_hour": 17, "session_end_minute": 30,
-        # Timezones
         "timezone": "Europe/Berlin",
-        "scheduler_timezone": "Europe/Berlin",  # Config hours are CET — scheduler must use CET
+        "scheduler_timezone": "Europe/Berlin",
     },
     "US30": {
         "epic": "IX.D.DOW.DAILY.IP",
