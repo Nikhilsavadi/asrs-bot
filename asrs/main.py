@@ -54,95 +54,69 @@ _resub_fail_count: dict[str, int] = {}
 
 async def reconcile_positions(signals, shared_session, stream_mgr, tg_send):
     """
-    Reconcile open IG positions with signal state on startup.
+    Reconcile broker positions with signal state on startup.
 
-    After a VPS restart mid-trade, the bot has no in-memory state.
-    This fetches all open positions from IG and matches each to the
-    correct signal by epic + direction, restoring LONG/SHORT state
-    and activating the disaster stop monitor.
+    Uses each broker's get_position() method (broker-agnostic) so works
+    for both IG and IB. If broker reports a non-flat position, restore
+    the signal's LONG/SHORT phase and arm the stop monitor.
     """
     try:
-        positions = await shared_session.rest_call(
-            shared_session.ig.fetch_open_positions
-        )
-        if positions is None:
-            logger.info("Reconciliation: No open positions -- clean start")
-            return
-
-        pos_list = (positions if isinstance(positions, list)
-                    else positions.to_dict("records") if hasattr(positions, "to_dict")
-                    else [])
-
-        if not pos_list:
-            logger.info("Reconciliation: No open positions -- clean start")
-            return
-
-        # Build epic -> list of positions
-        epic_positions: dict[str, list] = {}
-        for pos in pos_list:
-            epic = pos.get("epic", "")
-            epic_positions.setdefault(epic, []).append(pos)
-
+        from asrs.strategy import Phase
         matched = 0
+        seen_brokers: set[int] = set()  # one broker can serve multiple signals
+
         for key, signal in signals.items():
-            epic = signal.cfg["epic"]
-            if epic not in epic_positions:
+            broker_id = id(signal.broker)
+            # Each broker only reports its own contract's position; multiple
+            # signals share a broker per instrument, so skip duplicates
+            if broker_id in seen_brokers:
                 continue
 
-            for pos in epic_positions[epic]:
-                direction_raw = pos.get("direction", "")
-                direction = "LONG" if direction_raw == "BUY" else "SHORT"
-                entry_level = float(pos.get("level") or pos.get("openLevel", 0))
-                size = float(pos.get("dealSize") or pos.get("size", 0))
-                deal_id = pos.get("dealId", "")
+            try:
+                pos = await signal.broker.get_position()
+            except Exception as e:
+                logger.warning(f"Reconcile {key}: get_position failed: {e}")
+                continue
 
-                if entry_level <= 0:
-                    continue
+            if pos.get("direction", "FLAT") == "FLAT":
+                continue
 
-                # Only reconcile signals that are currently IDLE or have no position
-                from asrs.strategy import Phase
-                if signal.state.phase in (Phase.LONG, Phase.SHORT):
-                    continue  # already tracking a position
+            # Skip signals that already have an in-memory position
+            if signal.state.phase in (Phase.LONG, Phase.SHORT):
+                seen_brokers.add(broker_id)
+                continue
 
-                # Set signal state
-                signal.state.phase = Phase.LONG if direction == "LONG" else Phase.SHORT
-                signal.state.direction = direction
-                signal.state.entry_price = entry_level
-                if deal_id:
-                    signal.state.deal_ids = [deal_id]
+            seen_brokers.add(broker_id)
+            direction = pos["direction"]
+            entry_level = float(pos.get("avg_cost") or 0)
+            if entry_level <= 0:
+                logger.warning(f"Reconcile {key}: entry_level=0, skipping")
+                continue
 
-                # Track deal in broker
-                signal.broker._position_deal_ids[deal_id] = {
-                    "direction": direction_raw, "size": size, "level": entry_level,
-                }
+            signal.state.phase = Phase.LONG if direction == "LONG" else Phase.SHORT
+            signal.state.direction = direction
+            signal.state.entry_price = entry_level
 
-                # Activate disaster stop monitor
-                disaster_pts = signal.cfg["disaster_stop_pts"]
-                if direction == "LONG":
-                    stop_level = entry_level - disaster_pts
-                else:
-                    stop_level = entry_level + disaster_pts
+            # Disaster stop
+            disaster_pts = signal.cfg["disaster_stop_pts"]
+            stop_level = (entry_level - disaster_pts) if direction == "LONG" \
+                else (entry_level + disaster_pts)
+            signal.state.initial_stop = stop_level
+            signal.state.trailing_stop = stop_level
+            signal.broker.activate_stop_monitor(direction, stop_level)
 
-                signal.state.initial_stop = stop_level
-                signal.state.trailing_stop = stop_level
-                signal.broker.activate_stop_monitor(direction, stop_level)
+            signal.save_state()
+            matched += 1
 
-                signal.save_state()
-                matched += 1
-
-                msg = (
-                    f"[{signal.name}] RECONCILED: {direction} @ {entry_level}, "
-                    f"stop monitor active @ {stop_level}"
-                )
-                logger.info(msg)
-                await tg_send(msg)
-
-                # Remove this position so it doesn't match another signal
-                epic_positions[epic].remove(pos)
-                break  # one position per signal
+            msg = (
+                f"[{signal.name}] RECONCILED: {direction} @ {entry_level}, "
+                f"stop monitor @ {stop_level}"
+            )
+            logger.info(msg)
+            await tg_send(msg)
 
         if matched == 0:
-            logger.info("Reconciliation: Positions found but none matched signals")
+            logger.info("Reconciliation: clean start (no open positions)")
 
     except Exception as e:
         logger.error(f"Reconciliation failed: {e}", exc_info=True)
@@ -178,14 +152,22 @@ def _is_market_open(inst_name: str) -> bool:
     return (s1_open - 30) <= cur <= (eod + 30)
 
 
-async def check_stream_health_all(shared_session, stream_mgr, tg_send):
+async def check_stream_health_all(shared_session, stream_mgr, tg_send, signals=None):
     """
-    Check stream health for all epics. Send Telegram alerts on staleness.
-    Track consecutive resubscribe failures -- critical alert after 3.
-    Only checks during market hours to avoid weekend/holiday false alarms.
+    Check stream health for all instruments. Send Telegram alerts on staleness.
+    Uses broker.epic (which is the actual stream key — IG epic for IG,
+    contract_key for IBKR) so it works under both broker stacks.
     """
+    # Build instrument → stream_key from active signals (broker-agnostic)
+    inst_keys: dict[str, str] = {}
+    if signals:
+        for sig in signals.values():
+            inst_keys.setdefault(sig.instrument, sig.broker.epic)
+
     for inst_name, inst_cfg in config.INSTRUMENTS.items():
-        epic = inst_cfg["epic"]
+        epic = inst_keys.get(inst_name) or inst_cfg.get("epic", "")
+        if not epic:
+            continue
 
         # Skip if market is closed (weekend or outside session hours)
         if not _is_market_open(inst_name):
@@ -382,14 +364,16 @@ async def main():
             warmup_m += 60
             warmup_h -= 1
 
-        async def _warmup(b=inst_sigs[0].broker, epic=inst_cfg["epic"], name=inst_name):
+        async def _warmup(b=inst_sigs[0].broker, name=inst_name):
+            # Use broker.epic — IG epic for IG, contract_key for IBKR
+            epic = b.epic
             ok = await b.ensure_connected()
             bar_count = b.get_streaming_bar_count()
             tick_age = stream_mgr.get_tick_age(epic)
             bar_age = stream_mgr.get_last_bar_age(epic) if hasattr(stream_mgr, 'get_last_bar_age') else 0
 
             issues = []
-            if not ok: issues.append("IG connection FAILED")
+            if not ok: issues.append("Broker connection FAILED")
             if bar_count == 0: issues.append("No streaming bars")
             if tick_age > 120: issues.append(f"Ticks stale ({tick_age:.0f}s)")
             if bar_age > 600: issues.append(f"Bars stale ({bar_age:.0f}s)")
@@ -426,7 +410,7 @@ async def main():
 
     # -- Stream health check (every 5 minutes, with Telegram alerts) ---------
     async def _stream_health():
-        await check_stream_health_all(shared, stream_mgr, tg_send)
+        await check_stream_health_all(shared, stream_mgr, tg_send, signals)
 
     scheduler.add_job(_stream_health, "interval", minutes=5,
         id="stream_health", misfire_grace_time=60)
@@ -444,7 +428,8 @@ async def main():
             id="heartbeat", misfire_grace_time=60)
 
         async def _safety_audit():
-            if shared and shared.ig:
+            # IG-specific audit; skip on IBKR (broker provides its own checks)
+            if shared and getattr(shared, "ig", None):
                 await position_safety_audit(shared, tg_send)
 
         scheduler.add_job(_safety_audit, "interval", minutes=5,

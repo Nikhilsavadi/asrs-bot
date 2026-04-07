@@ -102,7 +102,7 @@ INSTRUMENTS = {
         "buffer": 2.0,
         "narrow_range": 50,
         "wide_range": 150,
-        "max_risk_gbp": 75.0,
+        "max_risk_gbp": 50.0,   # tightened from 75 → 50pt; £133 max loss on £5k account at NIY £2.65/pt
         "max_entries": 3,
         "max_bar_range": 250,
         "max_spread": 50.0,

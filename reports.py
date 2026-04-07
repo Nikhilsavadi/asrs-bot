@@ -41,10 +41,21 @@ MUTED = "#888888"
 
 
 def _fetch_trades(since: str | None = None, live_only: bool = True) -> list[dict]:
-    """Fetch trades from journal DB, optionally filtered by date and mode."""
-    from shared.journal_db import _get_conn
+    """
+    Fetch trades from journal DB, filtered by date and mode.
+
+    When live_only=True (default), filters to the CURRENT broker mode's
+    trades — so paper trading reads only paper trades, live IG reads only
+    live trades, etc. Prevents governance/reports from mixing different
+    broker eras (e.g. old IG live trades polluting paper IBKR alerts).
+    """
+    from shared.journal_db import _get_conn, _trade_mode_label
     conn = _get_conn()
-    mode_filter = " AND mode='live'" if live_only else ""
+    if live_only:
+        current_mode = _trade_mode_label()
+        mode_filter = f" AND mode='{current_mode}'"
+    else:
+        mode_filter = ""
     if since:
         rows = conn.execute(
             f"SELECT * FROM trades WHERE date >= ?{mode_filter} ORDER BY id ASC",
