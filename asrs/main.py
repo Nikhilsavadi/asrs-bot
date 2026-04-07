@@ -441,8 +441,8 @@ async def main():
             id="heartbeat", misfire_grace_time=60)
 
         async def _safety_audit():
-            # IG-specific audit; skip on IBKR (broker provides its own checks)
-            if shared and getattr(shared, "ig", None):
+            # Now broker-agnostic: dispatches to IG or IB variant inside.
+            if shared:
                 await position_safety_audit(shared, tg_send)
 
         scheduler.add_job(_safety_audit, "interval", minutes=5,

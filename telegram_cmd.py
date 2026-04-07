@@ -127,13 +127,27 @@ async def handle_status(dax_broker, **kwargs):
             await _send(f"📊 <b>BOT STATUS</b> [{mode}]\n━━━━━━━━━━━━━━━━━━━━━━\nNo signals loaded yet — bot may still be starting.")
             return
         if ALL_SIGNALS:
-            ig_ok = ALL_SIGNALS[0].broker._shared.ig is not None
+            # Broker-agnostic connection check
+            broker0 = ALL_SIGNALS[0].broker
+            shared0 = getattr(broker0, "_shared", None)
+            if shared0 is None:
+                broker_label = "Broker"
+                broker_ok = False
+            elif hasattr(shared0, "ig") and shared0.ig is not None:
+                broker_label = "IG"
+                broker_ok = True
+            elif hasattr(shared0, "ib") and shared0.connected:
+                broker_label = "IBKR"
+                broker_ok = True
+            else:
+                broker_label = "Broker"
+                broker_ok = False
             msg = (
                 f"📊 <b>BOT STATUS</b> [{mode}]\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"🕐 {now.strftime('%Y-%m-%d %H:%M')} UK\n"
                 f"🔄 Trading: <b>{pause_str}</b>\n"
-                f"  IG: {'✅' if ig_ok else '❌'}\n"
+                f"  {broker_label}: {'✅' if broker_ok else '❌'}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
             )
             from datetime import datetime as dt
@@ -277,56 +291,52 @@ async def handle_close(dax_broker, target: str = "all", **kwargs):
 
 
 async def handle_kill(dax_broker, **kwargs):
-    """EMERGENCY: Close ALL positions on IG, pause trading, reset all state."""
+    """EMERGENCY: Close ALL positions across all brokers, pause trading, reset state."""
     global paused
     paused = True
     results = []
 
     try:
-        from shared.ig_session import IGSharedSession
-        shared = IGSharedSession.get_instance()
-        if not shared or not shared.ig:
-            shared = IGSharedSession()
-            await shared.connect()
+        from asrs.main import ALL_SIGNALS
+        from asrs.strategy import Phase
 
-        # Fetch ALL open positions on the account
-        positions = shared.ig.fetch_open_positions()
-        if hasattr(positions, 'to_dict'):
-            positions = positions.to_dict('records')
-
-        if not positions:
-            results.append("No open positions found.")
-        else:
-            for pos in positions:
-                deal_id = pos.get('dealId', '')
-                epic = pos.get('epic', '')
-                direction = pos.get('direction', '')
-                size = pos.get('size', 1)
-                try:
-                    close_dir = 'SELL' if direction == 'BUY' else 'BUY'
-                    shared.ig.close_open_position(
-                        deal_id=deal_id, direction=close_dir,
-                        epic=epic, expiry='DFB', level=None,
-                        order_type='MARKET', quote_id=None, size=size,
+        # Close positions via each broker (broker-agnostic — works for IG and IB)
+        seen_brokers: set[int] = set()
+        for signal in ALL_SIGNALS:
+            broker_id = id(signal.broker)
+            if broker_id in seen_brokers:
+                continue
+            seen_brokers.add(broker_id)
+            try:
+                pos = await signal.broker.get_position()
+                if pos.get("direction", "FLAT") != "FLAT":
+                    closed = await signal.broker.close_position()
+                    label = getattr(signal.broker, "epic", "?")
+                    results.append(
+                        f"  {signal.instrument} ({label}): {pos['direction']} → "
+                        f"{'CLOSED' if closed else 'FAILED'}"
                     )
-                    results.append(f"  {epic} {direction} x{size}: CLOSED")
-                except Exception as e:
-                    results.append(f"  {epic} {direction}: FAILED ({e})")
+                else:
+                    label = getattr(signal.broker, "epic", "?")
+                    results.append(f"  {signal.instrument} ({label}): flat (skip)")
+            except Exception as e:
+                results.append(f"  {signal.instrument}: ERROR {e}")
+            try:
+                await signal.broker.cancel_all_orders()
+            except Exception:
+                pass
 
-        # Reset all signal states (new unified bot)
-        try:
-            from asrs.main import ALL_SIGNALS
-            from asrs.strategy import Phase
-            for signal in ALL_SIGNALS:
-                signal.state.phase = Phase.DONE
-                signal.state.direction = ""
-                signal.state.contracts_active = 0
-                signal.state.deal_ids = []
-                if hasattr(signal.broker, '_pending_bracket'):
-                    signal.broker._pending_bracket = None
-                results.append(f"{signal.name}: RESET")
-        except Exception as e:
-            results.append(f"State reset failed: {e}")
+        # Reset all signal states
+        for signal in ALL_SIGNALS:
+            signal.state.phase = Phase.DONE
+            signal.state.direction = ""
+            signal.state.contracts_active = 0
+            signal.state.deal_ids = []
+            if hasattr(signal.broker, '_pending_bracket'):
+                signal.broker._pending_bracket = None
+            if hasattr(signal.broker, 'deactivate_stop_monitor'):
+                signal.broker.deactivate_stop_monitor()
+            results.append(f"{signal.name}: RESET")
 
     except Exception as e:
         results.append(f"ERROR: {e}")

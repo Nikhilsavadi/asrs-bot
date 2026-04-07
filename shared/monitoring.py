@@ -117,11 +117,55 @@ async def send_startup_alert(send_func, gold_str: str = "disabled", spx_str: str
 
 # ── Position Safety Audit ─────────────────────────────────────────────────
 
-async def position_safety_audit(ig_session, send_func):
+async def position_safety_audit(shared_session, send_func):
     """
-    Every 5 mins: check ALL open positions on IG have stops set.
+    Every 5 mins: check ALL open positions have stops set.
     If any position has no stop, set a disaster stop and alert.
+
+    Broker-agnostic: dispatches to IG or IB implementation based on
+    which kind of session was passed.
     """
+    if hasattr(shared_session, "ib"):
+        return await _position_safety_audit_ib(shared_session, send_func)
+    return await _position_safety_audit_ig(shared_session, send_func)
+
+
+async def _position_safety_audit_ib(shared_session, send_func):
+    """IBKR variant: check broker positions, ensure each has a stop order."""
+    try:
+        ib = shared_session.ib
+        positions = ib.positions()
+        if not positions:
+            return
+        open_trades = ib.openTrades()
+        # Build conId → has_stop_order map
+        stop_conids: set[int] = set()
+        for trade in open_trades:
+            order_type = getattr(trade.order, "orderType", "")
+            if order_type in ("STP", "STOP"):
+                stop_conids.add(trade.contract.conId)
+
+        for pos in positions:
+            if pos.position == 0:
+                continue
+            conid = pos.contract.conId
+            if conid in stop_conids:
+                continue
+            # No stop on this position!
+            sym = pos.contract.localSymbol or pos.contract.symbol
+            direction = "LONG" if pos.position > 0 else "SHORT"
+            await send_func(
+                f"🚨 <b>IB SAFETY AUDIT</b>\n"
+                f"Position {sym} ({direction} {abs(pos.position)}) has NO real stop order!\n"
+                f"Tick monitor may still be active. Check /status."
+            )
+            logger.warning(f"IB SAFETY AUDIT: {sym} {direction} no real stop")
+    except Exception as e:
+        logger.warning(f"IB safety audit failed: {e}")
+
+
+async def _position_safety_audit_ig(ig_session, send_func):
+    """IG variant: check open positions via REST, set emergency stop if missing."""
     try:
         positions = ig_session.ig.fetch_open_positions()
         if hasattr(positions, 'to_dict'):
