@@ -15,7 +15,17 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+from matplotlib.ticker import FuncFormatter, FixedLocator
 from datetime import datetime, timedelta
+
+
+def _money_fmt(x, _pos=None):
+    """Format £ values as 5k, 100k, 1.5M etc."""
+    if x >= 1_000_000:
+        return f"£{x/1_000_000:.1f}M".replace(".0M", "M")
+    if x >= 1_000:
+        return f"£{x/1_000:.0f}k"
+    return f"£{x:.0f}"
 
 DEFAULT_RUNS = 2000
 TRADING_DAYS_PER_YEAR = 252
@@ -231,8 +241,13 @@ def main():
 
     ax1.set_title(f"4-Year Monte Carlo Equity Curve  "
                   f"(£{args.account:,.0f} start, {args.degradation*100:.0f}% degradation, {args.runs:,} sims)")
-    ax1.set_ylabel("Account (£)")
+    ax1.set_ylabel("Account")
     ax1.set_yscale("log")
+    # Friendly £ ticks at 5k, 10k, 50k, 100k, 500k, 1M, 5M, 10M, 50M
+    log_ticks = [5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
+                 1_000_000, 2_500_000, 5_000_000, 10_000_000, 25_000_000, 50_000_000]
+    ax1.yaxis.set_major_locator(FixedLocator(log_ticks))
+    ax1.yaxis.set_major_formatter(FuncFormatter(_money_fmt))
     ax1.grid(True, alpha=0.3)
     ax1.legend(loc="upper left", fontsize=9)
     ax1.xaxis.set_major_locator(mdates.MonthLocator(interval=6))
@@ -244,8 +259,9 @@ def main():
     ax2.bar(dates[1:], daily_pnl, color=colors, width=1.5)
     ax2.axhline(y=0, color="#888", linewidth=0.5)
     losing_days_pct = (daily_pnl < 0).sum() / len(daily_pnl) * 100
-    ax2.set_title(f"Daily P&L (sample path, £) — {losing_days_pct:.0f}% losing days")
+    ax2.set_title(f"Daily P&L (sample path) — {losing_days_pct:.0f}% losing days")
     ax2.set_ylabel("£/day")
+    ax2.yaxis.set_major_formatter(FuncFormatter(_money_fmt))
     ax2.grid(True, alpha=0.3)
     ax2.xaxis.set_major_locator(mdates.MonthLocator(interval=6))
     ax2.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
@@ -256,8 +272,9 @@ def main():
     ax3.bar(week_dates, weekly_pnl, color=wcolors, width=5)
     ax3.axhline(y=0, color="#888", linewidth=0.5)
     lw_pct = losing_weeks / max(1, len(weekly_pnl)) * 100
-    ax3.set_title(f"Weekly P&L (sample path, £) — {losing_weeks}/{len(weekly_pnl)} losing weeks ({lw_pct:.0f}%)")
+    ax3.set_title(f"Weekly P&L (sample path) — {losing_weeks}/{len(weekly_pnl)} losing weeks ({lw_pct:.0f}%)")
     ax3.set_ylabel("£/week")
+    ax3.yaxis.set_major_formatter(FuncFormatter(_money_fmt))
     ax3.grid(True, alpha=0.3)
     ax3.xaxis.set_major_locator(mdates.MonthLocator(interval=6))
     ax3.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
@@ -268,8 +285,9 @@ def main():
     ax4.bar(month_dates, monthly_pnl, color=mcolors, width=20)
     ax4.axhline(y=0, color="#888", linewidth=0.5)
     lm_pct = losing_months / max(1, len(monthly_pnl)) * 100
-    ax4.set_title(f"Monthly P&L (sample path, £) — {losing_months}/{len(monthly_pnl)} losing months ({lm_pct:.0f}%)")
+    ax4.set_title(f"Monthly P&L (sample path) — {losing_months}/{len(monthly_pnl)} losing months ({lm_pct:.0f}%)")
     ax4.set_ylabel("£/month")
+    ax4.yaxis.set_major_formatter(FuncFormatter(_money_fmt))
     ax4.set_xlabel("Date")
     ax4.grid(True, alpha=0.3)
     ax4.xaxis.set_major_locator(mdates.MonthLocator(interval=6))
