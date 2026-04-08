@@ -63,8 +63,33 @@ TG_TOKEN = _cfg.TG_TOKEN if _cfg else os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID = _cfg.TG_CHAT_ID if _cfg else os.getenv("TELEGRAM_CHAT_ID", "")
 API_BASE = f"https://api.telegram.org/bot{TG_TOKEN}"
 
-# Global pause flag — checked by bot main loops before placing new orders
+# Global pause flag — checked by Signal._arm_bracket / on_tick_trigger
 paused = False
+
+# Sentinel file checked by strategy.py. Survives bot restart so /pause
+# stays effective across crashes / wrapper restarts.
+PAUSE_SENTINEL = "/tmp/asrs-bot.paused"
+
+def _set_paused(value: bool) -> None:
+    global paused
+    paused = value
+    try:
+        if value:
+            with open(PAUSE_SENTINEL, "w") as f:
+                f.write(datetime.now().isoformat())
+        else:
+            if os.path.exists(PAUSE_SENTINEL):
+                os.remove(PAUSE_SENTINEL)
+    except Exception as e:
+        logger.error(f"Failed to write pause sentinel: {e}")
+
+def is_paused() -> bool:
+    """Authoritative pause check — sentinel file OR module flag."""
+    return paused or os.path.exists(PAUSE_SENTINEL)
+
+# Restore on import in case sentinel persisted across restart
+if os.path.exists(PAUSE_SENTINEL):
+    paused = True
 
 
 async def _send(text: str):
@@ -292,8 +317,7 @@ async def handle_close(dax_broker, target: str = "all", **kwargs):
 
 async def handle_kill(dax_broker, **kwargs):
     """EMERGENCY: Close ALL positions across all brokers, pause trading, reset state."""
-    global paused
-    paused = True
+    _set_paused(True)
     results = []
 
     try:
@@ -330,7 +354,6 @@ async def handle_kill(dax_broker, **kwargs):
         for signal in ALL_SIGNALS:
             signal.state.phase = Phase.DONE
             signal.state.direction = ""
-            signal.state.contracts_active = 0
             signal.state.deal_ids = []
             if hasattr(signal.broker, '_pending_bracket'):
                 signal.broker._pending_bracket = None
@@ -353,10 +376,93 @@ async def handle_kill(dax_broker, **kwargs):
     await _send(msg)
 
 
+async def handle_flatten():
+    """PANIC: Bypass strategy state machine and force-flatten EVERY open
+    IBKR position via direct MarketOrder. Last-resort lever — use when
+    /kill or normal close paths are stuck.
+
+    Pauses trading first so the bot doesn't immediately re-enter.
+    """
+    _set_paused(True)
+    results = []
+    try:
+        from asrs.main import ALL_SIGNALS
+        if not ALL_SIGNALS:
+            await _send("FLATTEN: no signals registered")
+            return
+        # Pull the shared IB session from any signal's broker
+        shared = getattr(ALL_SIGNALS[0].broker, "_shared", None)
+        if shared is None or not hasattr(shared, "ib"):
+            await _send("FLATTEN: not on IB broker — use /kill instead")
+            return
+        ib = shared.ib
+        from ib_async import MarketOrder, TagValue
+        # CRITICAL: cancel ALL open orders FIRST so resting stops don't
+        # race the offsetting market orders. Without this, you can get
+        # double-fills as your stop fires while your flatten order arrives.
+        try:
+            ib.reqGlobalCancel()
+            results.append("reqGlobalCancel sent (all open orders cancelled)")
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            results.append(f"reqGlobalCancel EXC {e}")
+        positions = [p for p in ib.positions() if p.position != 0]
+        if not positions:
+            await _send("FLATTEN: no open positions (after global cancel)")
+            return
+        for p in positions:
+            qty = abs(int(p.position))
+            action = "SELL" if p.position > 0 else "BUY"
+            for attempt in range(1, 4):
+                try:
+                    order = MarketOrder(action, qty, tif="DAY")
+                    # Adaptive Urgent — fastest fill in fast markets, what
+                    # you want for a panic flatten.
+                    try:
+                        order.algoStrategy = "Adaptive"
+                        order.algoParams = [TagValue("adaptivePriority", "Urgent")]
+                    except Exception:
+                        pass
+                    trade = ib.placeOrder(p.contract, order)
+                    # Wait briefly for fill
+                    for _ in range(20):
+                        await asyncio.sleep(0.5)
+                        if trade.orderStatus.status in ("Filled", "Cancelled"):
+                            break
+                    if trade.orderStatus.status == "Filled":
+                        results.append(
+                            f"  {p.contract.localSymbol}: {action} {qty} → "
+                            f"FLAT @ {trade.orderStatus.avgFillPrice}"
+                        )
+                        break
+                    else:
+                        results.append(
+                            f"  {p.contract.localSymbol}: attempt {attempt} "
+                            f"status={trade.orderStatus.status}"
+                        )
+                except Exception as e:
+                    results.append(f"  {p.contract.localSymbol}: attempt {attempt} EXC {e}")
+        # Cancel any leftover open orders too
+        try:
+            for o in ib.openOrders():
+                ib.cancelOrder(o)
+            results.append("All open orders cancelled")
+        except Exception as e:
+            results.append(f"cancelOrders EXC {e}")
+    except Exception as e:
+        results.append(f"FLATTEN OUTER EXC {e}")
+
+    await _send(
+        "🚨 <b>FLATTEN ALL</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(results) +
+        "\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        "<i>Trading PAUSED. /resume to re-enable.</i>"
+    )
+
+
 async def handle_pause():
     """Pause new trades."""
-    global paused
-    paused = True
+    _set_paused(True)
     await _send(
         "⏸ <b>TRADING PAUSED</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -368,8 +474,7 @@ async def handle_pause():
 
 async def handle_resume():
     """Resume trading."""
-    global paused
-    paused = False
+    _set_paused(False)
     await _send(
         "▶️ <b>TRADING RESUMED</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -880,6 +985,8 @@ async def poll_commands(dax_broker=None, **kwargs):
                             await handle_close(dax_broker, "dax")
                         elif cmd == "/kill":
                             await handle_kill(dax_broker)
+                        elif cmd == "/flatten":
+                            await handle_flatten()
                         elif cmd == "/pause":
                             await handle_pause()
                         elif cmd == "/resume":
