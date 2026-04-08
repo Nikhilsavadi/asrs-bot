@@ -56,10 +56,11 @@ INSTRUMENTS = {
         "max_slippage_pct": 0.5,
         "disaster_stop_pts": 200,
         "breakeven_pts": 15.0,
+        "be_buffer_pts": 5.0,    # BE stop offset below entry to absorb tick noise
         "tight_threshold": 100.0,
         "trail_min_move": 3.0,
         "add_trigger": 25.0,
-        "add_max": 2,
+        "add_max": 0,  # disabled — backtest shows no_adds nearly matches add_self_be with lower DD
         "s1_open_hour": 9, "s1_open_minute": 0,
         "s2_open_hour": 14, "s2_open_minute": 0,
         "session_end_hour": 17, "session_end_minute": 30,
@@ -80,10 +81,11 @@ INSTRUMENTS = {
         "max_slippage_pct": 0.5,
         "disaster_stop_pts": 1000,
         "breakeven_pts": 20.0,
+        "be_buffer_pts": 5.0,    # BE stop offset below entry to absorb tick noise
         "tight_threshold": 80.0,
         "trail_min_move": 5.0,
         "add_trigger": 30.0,
-        "add_max": 2,
+        "add_max": 0,  # disabled — backtest shows no_adds nearly matches add_self_be with lower DD
         "s1_open_hour": 9, "s1_open_minute": 30,
         "s2_open_hour": 11, "s2_open_minute": 0,
         "s3_open_hour": 13, "s3_open_minute": 0,
@@ -105,10 +107,11 @@ INSTRUMENTS = {
         "max_slippage_pct": 0.5,
         "disaster_stop_pts": 1000,
         "breakeven_pts": 50.0,
+        "be_buffer_pts": 10.0,   # NIY has wider 10pt spreads → bigger BE buffer
         "tight_threshold": 300.0,
         "trail_min_move": 5.0,
         "add_trigger": 80.0,
-        "add_max": 2,
+        "add_max": 0,  # disabled — backtest shows no_adds nearly matches add_self_be with lower DD
         "s1_open_hour": 10, "s1_open_minute": 0,
         "s2_open_hour": 12, "s2_open_minute": 0,
         "s3_open_hour": 13, "s3_open_minute": 0,

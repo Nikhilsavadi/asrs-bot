@@ -56,67 +56,108 @@ async def reconcile_positions(signals, shared_session, stream_mgr, tg_send):
     """
     Reconcile broker positions with signal state on startup.
 
-    Uses each broker's get_position() method (broker-agnostic) so works
-    for both IG and IB. If broker reports a non-flat position, restore
-    the signal's LONG/SHORT phase and arm the stop monitor.
+    SAFE-BY-DEFAULT policy:
+
+    1. If a signal's loaded state file ALREADY shows LONG/SHORT phase
+       (i.e. previous run was tracking a position), trust the state and
+       re-arm its tick stop monitor at the persisted trailing_stop. This
+       preserves the actual strategy stop, bar 4/5 levels, etc.
+
+    2. If a signal is FLAT in state but the broker reports an open
+       position on its contract: DO NOT auto-reconcile to a disaster
+       stop. The original strategy stop (50pt risk-managed) is gone, and
+       overwriting it with a 200pt disaster stop quadruples the risk
+       silently. Instead, send a CRITICAL Telegram alert and refuse to
+       claim the position. Manual intervention required.
+
+    3. To prevent the same position being claimed by multiple signals
+       sharing a broker (e.g. DAX_S1 and DAX_S2 both watch FDXS), track
+       reconciled positions by contract conId / epic.
     """
     try:
         from asrs.strategy import Phase
-        matched = 0
-        seen_brokers: set[int] = set()  # one broker can serve multiple signals
 
+        # Pass 1: re-arm stop monitor for any signal already in LONG/SHORT
+        # state (its state file persisted the real strategy stop).
+        rearmed = 0
         for key, signal in signals.items():
-            broker_id = id(signal.broker)
-            # Each broker only reports its own contract's position; multiple
-            # signals share a broker per instrument, so skip duplicates
-            if broker_id in seen_brokers:
+            if signal.state.phase not in (Phase.LONG, Phase.SHORT):
                 continue
+            stop = signal.state.trailing_stop or signal.state.initial_stop
+            if stop <= 0:
+                continue
+            try:
+                signal.broker.activate_stop_monitor(signal.state.direction, stop)
+                rearmed += 1
+                logger.info(
+                    f"[{key}] re-armed stop monitor from state: "
+                    f"{signal.state.direction} @ {signal.state.entry_price} stop={stop}"
+                )
+            except Exception as e:
+                logger.warning(f"[{key}] re-arm failed: {e}")
 
+        # Pass 2: detect orphaned broker positions (in IBKR but no signal
+        # tracks them). These need manual attention — we will NOT auto-claim.
+        seen_keys: set[str] = set()
+        orphan_alerts: list[str] = []
+        for key, signal in signals.items():
+            br_key = getattr(signal.broker, "epic", "") or str(id(signal.broker))
+            if br_key in seen_keys:
+                continue
+            seen_keys.add(br_key)
             try:
                 pos = await signal.broker.get_position()
             except Exception as e:
-                logger.warning(f"Reconcile {key}: get_position failed: {e}")
+                logger.warning(f"reconcile {key}: get_position failed: {e}")
                 continue
 
             if pos.get("direction", "FLAT") == "FLAT":
                 continue
 
-            # Skip signals that already have an in-memory position
-            if signal.state.phase in (Phase.LONG, Phase.SHORT):
-                seen_brokers.add(broker_id)
+            # Position exists at broker. Check if any signal on this broker
+            # has it tracked in-memory (Pass 1 would have re-armed those).
+            tracked = False
+            for sk, sig in signals.items():
+                if getattr(sig.broker, "epic", "") != br_key:
+                    continue
+                if sig.state.phase in (Phase.LONG, Phase.SHORT) and \
+                   abs(sig.state.entry_price - float(pos.get("avg_cost", 0))) < 1.0:
+                    tracked = True
+                    break
+
+            if tracked:
                 continue
 
-            seen_brokers.add(broker_id)
+            # ORPHAN — broker has a position but no signal tracks it.
+            entry = pos.get("avg_cost", 0)
             direction = pos["direction"]
-            entry_level = float(pos.get("avg_cost") or 0)
-            if entry_level <= 0:
-                logger.warning(f"Reconcile {key}: entry_level=0, skipping")
-                continue
-
-            signal.state.phase = Phase.LONG if direction == "LONG" else Phase.SHORT
-            signal.state.direction = direction
-            signal.state.entry_price = entry_level
-
-            # Disaster stop
-            disaster_pts = signal.cfg["disaster_stop_pts"]
-            stop_level = (entry_level - disaster_pts) if direction == "LONG" \
-                else (entry_level + disaster_pts)
-            signal.state.initial_stop = stop_level
-            signal.state.trailing_stop = stop_level
-            signal.broker.activate_stop_monitor(direction, stop_level)
-
-            signal.save_state()
-            matched += 1
-
             msg = (
-                f"[{signal.name}] RECONCILED: {direction} @ {entry_level}, "
-                f"stop monitor @ {stop_level}"
+                f"⚠️ <b>ORPHAN POSITION DETECTED</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Broker: {signal.instrument} ({br_key})\n"
+                f"Position: {direction} {abs(pos.get('position', 0))} @ {entry}\n"
+                f"<b>NOT auto-reconciled — original strategy stop is unknown.</b>\n"
+                f"Bot started in TRACKING-ONLY mode for this instrument.\n"
+                f"Manual close via IBKR or /kill required."
             )
-            logger.info(msg)
-            await tg_send(msg)
+            orphan_alerts.append(msg)
+            logger.error(
+                f"ORPHAN: {signal.instrument} {direction} @ {entry} not claimed by any signal"
+            )
 
-        if matched == 0:
-            logger.info("Reconciliation: clean start (no open positions)")
+        for alert in orphan_alerts:
+            try:
+                await tg_send(alert)
+            except Exception:
+                pass
+
+        if rearmed == 0 and not orphan_alerts:
+            logger.info("Reconciliation: clean start (no positions, no state)")
+        else:
+            logger.info(
+                f"Reconciliation: {rearmed} signals re-armed from state, "
+                f"{len(orphan_alerts)} orphan positions detected"
+            )
 
     except Exception as e:
         logger.error(f"Reconciliation failed: {e}", exc_info=True)

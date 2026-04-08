@@ -244,9 +244,21 @@ class IBBroker:
 
     # ── Tick callback: bracket + stop exit ───────────────────────────
 
-    def _on_tick(self, mid: float, bid: float = 0.0, ofr: float = 0.0) -> None:
-        """Every tick — checks both stop monitor AND pending bracket."""
-        # 1. Stop monitor
+    def _on_tick(self, mid: float, bid: float = 0.0, ofr: float = 0.0, last: float = 0.0) -> None:
+        """
+        Every tick — checks both stop monitor AND pending bracket.
+
+        Stop checks use the LAST TRADE price (not bid/ask) so live execution
+        mirrors the backtest semantics: stops only fire when an actual trade
+        prints at or below the stop level. Bid/ask quote movements alone
+        (e.g. market makers cancelling orders) do NOT fire stops — they're
+        not real fills, just promises that can be withdrawn.
+
+        This eliminates "phantom wick" exits like 2026-04-08 NIKKEI_S1 where
+        the bid touched 55980 but no trade printed at that price, yet the
+        old code fired the stop.
+        """
+        # 1. Stop monitor — uses LAST TRADE price for stop check
         if (
             self._stop_monitor
             and self._stop_monitor.get("active")
@@ -254,17 +266,21 @@ class IBBroker:
         ):
             sm = self._stop_monitor
             stop = sm["stop_level"]
+            # Prefer last trade; fall back to mid if last not available
+            check_price = last if last and last > 0 else mid
             hit = False
-            if sm["direction"] == "LONG" and bid > 0 and bid <= stop:
+            if sm["direction"] == "LONG" and check_price > 0 and check_price <= stop:
                 hit = True
-            elif sm["direction"] == "SHORT" and ofr > 0 and ofr >= stop:
+            elif sm["direction"] == "SHORT" and check_price > 0 and check_price >= stop:
                 hit = True
             if hit:
                 self._stop_exit_active = True
-                exit_price = bid if sm["direction"] == "LONG" else ofr
+                # Exit price reference: last trade (what we'll record), the
+                # market sell will fill at the prevailing bid for LONG, etc.
+                exit_price = check_price
                 logger.info(
                     f"Stop hit ({self.instrument}): {sm['direction']} "
-                    f"stop={stop} exit={exit_price:.2f} "
+                    f"stop={stop} last={check_price:.2f} "
                     f"(bid={bid:.2f} ofr={ofr:.2f})"
                 )
                 loop = asyncio.get_event_loop()

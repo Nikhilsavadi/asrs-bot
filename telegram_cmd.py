@@ -378,6 +378,69 @@ async def handle_resume():
     )
 
 
+async def handle_morning(text: str):
+    """Manually trigger a signal's morning routine.
+    Usage: /morning DAX_S1
+    Used when the scheduled morning routine was missed (e.g. after a
+    bot restart during market hours). Resets the signal to IDLE first
+    so the morning routine can fully re-run.
+
+    Safety: after morning_routine arms a bracket, if current price is
+    already outside the bracket levels, deactivate the bracket and put
+    the signal in re-entry-waiting mode. Prevents stale-trigger fills
+    when the call is made well after the actual bar 4/5 window.
+    """
+    parts = text.strip().split()
+    if len(parts) < 2:
+        await _send("Usage: /morning <SIGNAL_NAME>")
+        return
+    target = parts[1].upper()
+    try:
+        from asrs.main import ALL_SIGNALS
+        from asrs.strategy import Phase
+        for signal in ALL_SIGNALS:
+            if signal.name != target:
+                continue
+
+            signal.state.phase = Phase.IDLE
+            signal.state.entries_used = 0
+            signal.state.direction = ""
+            signal.state.deal_ids = []
+            signal._bar4_triggered = False
+            signal.save_state()
+            signal.broker.deactivate_bracket()
+            await _send(f"🔄 [{signal.name}] Reset to IDLE, running morning routine now...")
+            await signal.morning_routine()
+
+            # Safety: if price is already outside the bracket, defuse it
+            try:
+                buy_lvl = signal.state.buy_level
+                sell_lvl = signal.state.sell_level
+                price = await signal.broker.get_current_price()
+                if buy_lvl > 0 and sell_lvl > 0 and price:
+                    if price >= buy_lvl or price <= sell_lvl:
+                        signal.broker.deactivate_bracket()
+                        signal.state.phase = Phase.LEVELS_SET  # waiting state
+                        signal.save_state()
+                        side = "ABOVE BUY" if price >= buy_lvl else "BELOW SELL"
+                        await _send(
+                            f"⚠️ [{signal.name}] Price {price} already {side} "
+                            f"({sell_lvl} / {buy_lvl}).\n"
+                            f"Bracket DEFUSED — will arm once price returns between levels."
+                        )
+                        return
+            except Exception as e:
+                logger.warning(f"morning safety check failed: {e}")
+
+            await _send(f"✅ [{signal.name}] Morning routine complete. Check /status.")
+            return
+        names = [s.name for s in ALL_SIGNALS]
+        await _send(f"❌ Signal '{target}' not found.\nAvailable: {', '.join(names)}")
+    except Exception as e:
+        import traceback
+        await _send(f"❌ Morning trigger error: {e}\n<pre>{traceback.format_exc()[-500:]}</pre>")
+
+
 async def handle_reset(text: str):
     """Reset a signal to IDLE so it can re-run morning routine.
     Usage: /reset US30_S1 or /reset all
@@ -424,6 +487,107 @@ async def handle_logs():
         await _send(f"📋 <b>LAST 20 LOG LINES</b>\n━━━━━━━━━━━━━━━━━━━━━━\n<pre>{output}</pre>")
     except Exception as e:
         await _send(f"❌ <b>LOGS ERROR</b>\n{e}")
+
+
+_HIST_DAILY_CACHE: list | None = None
+
+
+def _load_hist_daily() -> list:
+    """Load and cache firstrate daily P&L series (cross-instrument totals)."""
+    global _HIST_DAILY_CACHE
+    if _HIST_DAILY_CACHE is not None:
+        return _HIST_DAILY_CACHE
+    try:
+        import pandas as pd
+        df = pd.read_csv("data/backtest_firstrate_results.csv")
+        # Sum P&L per calendar day across all instruments
+        daily = df.groupby("date")["pnl_pts"].sum().sort_index()
+        _HIST_DAILY_CACHE = [(str(d), float(p)) for d, p in daily.items()]
+    except Exception:
+        _HIST_DAILY_CACHE = []
+    return _HIST_DAILY_CACHE
+
+
+def historical_day_match(today_pts: float) -> str:
+    """
+    Return a one-paragraph comparison: how many backtest days had similar
+    P&L to today, and what happened on the day AFTER each of those.
+    """
+    series = _load_hist_daily()
+    if not series:
+        return ""
+    pts_list = [p for _d, p in series]
+    n_total = len(pts_list)
+    if n_total < 100:
+        return ""
+
+    # Bucket: within ±20% of today's value (or ±10pts if today is small)
+    tolerance = max(abs(today_pts) * 0.20, 10.0)
+    similar_idx = [
+        i for i, p in enumerate(pts_list)
+        if abs(p - today_pts) <= tolerance
+    ]
+    n_match = len(similar_idx)
+    pct = n_match / n_total * 100
+    sign_today = "+" if today_pts >= 0 else ""
+
+    # Special case: today's P&L was never seen in the 18-year backtest
+    if n_match == 0:
+        worst_day = min(pts_list)
+        best_day = max(pts_list)
+        is_worse = today_pts < worst_day
+        is_better = today_pts > best_day
+        if is_worse:
+            verdict = (
+                f"⚠️ Today ({sign_today}{today_pts:.0f}pts) is WORSE than the "
+                f"worst day in 18 years ({worst_day:+.0f}pts).\n"
+                f"This is unprecedented in backtest data. Verify execution."
+            )
+        elif is_better:
+            verdict = (
+                f"🎉 Today ({sign_today}{today_pts:.0f}pts) is BETTER than the "
+                f"best day in 18 years ({best_day:+.0f}pts).\n"
+                f"This is unprecedented in backtest data."
+            )
+        else:
+            verdict = (
+                f"Today ({sign_today}{today_pts:.0f}pts) is rare — no exact "
+                f"matches in 18yr data within ±{tolerance:.0f}pts.\n"
+                f"Backtest range: {worst_day:+.0f} to {best_day:+.0f}pts."
+            )
+        return (
+            f"\n📚 <b>HISTORICAL CONTEXT</b> (18yr backtest)\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n{verdict}"
+        )
+
+    # Average next-day P&L for those matches
+    next_day_pnls = [pts_list[i + 1] for i in similar_idx if i + 1 < n_total]
+    next_day_avg = sum(next_day_pnls) / len(next_day_pnls) if next_day_pnls else 0
+    next_day_pos_pct = (
+        sum(1 for p in next_day_pnls if p > 0) / len(next_day_pnls) * 100
+        if next_day_pnls else 0
+    )
+
+    # Next 5 days
+    next_5_pnls = []
+    for i in similar_idx:
+        win = pts_list[i + 1: i + 6]
+        if win:
+            next_5_pnls.append(sum(win))
+    next_5_avg = sum(next_5_pnls) / len(next_5_pnls) if next_5_pnls else 0
+
+    sign_next = "+" if next_day_avg >= 0 else ""
+    sign_5 = "+" if next_5_avg >= 0 else ""
+
+    return (
+        f"\n📚 <b>HISTORICAL CONTEXT</b> (18yr backtest)\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Days like today ({sign_today}{today_pts:.0f}±{tolerance:.0f}pts): "
+        f"<b>{n_match}</b> / {n_total} ({pct:.1f}%)\n"
+        f"Next day avg: <b>{sign_next}{next_day_avg:.0f}pts</b> "
+        f"({next_day_pos_pct:.0f}% positive)\n"
+        f"Next 5 days avg: <b>{sign_5}{next_5_avg:.0f}pts</b>"
+    )
 
 
 async def handle_pnl():
@@ -473,6 +637,15 @@ async def handle_pnl():
         lines.append(f"\nError: {e}")
 
     lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+
+    # Historical context — find similar days in 18-year backtest
+    try:
+        ctx = historical_day_match(day_total)
+        if ctx:
+            lines.append(ctx)
+    except Exception as e:
+        logger.warning(f"historical context failed: {e}")
+
     await _send("\n".join(lines))
 
 
@@ -731,6 +904,8 @@ async def poll_commands(dax_broker=None, **kwargs):
                             await handle_chart()
                         elif cmd.startswith("/reset"):
                             await handle_reset(text)
+                        elif cmd.startswith("/morning"):
+                            await handle_morning(text)
                         elif cmd == "/help":
                             await _send(
                                 "🤖 <b>COMMANDS</b>\n"

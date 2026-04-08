@@ -131,19 +131,41 @@ async def position_safety_audit(shared_session, send_func):
 
 
 async def _position_safety_audit_ib(shared_session, send_func):
-    """IBKR variant: check broker positions, ensure each has a stop order."""
+    """
+    IBKR variant: check that every open position is either:
+      (a) protected by a real IBKR StopOrder, OR
+      (b) protected by the bot's active tick-stop monitor
+
+    The bot deliberately uses tick monitors instead of real stops because
+    they handle trail/breakeven updates without the IBKR API spam, so
+    "no real stop" is normal — only alert if BOTH real stop AND tick
+    monitor are missing.
+    """
     try:
         ib = shared_session.ib
         positions = ib.positions()
         if not positions:
             return
-        open_trades = ib.openTrades()
-        # Build conId → has_stop_order map
+
+        # Build conId → has_real_stop_order map
         stop_conids: set[int] = set()
-        for trade in open_trades:
+        for trade in ib.openTrades():
             order_type = getattr(trade.order, "orderType", "")
             if order_type in ("STP", "STOP"):
                 stop_conids.add(trade.contract.conId)
+
+        # Build conId → has_active_tick_monitor map by inspecting brokers
+        tick_monitor_conids: set[int] = set()
+        try:
+            from asrs.main import ALL_SIGNALS
+            for sig in ALL_SIGNALS:
+                br = sig.broker
+                if (getattr(br, "_stop_monitor", None) is not None
+                    and br._stop_monitor.get("active")
+                    and getattr(br, "contract", None) is not None):
+                    tick_monitor_conids.add(br.contract.conId)
+        except Exception:
+            pass
 
         for pos in positions:
             if pos.position == 0:
@@ -151,15 +173,20 @@ async def _position_safety_audit_ib(shared_session, send_func):
             conid = pos.contract.conId
             if conid in stop_conids:
                 continue
-            # No stop on this position!
+            if conid in tick_monitor_conids:
+                continue
+            # Truly unprotected — no real stop AND no tick monitor
             sym = pos.contract.localSymbol or pos.contract.symbol
             direction = "LONG" if pos.position > 0 else "SHORT"
             await send_func(
                 f"🚨 <b>IB SAFETY AUDIT</b>\n"
-                f"Position {sym} ({direction} {abs(pos.position)}) has NO real stop order!\n"
-                f"Tick monitor may still be active. Check /status."
+                f"Position {sym} ({direction} {abs(pos.position)}) has "
+                f"NO real stop AND NO tick monitor active!\n"
+                f"This is a real exposure — check /status immediately."
             )
-            logger.warning(f"IB SAFETY AUDIT: {sym} {direction} no real stop")
+            logger.warning(
+                f"IB SAFETY AUDIT: {sym} {direction} unprotected (no stop, no monitor)"
+            )
     except Exception as e:
         logger.warning(f"IB safety audit failed: {e}")
 

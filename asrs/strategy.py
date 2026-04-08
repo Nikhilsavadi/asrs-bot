@@ -647,17 +647,28 @@ class Signal:
                 self.state.max_favourable = price
             unrealized = self.state.entry_price - price
 
-        # R13: Breakeven
+        # R13: Breakeven — move stop to entry ± buffer to absorb tick noise
         if not self.state.breakeven_hit and unrealized >= self.cfg["breakeven_pts"]:
             self.state.breakeven_hit = True
-            if self.state.direction == "LONG" and self.state.trailing_stop < self.state.entry_price:
-                self.state.trailing_stop = self.state.entry_price
-            elif self.state.direction == "SHORT" and self.state.trailing_stop > self.state.entry_price:
-                self.state.trailing_stop = self.state.entry_price
+            be_buffer = float(self.cfg.get("be_buffer_pts", 0))
+            if self.state.direction == "LONG":
+                target_stop = self.state.entry_price - be_buffer
+                if self.state.trailing_stop < target_stop:
+                    self.state.trailing_stop = target_stop
+            else:
+                target_stop = self.state.entry_price + be_buffer
+                if self.state.trailing_stop > target_stop:
+                    self.state.trailing_stop = target_stop
             self.save_state()
             await self._update_ig_stop()
-            await self.alert(f"[{self.name}] BREAKEVEN -- stop -> {self.state.entry_price}")
-            logger.info(f"[{self.name}] Breakeven hit, stop -> {self.state.entry_price}")
+            await self.alert(
+                f"[{self.name}] BREAKEVEN -- stop -> {self.state.trailing_stop} "
+                f"(entry {self.state.entry_price}, buffer {be_buffer:.0f}pt)"
+            )
+            logger.info(
+                f"[{self.name}] Breakeven hit, stop -> {self.state.trailing_stop} "
+                f"(buffer {be_buffer})"
+            )
 
         # R14 + R15: Candle trail
         await self._update_candle_trail()

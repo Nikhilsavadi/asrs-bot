@@ -179,15 +179,20 @@ class IBStreamManager:
             self._prices[key] = mid
             self._prices[f"{key}_bid"] = bid
             self._prices[f"{key}_ofr"] = ofr
+            self._prices[f"{key}_last"] = last
             self._prices[f"{key}_time"] = now_ts
 
             # Feed the in-process 5-min bar builder
             self._feed_tick_to_bar(key, mid)
 
-            # Fire tick callbacks
+            # Fire tick callbacks. Pass last as keyword for backwards compat —
+            # callbacks that don't accept it still work with the positional args.
             for cb in self._tick_callbacks.get(key, []):
                 try:
-                    cb(mid, bid, ofr)
+                    try:
+                        cb(mid, bid, ofr, last=last)
+                    except TypeError:
+                        cb(mid, bid, ofr)
                 except Exception as e:
                     logger.error(f"Tick callback error ({key}): {e}", exc_info=True)
 
