@@ -222,13 +222,17 @@ def daily_drift_report() -> dict:
 
 
 def format_drift_report(report: dict) -> str:
-    """Format for Telegram (Markdown)."""
+    """Format for Telegram (HTML). Includes inline playbook on alarm."""
     psr = report.get("psr")
     psr_str = f"{psr:.2f}" if psr is not None else "n/a"
     cum_pos = report.get("cusum_pos", 0)
     cum_neg = report.get("cusum_neg", 0)
     n = report.get("n_days", 0)
+    psr_alarm = report.get("psr_alarm", False)
+    cusum_alarm = report.get("cusum_alarm", False)
+    both = psr_alarm and cusum_alarm
     tag = "ALARM" if report.get("alarm") else "OK"
+
     lines = [
         f"<b>STRATEGY HEALTH</b> [{tag}]",
         f"Window: last {n} days",
@@ -236,12 +240,93 @@ def format_drift_report(report: dict) -> str:
         f"  Consecutive low days: {report.get('consecutive_low_psr_days', 0)} / {PSR_CONSECUTIVE_DAYS_FOR_ALARM}",
         f"CUSUM: pos={cum_pos:+.2f} neg={cum_neg:+.2f} (limit ±{CUSUM_H:.1f})",
     ]
-    if report.get("alarm"):
-        lines.append("")
-        if report.get("psr_alarm"):
-            lines.append("⚠️ PSR breach: edge may have died — review per-signal P&L.")
-        if report.get("cusum_alarm"):
-            lines.append("⚠️ CUSUM breach: live drifting systematically from backtest.")
+
+    # Healthy — no playbook needed, brief message
+    if not report.get("alarm"):
+        return "\n".join(lines)
+
+    # Alarm fired — include investigation playbook inline
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("<b>WHAT THIS MEANS</b>")
+
+    if both:
+        lines.append(
+            "Both PSR and CUSUM fired — multi-method consensus that "
+            "live performance is statistically distinct from backtest. "
+            "Most serious tier of alert."
+        )
+    elif psr_alarm:
+        lines.append(
+            "Rolling 30-day Sharpe has been below the backtest benchmark "
+            f"for {report.get('consecutive_low_psr_days', 0)} consecutive days. "
+            "Underperformance pattern is building. Not yet definitive — "
+            "could be a vol regime headwind."
+        )
+    elif cusum_alarm:
+        if cum_neg < -CUSUM_H:
+            lines.append(
+                "Daily P&L has been systematically below backtest "
+                "expectation for several weeks. Drift, not noise. "
+                "Most likely culprits: one signal decaying, vol regime "
+                "change, or microstructure shift in one instrument."
+            )
+        else:
+            lines.append(
+                "Daily P&L has been systematically ABOVE backtest "
+                "expectation. Sounds great but is a flag — usually means "
+                "the comparison baseline is stale or live is taking "
+                "DIFFERENT trades than the backtest. Cross-check the "
+                "DAILY PARITY message above for delta drift."
+            )
+
+    lines.append("")
+    lines.append("<b>NEXT MORNING CHECKLIST</b>")
+    lines.append("Do NOT act tonight. Tomorrow before market open:")
+    lines.append("1. <code>/pnl 30</code> — break down by signal")
+    lines.append("2. Identify worst signal (likely one carrying the loss)")
+    lines.append("3. Check vol regime: VIX, recent CPI/FOMC, holidays")
+    lines.append("4. Compare absolute loss vs 18yr historical worst window")
+
+    lines.append("")
+    lines.append("<b>DECISION RULES</b>")
+
+    if both:
+        lines.append(
+            "• <b>Pause to Monday</b> if absolute loss is in worst 5% "
+            "of historical weeks AND no regime explanation."
+        )
+        lines.append(
+            "• <b>Halve risk</b> (<code>RISK_PCT_PER_TRADE=0.25</code>, restart) "
+            "if loss is across multiple signals but within historical worst."
+        )
+        lines.append(
+            "• <b>Continue full size</b> only if one signal is the obvious "
+            "culprit AND you disable that signal."
+        )
+    else:
+        lines.append(
+            "• <b>Continue full size</b> if one signal is the obvious "
+            "culprit (disable just that signal) OR a regime event "
+            "explains it (CPI week, FOMC, holiday)."
+        )
+        lines.append(
+            "• <b>Halve risk</b> (<code>RISK_PCT_PER_TRADE=0.25</code>, restart) "
+            "if underperformance is across multiple signals with no "
+            "clear explanation, but loss is within historical worst."
+        )
+        lines.append(
+            "• <b>Pause to Monday</b> only if BOTH metrics fire on the "
+            "same day or absolute loss exceeds historical worst."
+        )
+
+    lines.append("")
+    lines.append(
+        "<i>Investigate calmly. The strategy recovers from drawdowns. "
+        "It does not recover from panic-pausing a normal drawdown OR "
+        "from ignoring a real decay.</i>"
+    )
+
     return "\n".join(lines)
 
 

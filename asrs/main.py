@@ -610,10 +610,40 @@ async def main():
                 except Exception:
                     pass
             tag = "DRIFT ALERT" if alert else "DAILY PARITY"
-            await tg_send(
-                f"<b>{tag}</b> — replay vs live\n"
-                f"<pre>{summary}</pre>"
-            )
+            msg = f"<b>{tag}</b> — replay vs live\n<pre>{summary}</pre>"
+            if alert:
+                msg += (
+                    "\n━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "<b>WHAT THIS MEANS</b>\n"
+                    "Live trades diverged from what the backtest engine "
+                    "would have done on the same bars (delta &gt; 20pts). "
+                    "This is a single-day issue, not a 30-day pattern.\n\n"
+                    "<b>LIKELY CAUSES</b>\n"
+                    "1. Slippage spike on one fill (check microstructure: "
+                    "spread, last_price at trigger time)\n"
+                    "2. Bar source mismatch (rare since rtbar fix — check "
+                    "if any signal hit mid-tick fallback today)\n"
+                    "3. Order rejection / partial fill\n"
+                    "4. Manual intervention via TWS\n\n"
+                    "<b>NEXT MORNING CHECKLIST</b>\n"
+                    "1. <code>/pnl</code> — see today's trades\n"
+                    "2. Look at the worst-delta instrument's last 5 fills "
+                    "in the journal — compare entry_intended vs entry, "
+                    "exit_intended vs exit\n"
+                    "3. Check <code>/tmp/asrs-logs/asrs.log</code> for "
+                    "any 'fallback to mid-tick' or 'EXCESSIVE SLIPPAGE' "
+                    "warnings\n\n"
+                    "<b>DECISION</b>\n"
+                    "• <b>Single-day delta &lt; 50pts</b>: investigate but "
+                    "no action needed. Watch tomorrow.\n"
+                    "• <b>Same instrument drifts 3 days running</b>: that "
+                    "instrument has a real problem. Check the broker / "
+                    "data sub for that contract.\n"
+                    "• <b>Delta &gt; 100pts in one day</b>: <code>/pause</code> "
+                    "and investigate before resuming. Something material "
+                    "broke."
+                )
+            await tg_send(msg)
             # Statistical process control — PSR + CUSUM on rolling 30-day P&L
             try:
                 from asrs.spc import daily_drift_report, format_drift_report
