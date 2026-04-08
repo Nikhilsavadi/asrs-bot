@@ -48,6 +48,24 @@
   Expected post-fix live PF: 4.9-5.1
   (vs pre-fix estimate 4.5-4.8 with phantom wicks)
 
+  PER-DAY / WEEK / MONTH CONSISTENCY (18yr backtest)
+  ──────────────────────────────────────────────────
+  DAYS:   4,719 total  →  92.5% green  (only 7.5% losing days)
+          Worst day:  -240 pts (£ -127 at £0.50/pt = -2.5% account)
+          Best day:   +4,351 pts
+          Mean day:   +355 pts
+
+  WEEKS:  954 total  →  99.8% green
+          Only 2 losing weeks in 18 YEARS
+          Worst week ever: -135 pts (-£72 at £0.50/pt)
+
+  MONTHS: 220 total  →  100.0% green
+          ZERO losing months in 18 years of backtest data
+
+  After a losing day:
+    90% of next days are positive
+    Average next-day P&L: +225 pts
+
   STRESS TESTS PASSED
   ──────────────────────────────────────────────────
   Flip top 5% winners:    PF 1.42 (still profitable)
@@ -123,27 +141,37 @@
   PAPER TRADING DAY 1 (2026-04-08) ACTUALS
   ──────────────────────────────────────────────────
   Overnight Nikkei: 7 trades, -85 pts (-£225 paper)
-                    [pre-fix, would have been positive]
+                    [pre-fix bid wicks, fixed Apr 8]
   DAX_S1 orphan:    -85 pts (-£73, operator restart error)
   Day 1 paper P&L:  ~-£300 (within MC distribution)
   Recovery time:    ~6 weeks at median path
 
-  WORST DAY IN 18 YEARS OF BACKTEST: -240 pts
+  THE REAL CONSISTENCY ANCHORS
   ──────────────────────────────────────────────────
-  At £0.50/pt that's -£127. NOT account-killing.
-  Recovery the next day: 84% positive avg +£103.
-  Recovery within 5 days: 100% positive avg +£640.
+  92.5% of days are GREEN
+  99.8% of weeks are GREEN
+  100.0% of months are GREEN (ZERO losing months in 18 years)
+
+  Worst single day: -240 pts = -£127 at £0.50/pt (-2.5%)
+  Worst single week: -135 pts = -£72 at £0.50/pt (-1.4%)
+  Worst single month: NEVER NEGATIVE in 18 years
+
+  After ANY losing day: 90% chance next day is positive
+  After ANY losing day: average next-day P&L = +225 pts
 
   ══════════════════════════════════════════════════
-  THE STRATEGY IS REAL. ON THE RIGHT VENUE.
-  WITH THE RIGHT STOP MECHANICS.
+  THE STRATEGY IS REAL.
+  IN 18 YEARS NO MONTH HAS EVER BEEN NEGATIVE.
   ──────────────────────────────────────────────────
   - 18 years backtest, every year profitable
+  - 220 months tracked, ZERO losing months
+  - 954 weeks tracked, only 2 losing weeks
+  - 4,719 days tracked, 92.5% winning days
   - Validated against actual IBKR live data
   - 6 signals byte-perfect, DAX validated separately
   - Phantom-wick exits eliminated (Apr 8 fix)
   - Survives 50% real-world degradation profitably
   - 0% chance of ruin on £5k hard stop
-  - £1k IG loss recovers in ~6 weeks at median path
-  - Tomorrow's first paper trade is the start of Y1
+  - When you see a losing day, breathe — 90% of next
+    days are positive averaging +225 pts
   ══════════════════════════════════════════════════

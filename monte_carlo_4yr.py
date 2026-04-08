@@ -146,9 +146,27 @@ def main():
             dates.append(d)
     dates = dates[:n_days + 1]
 
-    # ── Compute weekly and monthly aggregates from the median path ─────
+    # ── Pick a representative SAMPLE PATH for the bar charts ──────────
+    # The median across N sims smooths out variance — every day looks
+    # positive because positive days slightly outnumber negative ones in
+    # any large sample. To show realistic chop, pick ONE simulation
+    # whose final P&L is close to the median. That single path has all
+    # the variance of real life: losing days, losing weeks, occasional
+    # losing months.
     median_eq = bands[50]
-    daily_pnl = np.diff(median_eq)
+    final_pnls = all_equity[:, -1] - args.account
+    target = np.percentile(final_pnls, 50)
+    sample_idx = int(np.argmin(np.abs(final_pnls - target)))
+    sample_eq = all_equity[sample_idx]
+    sample_stakes = all_stakes[sample_idx]
+    daily_pnl = np.diff(sample_eq)
+    print(f"\nSample path #{sample_idx}: final P&L £{final_pnls[sample_idx]:+,.0f} "
+          f"(median across all sims: £{target:+,.0f})")
+    print(f"  Losing days:    {(daily_pnl < 0).sum()} / {len(daily_pnl)} "
+          f"({(daily_pnl < 0).sum()/len(daily_pnl)*100:.1f}%)")
+    print(f"  Worst day:      £{daily_pnl.min():+,.0f}")
+    print(f"  Worst drawdown: £{(sample_eq - np.maximum.accumulate(sample_eq)).min():+,.0f}")
+
     weekly_pnl = []
     monthly_pnl = []
     week_buf = []
@@ -177,29 +195,36 @@ def main():
         monthly_pnl.append(sum(month_buf))
         month_dates.append(dates[-1])
 
+    # Stats for the sample path
+    losing_weeks = sum(1 for w in weekly_pnl if w < 0)
+    losing_months = sum(1 for m in monthly_pnl if m < 0)
+    print(f"  Losing weeks:   {losing_weeks} / {len(weekly_pnl)} "
+          f"({losing_weeks/max(1,len(weekly_pnl))*100:.1f}%)")
+    print(f"  Losing months:  {losing_months} / {len(monthly_pnl)} "
+          f"({losing_months/max(1,len(monthly_pnl))*100:.1f}%)")
+
     # ── Plot ──────────────────────────────────────────────────────────
     fig = plt.figure(figsize=(15, 13))
     gs = fig.add_gridspec(4, 1, height_ratios=[2.4, 1, 1, 0.8], hspace=0.35)
 
-    # 1. Equity curves with confidence bands
+    # 1. Equity curves with confidence bands + sample path overlay
     ax1 = fig.add_subplot(gs[0])
     ax1.fill_between(dates, bands[5], bands[95], alpha=0.15,
                      color="#2ca02c", label="p5–p95 (90% CI)")
     ax1.fill_between(dates, bands[25], bands[75], alpha=0.30,
                      color="#2ca02c", label="p25–p75 (50% CI)")
-    ax1.plot(dates, bands[50], color="#1f7a1f", linewidth=2.0,
-             label="Median equity")
-    ax1.plot(dates, bands[5], color="#2ca02c", linewidth=0.6, linestyle="--")
-    ax1.plot(dates, bands[95], color="#2ca02c", linewidth=0.6, linestyle="--")
+    ax1.plot(dates, bands[50], color="#1f7a1f", linewidth=1.5,
+             label="Median across all sims", alpha=0.7, linestyle="--")
+    ax1.plot(dates, sample_eq, color="#0d4b0d", linewidth=2.0,
+             label=f"Sample path #{sample_idx} (real chop)")
     ax1.axhline(y=args.account, color="#888", linestyle=":", linewidth=1, label="Start")
 
-    # Mark stake-up events on the median path
-    median_stakes = np.median(all_stakes, axis=0)
+    # Mark stake-up events on the SAMPLE path
     last_stake = LADDER[0][1]
-    for i, st in enumerate(median_stakes):
+    for i, st in enumerate(sample_stakes):
         if st != last_stake:
             ax1.axvline(x=dates[i], color="#bbbbbb", linewidth=0.5, linestyle=":")
-            ax1.annotate(f"£{st:.0f}/pt", xy=(dates[i], bands[50][i]),
+            ax1.annotate(f"£{st:.0f}/pt", xy=(dates[i], sample_eq[i]),
                          xytext=(5, -5), textcoords="offset points",
                          fontsize=7, color="#666")
             last_stake = st
@@ -213,23 +238,25 @@ def main():
     ax1.xaxis.set_major_locator(mdates.MonthLocator(interval=6))
     ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
 
-    # 2. Daily P&L (median path)
+    # 2. Daily P&L (sample path — shows real losing days)
     ax2 = fig.add_subplot(gs[1])
     colors = ["#2ca02c" if p > 0 else "#d62728" for p in daily_pnl]
     ax2.bar(dates[1:], daily_pnl, color=colors, width=1.5)
     ax2.axhline(y=0, color="#888", linewidth=0.5)
-    ax2.set_title("Daily P&L (median path, £)")
+    losing_days_pct = (daily_pnl < 0).sum() / len(daily_pnl) * 100
+    ax2.set_title(f"Daily P&L (sample path, £) — {losing_days_pct:.0f}% losing days")
     ax2.set_ylabel("£/day")
     ax2.grid(True, alpha=0.3)
     ax2.xaxis.set_major_locator(mdates.MonthLocator(interval=6))
     ax2.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
 
-    # 3. Weekly P&L
+    # 3. Weekly P&L (sample path)
     ax3 = fig.add_subplot(gs[2])
     wcolors = ["#2ca02c" if p > 0 else "#d62728" for p in weekly_pnl]
     ax3.bar(week_dates, weekly_pnl, color=wcolors, width=5)
     ax3.axhline(y=0, color="#888", linewidth=0.5)
-    ax3.set_title("Weekly P&L (median path, £)")
+    lw_pct = losing_weeks / max(1, len(weekly_pnl)) * 100
+    ax3.set_title(f"Weekly P&L (sample path, £) — {losing_weeks}/{len(weekly_pnl)} losing weeks ({lw_pct:.0f}%)")
     ax3.set_ylabel("£/week")
     ax3.grid(True, alpha=0.3)
     ax3.xaxis.set_major_locator(mdates.MonthLocator(interval=6))
@@ -240,7 +267,8 @@ def main():
     mcolors = ["#2ca02c" if p > 0 else "#d62728" for p in monthly_pnl]
     ax4.bar(month_dates, monthly_pnl, color=mcolors, width=20)
     ax4.axhline(y=0, color="#888", linewidth=0.5)
-    ax4.set_title("Monthly P&L (median path, £)")
+    lm_pct = losing_months / max(1, len(monthly_pnl)) * 100
+    ax4.set_title(f"Monthly P&L (sample path, £) — {losing_months}/{len(monthly_pnl)} losing months ({lm_pct:.0f}%)")
     ax4.set_ylabel("£/month")
     ax4.set_xlabel("Date")
     ax4.grid(True, alpha=0.3)
@@ -264,14 +292,14 @@ def main():
             row.append(f"£{bands[p][idx]:>12,.0f}")
         print(f"  Year {yr}  " + "".join(f"{v:>14}" for v in row[1:]))
 
-    # Median path stake progression
-    print(f"\n  STAKE LADDER PROGRESSION (median path):")
+    # Sample path stake progression
+    print(f"\n  STAKE LADDER PROGRESSION (sample path #{sample_idx}):")
     last_stake = LADDER[0][1]
-    for i, st in enumerate(median_stakes):
+    for i, st in enumerate(sample_stakes):
         if st != last_stake:
             year_frac = i / TRADING_DAYS_PER_YEAR
             print(f"    Day {i:>4} (Year {year_frac:.1f}): £{last_stake:.1f}/pt → £{st:.1f}/pt  "
-                  f"(account ≈ £{bands[50][i]:,.0f})")
+                  f"(account ≈ £{sample_eq[i]:,.0f})")
             last_stake = st
 
     # Median per-year P&L
