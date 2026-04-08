@@ -49,8 +49,11 @@ class IBStreamManager:
 
         # contract_key → Contract / Ticker / BarDataList
         self._contracts: dict[str, Contract] = {}
-        self._tickers: dict[str, Ticker] = {}
-        self._bar_lists: dict[str, BarDataList] = {}
+        self._tickers: dict[str, Ticker] = {}                 # reqMktData (quotes)
+        self._rtbar_lists: dict[str, "RealTimeBarList"] = {}  # reqRealTimeBars (5sec TRADES)
+        self._rtbar_received: set[str] = set()                # keys that have received >=1 rtbar
+        self._use_mid_fallback: set[str] = set()              # keys with no rtbar permissions → mid-tick bars
+        self._bar_lists: dict[str, BarDataList] = {}          # reqHistoricalData (warmup)
 
         # Last mid + bid/ofr per key. Also "{key}_bid", "{key}_ofr", "{key}_time"
         self._prices: dict[str, float] = {}
@@ -59,7 +62,7 @@ class IBStreamManager:
         self._candle_bars: dict[str, deque] = {}
         self._last_bar_emit: dict[str, datetime] = {}
 
-        # In-progress 5-min bar being built from ticks per key
+        # In-progress 5-min bar built from REAL-TIME 5sec bars (trades-based)
         # Schema: {"start": datetime, "open": f, "high": f, "low": f, "close": f, "volume": int}
         self._building_bar: dict[str, dict] = {}
 
@@ -75,7 +78,16 @@ class IBStreamManager:
 
     async def subscribe_ticks(self, contract: Contract) -> str:
         """
-        Subscribe to live ticks for a qualified contract.
+        Subscribe to live data for a qualified contract.
+
+        TWO subscriptions per contract:
+          1. reqMktData → quote stream (bid/ask/last) for stop monitoring,
+             entry triggers, and tick callbacks. Sampled at ~250ms.
+          2. reqRealTimeBars(5sec, TRADES) → 5-second OHLC bars built from
+             actual trades. Aggregated to 5-min in code via _on_5sec_bar.
+             This replaces midpoint-based bar building which was inaccurate.
+             reqRealTimeBars is free with standard L1 (no upgrade needed).
+
         Returns the contract_key used for callbacks / lookups.
         """
         key = contract_key(contract)
@@ -89,13 +101,112 @@ class IBStreamManager:
         self._contracts[key] = contract
         self._loop = asyncio.get_event_loop()
 
+        # 1. reqMktData for quote stream (stop monitor, entry trigger, tick callbacks)
+        #    genericTickList="233" = RT Volume → guaranteed last-trade price +
+        #    last-size + last-time on every print. Without this, ticker.last
+        #    can be sparse on thin contracts (NIY especially), which would
+        #    silently degrade the last-trade stop-monitor fix.
         try:
-            ticker = self.ib.reqMktData(contract, "", False, False)
+            ticker = self.ib.reqMktData(contract, "233", False, False)
             self._tickers[key] = ticker
-            logger.info(f"IB ticks subscribed: {key} ({contract.symbol})")
+            logger.info(f"IB quotes subscribed: {key} ({contract.symbol})")
         except Exception as e:
             logger.error(f"reqMktData failed for {key}: {e}", exc_info=True)
+
+        # 2. reqRealTimeBars(5 seconds, TRADES) — accurate trade-based bars.
+        #    Each 5-second bar is built from actual trades during that window
+        #    by IBKR's matching engine. We aggregate 60 of them into a 5-min bar.
+        try:
+            # useRTH=False is CRITICAL for futures: NIY (Nikkei Yen on CME)
+            # trades through Asian session boundaries; useRTH=True would
+            # silently drop bars outside the US RTH window. Same for FDXS
+            # overnight Eurex extended hours.
+            rtbars = self.ib.reqRealTimeBars(contract, 5, "TRADES", useRTH=False)
+            self._rtbar_lists[key] = rtbars
+            rtbars.updateEvent += lambda bars, has_new, k=key: self._on_5sec_bar(k, bars, has_new)
+            logger.info(f"IB real-time bars (5sec TRADES) subscribed: {key}")
+        except Exception as e:
+            logger.error(f"reqRealTimeBars failed for {key}: {e}", exc_info=True)
+
+        # Permission probe: if no rtbar arrives within 20 s, fall back to
+        # mid-tick bars for this key (CBOT data sub not yet active, etc.).
+        async def _probe(k=key):
+            await asyncio.sleep(20)
+            if k not in self._rtbar_received:
+                self._use_mid_fallback.add(k)
+                logger.warning(
+                    f"No real-time bars for {k} after 20s — falling back to "
+                    f"mid-tick bar builder (less accurate; subscribe market "
+                    f"data for this exchange to fix)"
+                )
+        if self._loop:
+            self._loop.create_task(_probe())
+
         return key
+
+    def _on_5sec_bar(self, key: str, bars, has_new_bar: bool) -> None:
+        """
+        Called when a new 5-second TRADES bar arrives. Aggregate into the
+        in-progress 5-min bar. When the 5-min boundary crosses, finalise
+        the bar and fire candle callbacks.
+        """
+        if not bars or not has_new_bar:
+            return
+        self._rtbar_received.add(key)
+        latest = bars[-1]
+        # latest.time is the bar END time (5 seconds after start)
+        bar_time = latest.time
+        if not isinstance(bar_time, datetime):
+            bar_time = pd.to_datetime(bar_time, utc=True).to_pydatetime()
+        elif bar_time.tzinfo is None:
+            bar_time = bar_time.replace(tzinfo=timezone.utc)
+
+        # Snap to 5-minute window the 5sec bar belongs to (floor of UTC minute)
+        five_min_start = bar_time.replace(second=0, microsecond=0)
+        five_min_start = five_min_start.replace(minute=(five_min_start.minute // 5) * 5)
+
+        cur = self._building_bar.get(key)
+        o = float(latest.open_); h = float(latest.high); l = float(latest.low); c = float(latest.close)
+        v = float(getattr(latest, "volume", 0) or 0)
+
+        if cur is None or cur["start"] != five_min_start:
+            # Boundary crossed — finalise previous and start new
+            if cur is not None:
+                completed = {
+                    "time": cur["start"],
+                    "Open": cur["open"], "High": cur["high"],
+                    "Low": cur["low"], "Close": cur["close"],
+                    "Volume": cur["volume"],
+                }
+                deck = self._candle_bars.setdefault(key, deque(maxlen=500))
+                if deck and deck[-1]["time"] == completed["time"]:
+                    deck[-1] = completed
+                else:
+                    deck.append(completed)
+                self._last_bar_emit[key] = datetime.now(timezone.utc)
+                # Fire candle callbacks
+                for cb in self._candle_callbacks.get(key, []):
+                    try:
+                        if asyncio.iscoroutinefunction(cb):
+                            if self._loop:
+                                self._loop.create_task(cb(completed))
+                        else:
+                            cb(completed)
+                    except Exception as e:
+                        logger.error(f"Candle callback error ({key}): {e}", exc_info=True)
+            # Start new in-progress 5-min bar from this 5sec bar
+            self._building_bar[key] = {
+                "start": five_min_start,
+                "open": o, "high": h, "low": l, "close": c, "volume": v,
+            }
+        else:
+            # Same 5-min window — extend OHLC
+            if h > cur["high"]:
+                cur["high"] = h
+            if l < cur["low"]:
+                cur["low"] = l
+            cur["close"] = c
+            cur["volume"] += v
 
     async def subscribe_candles(
         self, contract: Contract, what: str = "TRADES", use_rth: bool = True,
@@ -152,41 +263,56 @@ class IBStreamManager:
     # ── Tick handling ──────────────────────────────────────────────
 
     def _on_pending_tickers(self, tickers):
-        """Called by IB when one or more subscribed tickers have new data."""
+        """Called by IB when one or more subscribed tickers have new data.
+
+        Two ticker types are dispatched here:
+          1. Quote tickers (from reqMktData) → update bid/ask/last/mid cache,
+             fire tick callbacks for stop monitoring and entry triggers.
+          2. Trade-by-trade tickers (from reqTickByTickData) → walk the
+             tickByTicks list of new trade prints and feed each one to the
+             bar builder. THIS is the accurate source for OHLC bars.
+        """
         now_ts = time.time()
         for ticker in tickers:
-            # Find which key this ticker belongs to
-            key = None
+            # Identify ticker type by membership
+            quote_key = None
+            tbt_key = None
             for k, t in self._tickers.items():
                 if t is ticker:
-                    key = k
+                    quote_key = k
                     break
-            if key is None:
+
+            # === QUOTE UPDATES (stop monitor + entry trigger source) ===
+            # Bars are built from reqRealTimeBars(5sec, TRADES) — see _on_5sec_bar.
+            if quote_key is None:
                 continue
+            key = quote_key
 
             bid = ticker.bid if ticker.bid and ticker.bid > 0 else 0.0
             ofr = ticker.ask if ticker.ask and ticker.ask > 0 else 0.0
             last = ticker.last if ticker.last and ticker.last > 0 else 0.0
 
-            # Mid: prefer bid/ask, fall back to last
             if bid and ofr:
                 mid = round((bid + ofr) / 2, 2)
             elif last:
                 mid = round(last, 2)
             else:
-                continue  # nothing usable
+                continue
 
             self._prices[key] = mid
             self._prices[f"{key}_bid"] = bid
             self._prices[f"{key}_ofr"] = ofr
-            self._prices[f"{key}_last"] = last
+            # Note: do NOT overwrite key_last here — tick-by-tick is authoritative
+            if not self._prices.get(f"{key}_last"):
+                self._prices[f"{key}_last"] = last
             self._prices[f"{key}_time"] = now_ts
 
-            # Feed the in-process 5-min bar builder
-            self._feed_tick_to_bar(key, mid)
+            # Mid-tick bar fallback: only used when reqRealTimeBars permission
+            # is denied for this key (e.g. CBOT without CBOT data sub).
+            if key in self._use_mid_fallback:
+                self._feed_tick_to_bar(key, mid)
 
-            # Fire tick callbacks. Pass last as keyword for backwards compat —
-            # callbacks that don't accept it still work with the positional args.
+            # Fire tick callbacks (stop monitor + entry triggers).
             for cb in self._tick_callbacks.get(key, []):
                 try:
                     try:
@@ -399,6 +525,7 @@ class IBStreamManager:
         """Re-subscribe everything after a reconnect."""
         contracts = list(self._contracts.values())
         self._tickers.clear()
+        self._rtbar_lists.clear()
         self._bar_lists.clear()
         for c in contracts:
             await self.subscribe_ticks(c)
@@ -416,6 +543,12 @@ class IBStreamManager:
             except Exception:
                 pass
             self._tickers.pop(key, None)
+        if key in self._rtbar_lists:
+            try:
+                self.ib.cancelRealTimeBars(self._rtbar_lists[key])
+            except Exception:
+                pass
+            self._rtbar_lists.pop(key, None)
         if key in self._bar_lists:
             try:
                 self.ib.cancelHistoricalData(self._bar_lists[key])

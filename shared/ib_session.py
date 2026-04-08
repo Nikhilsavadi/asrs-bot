@@ -40,6 +40,10 @@ class IBSharedSession:
         self._lock = asyncio.Lock()
         self._on_reconnect: list[Callable[[], Awaitable[None]]] = []
         self._on_disconnect: list[Callable[[], Awaitable[None]]] = []
+        # Captured at first connect() — used by sync ib_async event handlers
+        # to schedule async callbacks. asyncio.get_event_loop() is deprecated
+        # on 3.10+ and raises on 3.12 when called outside a running loop.
+        self._loop: asyncio.AbstractEventLoop | None = None
 
         # Wire IB's connectivity events into our callback dispatchers
         self.ib.connectedEvent += self._fire_reconnect
@@ -76,18 +80,32 @@ class IBSharedSession:
         """Register an async callback to fire on disconnect."""
         self._on_disconnect.append(callback)
 
+    def _schedule(self, coro):
+        """Schedule a coroutine on the captured loop from a sync context."""
+        loop = self._loop
+        if loop is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                logger.error("No event loop available to schedule callback")
+                return
+        if loop.is_running():
+            asyncio.run_coroutine_threadsafe(coro, loop)
+        else:
+            loop.create_task(coro)
+
     def _fire_reconnect(self) -> None:
         """Sync handler that schedules async reconnect callbacks."""
         for cb in self._on_reconnect:
             try:
-                asyncio.get_event_loop().create_task(cb())
+                self._schedule(cb())
             except Exception as e:
                 logger.error(f"on_reconnect callback failed: {e}", exc_info=True)
 
     def _fire_disconnect(self) -> None:
         for cb in self._on_disconnect:
             try:
-                asyncio.get_event_loop().create_task(cb())
+                self._schedule(cb())
             except Exception as e:
                 logger.error(f"on_disconnect callback failed: {e}", exc_info=True)
 
@@ -114,6 +132,10 @@ class IBSharedSession:
     async def _connect_inner(self) -> bool:
         if self.ib.isConnected():
             return True
+        # Capture the running loop on first connect — sync IB event handlers
+        # use this to schedule async callbacks safely.
+        if self._loop is None:
+            self._loop = asyncio.get_running_loop()
         try:
             await self.ib.connectAsync(
                 host=self._host,
