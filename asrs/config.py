@@ -46,6 +46,7 @@ INSTRUMENTS = {
         "epic": "IX.D.DAX.DAILY.IP",
         "currency": "GBP",
         "label": "DAX 40",
+        "gbp_per_pt": 0.86,   # FDXS €1/pt → ~£0.86/pt
         "buffer": 2.0,
         "narrow_range": 15,
         "wide_range": 40,
@@ -71,6 +72,7 @@ INSTRUMENTS = {
         "epic": "IX.D.DOW.DAILY.IP",
         "currency": "GBP",
         "label": "US30 (Dow)",
+        "gbp_per_pt": 0.40,   # MYM $0.50/pt → ~£0.40/pt
         "buffer": 5.0,
         "narrow_range": 30,
         "wide_range": 100,
@@ -97,6 +99,7 @@ INSTRUMENTS = {
         "epic": "IX.D.NIKKEI.DAILY.IP",
         "currency": "GBP",
         "label": "Nikkei 225",
+        "gbp_per_pt": 2.65,   # NIY ¥500/pt → ~£2.65/pt
         "buffer": 2.0,
         "narrow_range": 50,
         "wide_range": 150,

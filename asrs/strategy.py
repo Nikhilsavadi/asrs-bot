@@ -119,6 +119,12 @@ class Signal:
         self._morning_running = False                          # mutex
         self._sibling: "Signal | None" = None                  # S1<->S2 link
 
+        # Per-signal lock — serialises state-mutating coroutines so
+        # monitor_cycle, on_tick_trigger, on_bar_complete, _on_stop_exit
+        # can't clobber each other on overlapping firings.
+        import asyncio as _asyncio
+        self._lock = _asyncio.Lock()
+
         # Register tick-based stop exit callback
         self.broker.register_stop_callback(self._on_stop_exit)
         self._state_dir = os.path.join(
@@ -136,8 +142,16 @@ class Signal:
         return os.path.join(self._state_dir, f"{self.name}.json")
 
     def save_state(self):
-        with open(self._state_path(), "w") as f:
+        """Atomic write: tmp file + fsync + rename. Prevents corrupt
+        state JSON if the bot crashes mid-write (which would silently
+        orphan an open position on next restart)."""
+        path = self._state_path()
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(self.state.to_dict(), f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
 
     def load_state(self):
         """Load state for today, or reset if stale."""
@@ -179,6 +193,11 @@ class Signal:
     # =========================================================================
 
     async def on_bar_complete(self, bar: dict):
+        """Lock-wrapped entry — see _on_bar_complete_impl for body."""
+        async with self._lock:
+            await self._on_bar_complete_impl(bar)
+
+    async def _on_bar_complete_impl(self, bar: dict):
         """
         Called when a 5-min bar completes via Lightstreamer tick-bar builder.
         Checks if it is our bar 4 (or bar 5 in hybrid mode).
@@ -238,6 +257,11 @@ class Signal:
             self._bar5_event.set()
 
     async def _on_stop_exit(self, result: dict):
+        """Lock-wrapped entry — see _on_stop_exit_impl."""
+        async with self._lock:
+            await self._on_stop_exit_impl(result)
+
+    async def _on_stop_exit_impl(self, result: dict):
         """Called by broker when tick-based stop monitor triggers a market close."""
         exit_price = result["exit_price"]
         exit_intended = result.get("exit_intended", exit_price)
@@ -453,7 +477,34 @@ class Signal:
 
     async def _arm_bracket(self):
         """Place OCA bracket: both directions armed, tick-triggered."""
-        qty = config.NUM_CONTRACTS
+        # Portfolio risk gate — daily/weekly loss limit, concurrent positions,
+        # consecutive losses, /pause sentinel. All in one call.
+        try:
+            from asrs.risk_gate import check_entry_allowed, position_size_contracts
+            allowed, reason = check_entry_allowed(self.name)
+            if not allowed:
+                logger.warning(f"[{self.name}] RISK GATE blocked: {reason}")
+                await self.alert(f"[{self.name}] RISK GATE: {reason}")
+                self.state.phase = Phase.DONE
+                self.save_state()
+                return
+        except Exception as e:
+            logger.error(f"[{self.name}] risk_gate error (failing open): {e}", exc_info=True)
+
+        # Vol-targeted position sizing — replaces fixed NUM_CONTRACTS.
+        # Stop distance for sizing is the *initial* stop (bar range + buffer).
+        try:
+            stop_distance_pts = self.state.bar_range + self.cfg["buffer"] * 2
+            qty = position_size_contracts(
+                signal_name=self.name,
+                instrument=self.instrument,
+                stop_distance_pts=stop_distance_pts,
+                gbp_per_pt=float(self.cfg.get("gbp_per_pt", 1.0)),
+                max_contracts=config.MAX_CONTRACTS,
+            )
+        except Exception as e:
+            logger.error(f"[{self.name}] sizing failed (falling back to NUM_CONTRACTS): {e}")
+            qty = config.NUM_CONTRACTS
         result = await self.broker.place_oca_bracket(
             buy_price=self.state.buy_level,
             sell_price=self.state.sell_level,
@@ -477,6 +528,24 @@ class Signal:
         self.load_state()
         if self.state.phase != Phase.BRACKET_ARMED:
             return
+
+        # Risk gate at tick trigger as well — guards against state changes
+        # between bracket arm and tick fire (loss limit hit since arming, etc).
+        try:
+            from asrs.risk_gate import check_entry_allowed
+            allowed, reason = check_entry_allowed(self.name)
+            if not allowed:
+                logger.warning(f"[{self.name}] on_tick_trigger RISK GATE blocked: {reason}")
+                try:
+                    await self.broker.deactivate_bracket()
+                except Exception:
+                    pass
+                self.state.phase = Phase.DONE
+                self.save_state()
+                await self.alert(f"[{self.name}] RISK GATE: {reason} — entry refused")
+                return
+        except Exception as e:
+            logger.error(f"[{self.name}] tick risk_gate error: {e}", exc_info=True)
 
         direction = trigger["direction"]    # "LONG" or "SHORT"
         fill_price = trigger["fill_price"]
@@ -509,11 +578,23 @@ class Signal:
             self.save_state()
             return
 
-        # Process fill
-        self._process_fill(direction, fill_price, deal_id)
+        # Process fill (includes microstructure capture for TCA)
+        self._process_fill(direction, fill_price, deal_id, trigger=trigger)
 
-        # Activate tick-based stop monitor (IG disaster stop already set via market order)
+        # Activate tick-based stop monitor (intra-bar trail / BE / phantom-wick filter)
         self.broker.activate_stop_monitor(direction, self.state.trailing_stop)
+
+        # Place a SERVER-SIDE backup stop on the broker. This is the
+        # belt-and-braces protection that survives the bot dying or losing
+        # network connectivity. Tick monitor handles BE/trail mid-session;
+        # this resting stop saves the account if the bot is dead.
+        stop_placed = await self._place_stop_with_retry()
+        if not stop_placed:
+            await self.alert(
+                f"[{self.name}] CRITICAL: server-side stop placement FAILED "
+                f"after retries. Position closed by emergency path."
+            )
+            return
 
         await self.alert(
             f"<b>{self.name} {direction} ENTRY</b>\n"
@@ -522,7 +603,7 @@ class Signal:
             f"Entry {self.state.entries_used}/{self.cfg['max_entries']}"
         )
 
-    def _process_fill(self, direction: str, fill_price: float, deal_id: str = ""):
+    def _process_fill(self, direction: str, fill_price: float, deal_id: str = "", trigger: dict | None = None):
         """Update state for a new entry fill."""
         self.state.direction = direction
         self.state.entry_price = fill_price
@@ -552,7 +633,7 @@ class Signal:
         intended = self.state.buy_level if direction == "LONG" else self.state.sell_level
         entry_slip = round(fill_price - intended, 1) if direction == "LONG" else round(intended - fill_price, 1)
 
-        self.state.trades.append({
+        trade_row = {
             "num": self.state.entries_used,
             "direction": direction,
             "entry": fill_price,
@@ -562,7 +643,14 @@ class Signal:
             "time": datetime.now(self.tz).strftime("%H:%M"),
             "signal_bar": self.state.bar_number,
             "session": f"S{self.session}",
-        })
+        }
+        if trigger:
+            # TCA fields — captured at the moment of tick trigger
+            trade_row["trigger_bid"] = trigger.get("trigger_bid", 0)
+            trade_row["trigger_ofr"] = trigger.get("trigger_ofr", 0)
+            trade_row["trigger_spread"] = trigger.get("trigger_spread", 0)
+            trade_row["trigger_last"] = trigger.get("trigger_last", 0)
+        self.state.trades.append(trade_row)
         self.save_state()
 
     # =========================================================================
@@ -570,6 +658,11 @@ class Signal:
     # =========================================================================
 
     async def monitor_cycle(self):
+        """Lock-wrapped entry — see _monitor_cycle_impl for body."""
+        async with self._lock:
+            await self._monitor_cycle_impl()
+
+    async def _monitor_cycle_impl(self):
         """
         Called every minute by scheduler.
         Handles: bracket trigger polling, trailing stop, breakeven, adds,

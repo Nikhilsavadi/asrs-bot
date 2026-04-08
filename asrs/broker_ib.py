@@ -29,12 +29,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 import pandas as pd
 from ib_async import (
-    Contract, Future, MarketOrder, StopOrder, LimitOrder, Trade,
+    Contract, Future, MarketOrder, StopOrder, LimitOrder, Trade, TagValue,
 )
 
 from shared.ib_session import IBSharedSession
@@ -86,6 +87,11 @@ class IBBroker:
         # IBKR-specific: parallel real stop order (belt + braces)
         self._real_stop_trade: Trade | None = None
 
+        # Captured event loop for sync→async scheduling from tick handlers.
+        # Set in connect(). Avoids asyncio.get_event_loop() (deprecated 3.10+,
+        # raises 3.12).
+        self._loop: asyncio.AbstractEventLoop | None = None
+
         # Currency passthrough for compatibility with main.py
         self.currency = self.spec.currency
         # "epic" alias so existing main.py code compiles unchanged
@@ -98,6 +104,9 @@ class IBBroker:
         if not await self._shared.ensure_connected():
             self.connected = False
             return False
+
+        # Capture loop for sync→async scheduling from tick handlers
+        self._loop = asyncio.get_running_loop()
 
         # Dynamically resolve front-month from IBKR's contract calendar
         # (handles CBOT/CME/EUREX expiry quirks without hardcoding rules)
@@ -226,9 +235,26 @@ class IBBroker:
                 )
         # Also move the real backup stop on IBKR
         if self._real_stop_trade:
-            asyncio.get_event_loop().create_task(
-                self._modify_real_stop(new_stop)
-            )
+            self._schedule(self._modify_real_stop(new_stop))
+
+    def _schedule(self, coro) -> None:
+        """Schedule a coroutine on the captured loop from a sync context.
+
+        Used by sync ib_async event handlers (tick callbacks) to fire async
+        execution paths. Avoids asyncio.get_event_loop() which is deprecated
+        on Python 3.10+ and raises on 3.12 outside a running loop.
+        """
+        loop = self._loop
+        if loop is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                logger.error(f"{self.instrument}: no loop available to schedule {coro}")
+                return
+        if loop.is_running():
+            asyncio.run_coroutine_threadsafe(coro, loop)
+        else:
+            loop.create_task(coro)
 
     def deactivate_stop_monitor(self) -> None:
         if self._stop_monitor:
@@ -283,8 +309,7 @@ class IBBroker:
                     f"stop={stop} last={check_price:.2f} "
                     f"(bid={bid:.2f} ofr={ofr:.2f})"
                 )
-                loop = asyncio.get_event_loop()
-                loop.create_task(self._execute_stop_exit(sm["direction"], exit_price))
+                self._schedule(self._execute_stop_exit(sm["direction"], exit_price))
 
         # 2. Bracket trigger
         if not self._pending_bracket or not self._pending_bracket.get("active"):
@@ -314,12 +339,16 @@ class IBBroker:
         self._tick_trigger_active = True
         bracket["active"] = False
         trigger_price = ofr if triggered_dir == "BUY" else bid
+        # Capture market microstructure at the moment of trigger for TCA
+        bracket["_trigger_bid"] = bid
+        bracket["_trigger_ofr"] = ofr
+        bracket["_trigger_spread"] = round(spread, 2)
+        bracket["_trigger_last"] = last
         logger.info(
             f"Tick trigger ({self.instrument}): {triggered_dir} @ {trigger_price:.2f} "
             f"(spread={spread:.1f})"
         )
-        loop = asyncio.get_event_loop()
-        loop.create_task(self._execute_tick_trigger(triggered_dir, trigger_price, bracket))
+        self._schedule(self._execute_tick_trigger(triggered_dir, trigger_price, bracket))
 
     async def _execute_tick_trigger(
         self, direction: str, price: float, bracket: dict,
@@ -348,6 +377,10 @@ class IBBroker:
                 "direction": "LONG" if direction == "BUY" else "SHORT",
                 "fill_price": result.get("avg_price", price),
                 "order_id": result.get("order_id", ""),
+                "trigger_bid": bracket.get("_trigger_bid", 0),
+                "trigger_ofr": bracket.get("_trigger_ofr", 0),
+                "trigger_spread": bracket.get("_trigger_spread", 0),
+                "trigger_last": bracket.get("_trigger_last", 0),
             }
             for cb in self._on_trigger_callbacks:
                 try:
@@ -502,6 +535,19 @@ class IBBroker:
             order = MarketOrder(
                 action=action, totalQuantity=qty, tif="DAY", transmit=True,
             )
+            # IBKR Adaptive Algo — wraps the market order with snap-to-mid
+            # routing. Documented to give better fills on average than raw
+            # MKT. Priority "Normal" balances price improvement vs fill speed.
+            # Override via env IB_ADAPTIVE_PRIORITY=Urgent for fast-fill mode.
+            try:
+                priority = os.getenv("IB_ADAPTIVE_PRIORITY", "Normal")
+                order.algoStrategy = "Adaptive"
+                order.algoParams = [TagValue("adaptivePriority", priority)]
+            except Exception as e:
+                logger.warning(f"Adaptive algo wrap failed (falling back to raw MKT): {e}")
+            # Tag every order so it can be reconciled by signal/date later.
+            from datetime import datetime as _dt
+            order.orderRef = f"ASRS_{self.instrument}_{_dt.now().strftime('%Y%m%d_%H%M%S')}"
             trade = self._shared.ib.placeOrder(self.contract, order)
 
             # Wait up to 5s for fill
@@ -567,6 +613,8 @@ class IBBroker:
                 action=action, totalQuantity=qty,
                 stopPrice=stop_price, tif="DAY", transmit=True,
             )
+            from datetime import datetime as _dt
+            order.orderRef = f"ASRS_STOP_{self.instrument}_{_dt.now().strftime('%Y%m%d_%H%M%S')}"
             trade = self._shared.ib.placeOrder(self.contract, order)
             await asyncio.sleep(0.3)
             self._real_stop_trade = trade
