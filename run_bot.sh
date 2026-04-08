@@ -48,6 +48,7 @@ while true; do
     CONSECUTIVE_LOSS_KILL="${CONSECUTIVE_LOSS_KILL:-6}" \
     RISK_PCT_PER_TRADE="${RISK_PCT_PER_TRADE:-0.5}" \
     MAX_CONTRACTS="${MAX_CONTRACTS:-5}" \
+    IB_ADAPTIVE_PRIORITY="${IB_ADAPTIVE_PRIORITY:-Urgent}" \
         python3 -m asrs.main 2>&1 | tee -a "$LOG_DIR/asrs.stderr.log"
 
     exitcode=$?
