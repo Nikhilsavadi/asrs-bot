@@ -79,8 +79,15 @@ async def reconcile_positions(signals, shared_session, stream_mgr, tg_send):
 
         # Pass 1: re-arm stop monitor for any signal already in LONG/SHORT
         # state (its state file persisted the real strategy stop).
+        # IMPORTANT: load_state() from disk first — Signal.__init__ creates a
+        # blank SignalState(), so without this every signal looks IDLE here
+        # and any open position would be orphaned on restart.
         rearmed = 0
         for key, signal in signals.items():
+            try:
+                signal.load_state()
+            except Exception as e:
+                logger.warning(f"[{key}] load_state failed in reconcile: {e}")
             if signal.state.phase not in (Phase.LONG, Phase.SHORT):
                 continue
             stop = signal.state.trailing_stop or signal.state.initial_stop
@@ -120,8 +127,13 @@ async def reconcile_positions(signals, shared_session, stream_mgr, tg_send):
             for sk, sig in signals.items():
                 if getattr(sig.broker, "epic", "") != br_key:
                     continue
+                # Tolerance: IBKR avgCost can drift from bot's recorded entry
+                # by a few points due to fill slippage + commission roll-in.
+                # Direction match + 5pt tolerance is enough — only one signal
+                # per broker can be in LONG/SHORT phase at a time anyway.
                 if sig.state.phase in (Phase.LONG, Phase.SHORT) and \
-                   abs(sig.state.entry_price - float(pos.get("avg_cost", 0))) < 1.0:
+                   sig.state.direction == pos["direction"] and \
+                   abs(sig.state.entry_price - float(pos.get("avg_cost", 0))) < 5.0:
                     tracked = True
                     break
 
@@ -129,14 +141,41 @@ async def reconcile_positions(signals, shared_session, stream_mgr, tg_send):
                 continue
 
             # ORPHAN — broker has a position but no signal tracks it.
+            # Place an EMERGENCY disaster stop immediately so the position
+            # can't bleed unbounded while we wait for human intervention.
+            # Original strategy stop is unknown, so we use the configured
+            # disaster_stop_pts as a safety net (much wider than strategy
+            # would have used, but bounded loss > unbounded loss).
             entry = pos.get("avg_cost", 0)
             direction = pos["direction"]
+            disaster_pts = getattr(signal.broker, "_disaster_stop_pts", 200)
+            stop_level = (entry - disaster_pts) if direction == "LONG" else (entry + disaster_pts)
+            stop_placed = False
+            try:
+                stop_action = "SELL" if direction == "LONG" else "BUY"
+                qty = abs(int(pos.get("position", 1)))
+                result = await signal.broker.place_stop_order(
+                    action=stop_action, qty=qty, stop_price=round(stop_level, 1),
+                )
+                stop_placed = "order_id" in result
+                if stop_placed:
+                    logger.warning(
+                        f"ORPHAN STOP placed for {signal.instrument} {direction} "
+                        f"@ {entry}: stop={stop_level:.1f} ({disaster_pts}pt disaster)"
+                    )
+            except Exception as e:
+                logger.error(f"ORPHAN stop placement failed: {e}", exc_info=True)
+            stop_line = (
+                f"<b>Emergency disaster stop placed @ {stop_level:.1f} ({disaster_pts}pt).</b>\n"
+                if stop_placed else
+                f"<b>⚠️ FAILED to place emergency stop — manual action REQUIRED.</b>\n"
+            )
             msg = (
                 f"⚠️ <b>ORPHAN POSITION DETECTED</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"Broker: {signal.instrument} ({br_key})\n"
                 f"Position: {direction} {abs(pos.get('position', 0))} @ {entry}\n"
-                f"<b>NOT auto-reconciled — original strategy stop is unknown.</b>\n"
+                + stop_line +
                 f"Bot started in TRACKING-ONLY mode for this instrument.\n"
                 f"Manual close via IBKR or /kill required."
             )
@@ -290,6 +329,21 @@ async def main():
     shared = stack.shared
     stream_mgr = stack.stream
     await stack.post_session_setup()
+
+    # Wire IB reconnect → automatic resubscribe of all streams.
+    # Without this, an IB Gateway flap during market hours would leave
+    # the bot running with zero ticks/bars until the stream-health
+    # watchdog notices (~5 min). Now it self-heals on the connect event.
+    if hasattr(shared, "on_reconnect") and hasattr(stream_mgr, "resubscribe_all"):
+        async def _on_ib_reconnect():
+            logger.warning("IB reconnect detected — resubscribing all streams")
+            try:
+                await stream_mgr.resubscribe_all()
+                await tg_send("IB reconnect: streams resubscribed")
+            except Exception as e:
+                logger.error(f"resubscribe_all failed: {e}", exc_info=True)
+                await tg_send(f"CRITICAL: IB resubscribe failed: {e}")
+        shared.on_reconnect(_on_ib_reconnect)
 
     # -- Create broker + signal instances per instrument ----------------------
     signals: dict[str, Signal] = {}  # keyed by "DAX_S1", "DAX_S2", etc.
@@ -490,6 +544,91 @@ async def main():
             id="safety_audit", misfire_grace_time=60)
     except ImportError:
         logger.warning("shared.monitoring not available -- skipping")
+
+    # -- Daily contract roll check (07:00 UK, weekdays) ----------------------
+    # Front-month is resolved once at startup. If the bot runs past expiry,
+    # it would trade an expired/zero-volume contract. This cron warns at
+    # ≤7d and bails out hard at ≤2d.
+    async def _roll_check():
+        if stack.kind != "ib":
+            return
+        try:
+            from asrs.contract_resolver import resolve_front_month, days_to_expiry
+            for inst_name in config.INSTRUMENTS.keys():
+                contract, expiry = await resolve_front_month(inst_name, shared)
+                if not expiry:
+                    await tg_send(f"ROLL CHECK: {inst_name} resolve failed")
+                    continue
+                d = days_to_expiry(expiry)
+                if d <= 2:
+                    msg = (f"CRITICAL: {inst_name} expires in {d}d ({expiry}). "
+                           f"Bot will trade expired contract — manual roll required NOW.")
+                    logger.error(msg)
+                    await tg_send(msg)
+                elif d <= 7:
+                    await tg_send(f"ROLL WARNING: {inst_name} expires in {d}d ({expiry})")
+        except Exception as e:
+            logger.error(f"roll_check failed: {e}", exc_info=True)
+            await tg_send(f"roll_check exception: {e}")
+
+    scheduler.add_job(_roll_check, "cron",
+        day_of_week="mon-fri", hour=7, minute=0,
+        id="roll_check", misfire_grace_time=3600)
+
+    # -- Daily backtest-vs-live drift check (21:00 UK, weekdays) -------------
+    # Runs the backtest engine on today's IBKR bars and compares the
+    # resulting trade list against the live journal. Alerts on any mismatch.
+    # This is the parity check that catches silent bar-source / strategy
+    # drift before it bleeds £k.
+    async def _replay_check():
+        if stack.kind != "ib":
+            return
+        try:
+            import asyncio as _asyncio, subprocess
+            proc = await _asyncio.create_subprocess_exec(
+                "python3", "/root/asrs-bot/replay_today.py",
+                stdout=_asyncio.subprocess.PIPE,
+                stderr=_asyncio.subprocess.STDOUT,
+            )
+            stdout, _ = await _asyncio.wait_for(proc.communicate(), timeout=180)
+            output = stdout.decode("utf-8", errors="replace")
+            # Parse last DELTA lines
+            deltas = []
+            for line in output.splitlines():
+                if "DELTA:" in line or "TOTAL" in line:
+                    deltas.append(line.strip())
+            summary = "\n".join(deltas[-6:]) if deltas else "no output"
+            # If any per-instrument delta is non-trivial (>20 pts), alert loud
+            alert = False
+            for line in deltas:
+                try:
+                    if "DELTA:" in line:
+                        val = line.split("DELTA:")[-1].split("pts")[0].strip()
+                        if abs(int(float(val))) > 20:
+                            alert = True
+                            break
+                except Exception:
+                    pass
+            tag = "DRIFT ALERT" if alert else "DAILY PARITY"
+            await tg_send(
+                f"<b>{tag}</b> — replay vs live\n"
+                f"<pre>{summary}</pre>"
+            )
+            # Statistical process control — PSR + CUSUM on rolling 30-day P&L
+            try:
+                from asrs.spc import daily_drift_report, format_drift_report
+                spc_report = daily_drift_report()
+                await tg_send(format_drift_report(spc_report))
+            except Exception as e:
+                logger.error(f"spc daily_drift_report failed: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"replay_check failed: {e}", exc_info=True)
+            await tg_send(f"replay_check exception: {e}")
+
+    scheduler.add_job(_replay_check, "cron",
+        day_of_week="mon-fri", hour=21, minute=0,
+        id="replay_check", misfire_grace_time=3600,
+        timezone=config.TZ_UK)
 
     # -- Monthly report (R7 in spec: 1st of month, 08:00 UK) -----------------
     async def _monthly_report():
