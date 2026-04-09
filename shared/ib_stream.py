@@ -18,7 +18,7 @@ import asyncio
 import logging
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 import pandas as pd
@@ -73,6 +73,7 @@ class IBStreamManager:
         # Wire IB events to our dispatch
         self.ib.pendingTickersEvent += self._on_pending_tickers
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._wall_clock_task: asyncio.Task | None = None
 
     # ── Subscribe ───────────────────────────────────────────────────
 
@@ -100,6 +101,11 @@ class IBStreamManager:
 
         self._contracts[key] = contract
         self._loop = asyncio.get_event_loop()
+
+        # Start wall-clock finaliser task once (on first subscribe)
+        if self._wall_clock_task is None or self._wall_clock_task.done():
+            self._wall_clock_task = self._loop.create_task(self._wall_clock_finalizer())
+            logger.info("Wall-clock bar finaliser started")
 
         # 1. reqMktData for quote stream (stop monitor, entry trigger, tick callbacks)
         #    genericTickList="233" = RT Volume → guaranteed last-trade price +
@@ -169,31 +175,11 @@ class IBStreamManager:
         o = float(latest.open_); h = float(latest.high); l = float(latest.low); c = float(latest.close)
         v = float(getattr(latest, "volume", 0) or 0)
 
-        if cur is None or cur["start"] != five_min_start:
-            # Boundary crossed — finalise previous and start new
-            if cur is not None:
-                completed = {
-                    "time": cur["start"],
-                    "Open": cur["open"], "High": cur["high"],
-                    "Low": cur["low"], "Close": cur["close"],
-                    "Volume": cur["volume"],
-                }
-                deck = self._candle_bars.setdefault(key, deque(maxlen=500))
-                if deck and deck[-1]["time"] == completed["time"]:
-                    deck[-1] = completed
-                else:
-                    deck.append(completed)
-                self._last_bar_emit[key] = datetime.now(timezone.utc)
-                # Fire candle callbacks
-                for cb in self._candle_callbacks.get(key, []):
-                    try:
-                        if asyncio.iscoroutinefunction(cb):
-                            if self._loop:
-                                self._loop.create_task(cb(completed))
-                        else:
-                            cb(completed)
-                    except Exception as e:
-                        logger.error(f"Candle callback error ({key}): {e}", exc_info=True)
+        if cur is None or cur.get("start") != five_min_start:
+            # Boundary crossed — finalise previous and start new.
+            # Skip if cur was already wall-clock finalised (slot set to None).
+            if cur is not None and cur.get("start") is not None:
+                self._finalize_bar(key, cur, source="rtbar")
             # Start new in-progress 5-min bar from this 5sec bar
             self._building_bar[key] = {
                 "start": five_min_start,
@@ -207,6 +193,179 @@ class IBStreamManager:
                 cur["low"] = l
             cur["close"] = c
             cur["volume"] += v
+
+    def _finalize_bar(self, key: str, cur: dict, source: str = "rtbar") -> None:
+        """Finalise an in-progress 5-min bar: append to deque, fire callbacks.
+
+        Called by both _on_5sec_bar (trade-clock path) and _wall_clock_finalizer
+        (wall-clock path) so sparse-trade contracts (NIY early Tokyo session)
+        still get bars finalised on schedule.
+
+        SAFETY: synth bars NEVER overwrite real (rtbar/wall-clock) bars.
+        """
+        completed = {
+            "time": cur["start"],
+            "Open": cur["open"], "High": cur["high"],
+            "Low": cur["low"], "Close": cur["close"],
+            "Volume": cur["volume"],
+        }
+        deck = self._candle_bars.setdefault(key, deque(maxlen=500))
+        # Find existing bar with this timestamp anywhere in the deque
+        existing_idx = None
+        for i, b in enumerate(deck):
+            if b["time"] == completed["time"]:
+                existing_idx = i
+                break
+        if existing_idx is not None:
+            existing = deck[existing_idx]
+            # Synth bars cannot overwrite anything that already exists.
+            if source.startswith("synth"):
+                return
+            # Real bars can update an existing synth (replace it) or extend
+            # the latest real bar (rare — same timestamp from a re-fire).
+            deck[existing_idx] = completed
+        else:
+            deck.append(completed)
+        self._last_bar_emit[key] = datetime.now(timezone.utc)
+        logger.info(
+            f"Bar finalised ({source}) {key} {completed['time'].strftime('%H:%M')} "
+            f"O={completed['Open']:.0f} H={completed['High']:.0f} "
+            f"L={completed['Low']:.0f} C={completed['Close']:.0f} V={completed['Volume']:.0f}"
+        )
+        for cb in self._candle_callbacks.get(key, []):
+            try:
+                if asyncio.iscoroutinefunction(cb):
+                    if self._loop:
+                        self._loop.create_task(cb(completed))
+                else:
+                    cb(completed)
+            except Exception as e:
+                logger.error(f"Candle callback error ({key}): {e}", exc_info=True)
+
+    def _floor_5min(self, dt: datetime) -> datetime:
+        """Floor a datetime to the nearest 5-minute window start (UTC)."""
+        dt = dt.replace(second=0, microsecond=0)
+        return dt.replace(minute=(dt.minute // 5) * 5)
+
+    def _maybe_insert_zero_trade_bars(self, key: str, now: datetime) -> None:
+        """Detect 5-min windows that have ZERO trades and insert synthetic
+        no-trade bars to keep the deque continuous.
+
+        STRICT SAFETY RULES (learned the hard way 2026-04-09):
+        - Only fill gaps where last_bar is within the LAST 15 MINUTES of
+          wall-clock. If last_bar is older, the contract is in a quiet
+          period (overnight, weekend, maintenance) and we should NOT
+          synthesize anything.
+        - Maximum 2 synth bars per call (10 min of gap fill). The wall-clock
+          loop runs every 2s — if a real outage spans more than 10 min,
+          the watchdog handles it; we don't paper over a longer gap.
+        - NEVER overwrite an existing bar with the same timestamp. Skip if
+          a real bar already exists for the target window.
+        - Synth bars are only valid AFTER the contract has been actively
+          trading recently. The gap-fill is for sub-minute liquidity gaps
+          DURING active trading sessions — not for filling overnight
+          inactivity.
+        """
+        deck = self._candle_bars.get(key)
+        if not deck or len(deck) == 0:
+            return
+        last_bar = deck[-1]
+        last_start = last_bar["time"]
+        if last_start.tzinfo is None:
+            last_start = last_start.replace(tzinfo=timezone.utc)
+
+        # SAFETY 1: only fill gaps when last bar is within 15 min of now.
+        # If we haven't seen a real trade in 15+ min, the contract isn't
+        # trading and synthesizing is wrong.
+        age = (now - last_start).total_seconds()
+        if age > 15 * 60:
+            return
+
+        # The window we EXPECT to land next
+        next_start = last_start + timedelta(minutes=5)
+        cur_window = self._floor_5min(now)
+        # If the in-progress bar is for a future window, only fill the gap
+        # up to (not including) that in-progress window.
+        cur = self._building_bar.get(key)
+        if cur and cur.get("start") and cur["start"] < cur_window:
+            cur_window = cur["start"]
+
+        # SAFETY 2: hard cap at 2 synth bars per call (10 min)
+        MAX_SYNTH_PER_CALL = 2
+        last_close = float(last_bar["Close"])
+        gap_filled = 0
+
+        # Build a set of existing bar timestamps so we never overwrite
+        existing_times = {b["time"] for b in deck}
+
+        while next_start < cur_window and gap_filled < MAX_SYNTH_PER_CALL:
+            # SAFETY 3: never overwrite an existing real bar
+            if next_start in existing_times:
+                next_start = next_start + timedelta(minutes=5)
+                continue
+            synthetic = {
+                "start": next_start,
+                "open": last_close,
+                "high": last_close,
+                "low": last_close,
+                "close": last_close,
+                "volume": 0.0,
+            }
+            self._finalize_bar(key, synthetic, source="synth-no-trades")
+            existing_times.add(next_start)
+            next_start = next_start + timedelta(minutes=5)
+            gap_filled += 1
+
+    async def _wall_clock_finalizer(self) -> None:
+        """
+        Periodic task that walks _building_bar every 2 seconds and finalises
+        any bar whose wall-clock window has closed, even if no new 5sec bar
+        has arrived.
+
+        Also detects 5-min windows with ZERO trades and inserts synthetic
+        no-trade bars to keep the deque continuous (so bar numbering doesn't
+        drift on thin contracts).
+
+        Without this, sparse-trade contracts (NIY early Tokyo session) wait
+        for the NEXT trade print to finalise — which can be 60+ seconds late
+        and miss the strategy's bar5 wait window. Bug discovered 2026-04-09
+        when NIKKEI_S1/S3 fired entries on bar 4 instead of bar 5 because
+        bar 5 finalised after the strategy's wait timeout.
+        """
+        # Wait a touch past each 5-min boundary so the rtbar path has a
+        # chance to finalise first (preferred — has accurate close from
+        # the last 5sec bar). Wall-clock is the fallback.
+        GRACE_S = 8
+        while True:
+            try:
+                await asyncio.sleep(2)
+                now = datetime.now(timezone.utc)
+                # 1. Finalise any in-progress bar whose window has closed
+                for key, cur in list(self._building_bar.items()):
+                    if cur is None:
+                        continue
+                    bar_start = cur["start"]
+                    bar_end = bar_start.replace(microsecond=0) + timedelta(minutes=5)
+                    age = (now - bar_end).total_seconds()
+                    if age >= GRACE_S:
+                        # Window closed > GRACE_S ago and bar still building.
+                        # rtbar path has had its chance; finalise now.
+                        self._finalize_bar(key, cur, source="wall-clock")
+                        # Clear so we don't double-finalise. Next 5sec bar
+                        # arriving in the new window will start a fresh one.
+                        self._building_bar[key] = None
+                # 2. For every subscribed key, check for missing 5-min windows
+                #    (zero-trade gaps) and insert synthetic bars to keep the
+                #    deque continuous.
+                for key in list(self._candle_bars.keys()):
+                    try:
+                        self._maybe_insert_zero_trade_bars(key, now)
+                    except Exception as e:
+                        logger.error(f"zero-trade gap check ({key}): {e}", exc_info=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"_wall_clock_finalizer error: {e}", exc_info=True)
 
     async def subscribe_candles(
         self, contract: Contract, what: str = "TRADES", use_rth: bool = True,

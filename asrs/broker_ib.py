@@ -50,6 +50,18 @@ logger = logging.getLogger(__name__)
 class IBBroker:
     """IBKR broker — one per signal, shares session + stream manager."""
 
+    # Per-contract entry lock shared across all signals on the same contract.
+    # Without this, sibling signals (DAX_S1 + DAX_S2) can both fire on the
+    # same tick and place duplicate market orders before either's
+    # get_position() check reflects the other's fill.
+    _contract_entry_locks: dict[str, asyncio.Lock] = {}
+
+    @classmethod
+    def _get_entry_lock(cls, contract_key: str) -> asyncio.Lock:
+        if contract_key not in cls._contract_entry_locks:
+            cls._contract_entry_locks[contract_key] = asyncio.Lock()
+        return cls._contract_entry_locks[contract_key]
+
     def __init__(
         self,
         shared: IBSharedSession,
@@ -354,15 +366,23 @@ class IBBroker:
         self, direction: str, price: float, bracket: dict,
     ) -> None:
         """Market order on tick breach of bracket level."""
+        # Acquire per-contract entry lock so sibling signals on the same
+        # contract serialize their entries (no double-fill race).
+        lock = self._get_entry_lock(self.contract_key)
         try:
-            # Safety: no existing position
+            await lock.acquire()
+            # Safety: no existing position (re-check INSIDE the lock so
+            # whichever sibling acquires first sees its own fill before the
+            # next sibling gets the lock).
             try:
                 pos = await self.get_position()
                 if pos["direction"] != "FLAT":
                     logger.error(
-                        f"BLOCKED: existing {pos['direction']} on {self.instrument}"
+                        f"BLOCKED: existing {pos['direction']} on {self.instrument} "
+                        f"(sibling already entered)"
                     )
                     self._tick_trigger_active = False
+                    lock.release()
                     return
             except Exception:
                 pass
@@ -391,6 +411,11 @@ class IBBroker:
             logger.error(f"Tick trigger execution failed: {e}", exc_info=True)
         finally:
             self._tick_trigger_active = False
+            try:
+                if lock.locked():
+                    lock.release()
+            except Exception:
+                pass
 
     async def _execute_stop_exit(self, direction: str, exit_price: float) -> None:
         """Market close all positions when tick monitor fires."""
@@ -526,26 +551,51 @@ class IBBroker:
     # ── Order placement ─────────────────────────────────────────────
 
     async def place_market_order(self, action: str, qty: int) -> dict:
-        """Market order entry. Also places a disaster stop on IBKR."""
+        """Market order entry. Also places a disaster stop on IBKR.
+
+        Tries Adaptive Algo first; falls back to raw MKT if rejected
+        (e.g. account doesn't have algo permissions).
+        """
         if not await self.ensure_connected():
             return {"error": "Not connected"}
         if self.contract is None:
             return {"error": "Contract not qualified"}
+
+        # Try Adaptive first, then raw MKT on rejection
+        for use_adaptive in (True, False):
+            result = await self._place_market_order_attempt(action, qty, use_adaptive)
+            if "error" not in result:
+                return result
+            # Detect "algo rejected" errors and retry without algo.
+            err = result.get("error", "").lower()
+            algo_rejected = any(
+                k in err for k in (
+                    "algo", "adaptive", "201", "202", "10268", "10269",
+                    "not allowed", "not supported"
+                )
+            )
+            if not use_adaptive or not algo_rejected:
+                return result
+            logger.warning(
+                f"Adaptive Algo rejected ({self.instrument}): {err} — "
+                f"retrying as raw MKT"
+            )
+        return {"error": "Both adaptive and raw MKT failed"}
+
+    async def _place_market_order_attempt(
+        self, action: str, qty: int, use_adaptive: bool,
+    ) -> dict:
         try:
             order = MarketOrder(
                 action=action, totalQuantity=qty, tif="DAY", transmit=True,
             )
-            # IBKR Adaptive Algo — wraps the market order with snap-to-mid
-            # routing. Documented to give better fills on average than raw
-            # MKT. Priority "Normal" balances price improvement vs fill speed.
-            # Override via env IB_ADAPTIVE_PRIORITY=Urgent for fast-fill mode.
-            try:
-                priority = os.getenv("IB_ADAPTIVE_PRIORITY", "Normal")
-                order.algoStrategy = "Adaptive"
-                order.algoParams = [TagValue("adaptivePriority", priority)]
-            except Exception as e:
-                logger.warning(f"Adaptive algo wrap failed (falling back to raw MKT): {e}")
-            # Tag every order so it can be reconciled by signal/date later.
+            if use_adaptive:
+                try:
+                    priority = os.getenv("IB_ADAPTIVE_PRIORITY", "Urgent")
+                    order.algoStrategy = "Adaptive"
+                    order.algoParams = [TagValue("adaptivePriority", priority)]
+                except Exception as e:
+                    logger.warning(f"Adaptive wrap failed: {e}")
             from datetime import datetime as _dt
             order.orderRef = f"ASRS_{self.instrument}_{_dt.now().strftime('%Y%m%d_%H%M%S')}"
             trade = self._shared.ib.placeOrder(self.contract, order)
@@ -559,13 +609,17 @@ class IBBroker:
                     break
 
             status = trade.orderStatus.status
-            # Some statuses like "Submitted" with fills present mean it filled
-            # before the status field caught up. Treat fills as authoritative.
             if status not in ("Filled",) and not trade.fills:
+                # Surface any error message from the trade log so the
+                # outer loop can decide whether to retry without algo.
+                last_log = ""
+                if trade.log:
+                    last_log = (trade.log[-1].message or "").lower()
                 logger.error(
-                    f"Market order not filled ({self.instrument}): status={status}"
+                    f"Market order not filled ({self.instrument}): "
+                    f"status={status} log={last_log}"
                 )
-                return {"error": f"status={status}"}
+                return {"error": f"status={status} {last_log}"}
 
             fill_price = float(trade.orderStatus.avgFillPrice or 0)
             if not fill_price and trade.fills:

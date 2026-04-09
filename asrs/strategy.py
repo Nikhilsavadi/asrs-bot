@@ -215,12 +215,29 @@ class Signal:
         if bn <= 0:
             return
 
-        # Bar 1: stream alive confirmation via Telegram (once per signal)
+        # Bar 1: stream alive confirmation via Telegram (once per signal per day)
         if bn == 1:
             cache = getattr(self, '_bar_cache', {})
-            if 1 not in cache:
+            # Persisted check: only fire once per session per day, even
+            # across bot restarts. Uses a sentinel file in the state dir.
+            sentinel = os.path.join(
+                self._state_dir,
+                f"{self.name}_bar1_alerted_{datetime.now(self.tz).strftime('%Y%m%d')}.flag"
+            )
+            already_alerted = os.path.exists(sentinel)
+            # Defensive: skip flat synthetic bars (H==L) — those are
+            # zero-trade gap fillers and should not fire bar 1 alerts.
+            is_synth_flat = (bar.get('High') == bar.get('Low') and
+                             bar.get('Open') == bar.get('Close') and
+                             bar.get('High') == bar.get('Open'))
+            if 1 not in cache and not already_alerted and not is_synth_flat:
                 logger.info(f"[{self.name}] Bar 1 complete -- stream alive "
                             f"O={bar['Open']} H={bar['High']} L={bar['Low']} C={bar['Close']}")
+                try:
+                    with open(sentinel, "w") as f:
+                        f.write(datetime.now(self.tz).isoformat())
+                except Exception:
+                    pass
                 import asyncio
                 asyncio.get_event_loop().create_task(self.alert(
                     f"[{self.name}] SESSION ACTIVE\n"
@@ -396,7 +413,10 @@ class Signal:
                     f"Bar 4: H={bar4['High']} L={bar4['Low']} Range={bar4_range}pts"
                 )
                 try:
-                    await asyncio.wait_for(self._bar5_event.wait(), timeout=330)  # 5.5 min max
+                    # 8 min — gives wall-clock finaliser headroom for sparse
+                    # contracts (NIY early Tokyo) where bar 5 finalisation can
+                    # be delayed by 60-90s due to thin trade flow.
+                    await asyncio.wait_for(self._bar5_event.wait(), timeout=480)
                 except asyncio.TimeoutError:
                     pass
                 self._bar5_event = None
