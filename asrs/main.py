@@ -343,12 +343,74 @@ async def main():
             except Exception as e:
                 logger.error(f"resubscribe_all failed: {e}", exc_info=True)
                 await tg_send(f"CRITICAL: IB resubscribe failed: {e}")
+                return
+            # POST-RESUBSCRIBE: validate that any signal currently in
+            # LONG/SHORT phase still has a live broker stop. IBKR holds
+            # resting orders across API client disconnects in normal cases,
+            # but a hard disconnect / Gateway crash can lose them. If the
+            # real stop is gone, re-place it from persisted trailing_stop.
+            try:
+                from asrs.strategy import Phase
+                refilled = 0
+                for _rc_sig in ALL_SIGNALS:
+                    _rc_sig.load_state()
+                    if _rc_sig.state.phase not in (Phase.LONG, Phase.SHORT):
+                        continue
+                    br = _rc_sig.broker
+                    real_stop = getattr(br, "_real_stop_trade", None)
+                    needs_replace = False
+                    if real_stop is None:
+                        needs_replace = True
+                    else:
+                        status = getattr(real_stop.orderStatus, "status", "") if hasattr(real_stop, "orderStatus") else ""
+                        if status not in ("Submitted", "PreSubmitted"):
+                            needs_replace = True
+                    if needs_replace and _rc_sig.state.trailing_stop > 0:
+                        action = "SELL" if _rc_sig.state.direction == "LONG" else "BUY"
+                        try:
+                            await br.place_stop_order(
+                                action=action, qty=1,
+                                stop_price=float(_rc_sig.state.trailing_stop),
+                            )
+                            refilled += 1
+                            logger.warning(
+                                f"[{_rc_sig.name}] post-reconnect: re-placed real stop "
+                                f"@ {_rc_sig.state.trailing_stop}"
+                            )
+                        except Exception as e:
+                            logger.error(f"[{_rc_sig.name}] re-place stop failed: {e}", exc_info=True)
+                            await tg_send(
+                                f"CRITICAL: [{_rc_sig.name}] post-reconnect stop "
+                                f"replace FAILED — manual stop required"
+                            )
+                if refilled:
+                    await tg_send(f"Post-reconnect: re-placed {refilled} real stop(s)")
+            except Exception as e:
+                logger.error(f"post-reconnect stop check failed: {e}", exc_info=True)
         shared.on_reconnect(_on_ib_reconnect)
 
     # -- Create broker + signal instances per instrument ----------------------
     signals: dict[str, Signal] = {}  # keyed by "DAX_S1", "DAX_S2", etc.
 
+    # DISABLE_INSTRUMENTS env: comma-separated list of instruments to skip.
+    # Example: DISABLE_INSTRUMENTS=NIKKEI skips all NIKKEI signals entirely
+    # (no broker, no subscriptions, no scheduler jobs, no Telegram alerts).
+    # Used when an instrument's contract is wrong for current account size
+    # (e.g. NIY at £5k paper — pollutes monitoring with apples-to-oranges data).
+    _disabled_raw = os.getenv("DISABLE_INSTRUMENTS", "").strip()
+    DISABLED_INSTRUMENTS = {
+        x.strip().upper() for x in _disabled_raw.split(",") if x.strip()
+    }
+    if DISABLED_INSTRUMENTS:
+        logger.warning(
+            f"DISABLE_INSTRUMENTS={','.join(sorted(DISABLED_INSTRUMENTS))} "
+            f"— these signals will NOT be loaded"
+        )
+
     for inst_name, inst_cfg in config.INSTRUMENTS.items():
+        if inst_name.upper() in DISABLED_INSTRUMENTS:
+            logger.info(f"Skipping {inst_name} (in DISABLE_INSTRUMENTS)")
+            continue
         # Determine how many sessions (2 or 3) based on config
         max_session = 3 if f"s3_open_hour" in inst_cfg else 2
         inst_signals = []
@@ -386,10 +448,62 @@ async def main():
     # -- Position Reconciliation (before scheduler starts) --------------------
     await reconcile_positions(signals, shared, stream_mgr, tg_send)
 
+    # -- Mid-session morning_routine catchup ---------------------------------
+    # If bot started AFTER a signal's routine_time but BEFORE its session_end,
+    # the cron jobs already fired (and we missed them with no grace). Run
+    # morning_routine catchup so the signal can still trade today.
+    try:
+        from asrs.strategy import Phase
+        from datetime import datetime as _dt
+        catchup = []
+        for inst_name, inst_cfg in config.INSTRUMENTS.items():
+            if inst_name.upper() in DISABLED_INSTRUMENTS:
+                continue
+            inst_tz = ZoneInfo(inst_cfg["timezone"])
+            now_inst = _dt.now(inst_tz)
+            if now_inst.weekday() >= 5:
+                continue  # weekend
+            max_session = 3 if "s3_open_hour" in inst_cfg else 2
+            for sn in range(1, max_session + 1):
+                open_h = inst_cfg[f"s{sn}_open_hour"]
+                open_m = inst_cfg[f"s{sn}_open_minute"]
+                routine_total_m = open_h * 60 + open_m + 21
+                routine_h = routine_total_m // 60
+                routine_m = routine_total_m % 60
+                end_h = inst_cfg["session_end_hour"]
+                end_m = inst_cfg["session_end_minute"]
+                now_total_m = now_inst.hour * 60 + now_inst.minute
+                end_total_m = end_h * 60 + end_m
+                if routine_total_m <= now_total_m < end_total_m:
+                    _catch = signals.get(f"{inst_name}_S{sn}")
+                    if _catch is None:
+                        continue
+                    _catch.load_state()
+                    if _catch.state.phase == Phase.IDLE:
+                        catchup.append((_catch, f"{routine_h:02d}:{routine_m:02d}"))
+        if catchup:
+            for _catch_sig, routine_str in catchup:
+                logger.warning(
+                    f"[{_catch_sig.name}] startup catchup: now in-session past "
+                    f"routine time {routine_str} — running morning_routine"
+                )
+                try:
+                    await _catch_sig.morning_routine()
+                except Exception as e:
+                    logger.error(f"[{_catch_sig.name}] catchup morning_routine failed: {e}", exc_info=True)
+            await tg_send(
+                f"Startup catchup: ran morning_routine for "
+                f"{', '.join(s[0].name for s in catchup)}"
+            )
+    except Exception as e:
+        logger.error(f"Startup mid-session catchup check failed: {e}", exc_info=True)
+
     # -- Scheduler ------------------------------------------------------------
     scheduler = AsyncIOScheduler(timezone=config.TZ_UK)
 
     for inst_name, inst_cfg in config.INSTRUMENTS.items():
+        if inst_name.upper() in DISABLED_INSTRUMENTS:
+            continue
         sched_tz = ZoneInfo(inst_cfg["scheduler_timezone"])
         prefix = inst_name.lower()
         max_session = 3 if "s3_open_hour" in inst_cfg else 2
@@ -555,6 +669,8 @@ async def main():
         try:
             from asrs.contract_resolver import resolve_front_month, days_to_expiry
             for inst_name in config.INSTRUMENTS.keys():
+                if inst_name.upper() in DISABLED_INSTRUMENTS:
+                    continue
                 contract, expiry = await resolve_front_month(inst_name, shared)
                 if not expiry:
                     await tg_send(f"ROLL CHECK: {inst_name} resolve failed")

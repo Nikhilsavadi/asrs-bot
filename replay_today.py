@@ -3,9 +3,17 @@ replay_today.py — Pull fresh IBKR bars for today and run the backtest
 engine against them, then compare to live trades.
 
 Confirms whether live execution matches what the backtest would do.
+
+Usage:
+    python3 replay_today.py                  # today UTC
+    python3 replay_today.py 2026-04-09       # specific date
+    REPLAY_DATE=2026-04-09 python3 replay_today.py
+    REPLAY_INSTRUMENTS=NIKKEI python3 replay_today.py
 """
 import asyncio
+import os
 import sqlite3
+import sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import pandas as pd
@@ -30,7 +38,10 @@ bt.INSTRUMENTS["NIKKEI"]["max_risk_gbp"] = 50.0
 INSTRUMENTS = {
     "DAX": {"symbol": "DAX", "exchange": "EUREX", "currency": "EUR", "tc": "FDAX"},
     "US30": {"symbol": "YM", "exchange": "CBOT", "currency": "USD", "tc": ""},
-    "NIKKEI": {"symbol": "NKD", "exchange": "CME", "currency": "USD", "tc": ""},
+    # NIKKEI: live trades NIY (yen, ¥500/pt) for £5k account size.
+    # Backtest historically used NKD (USD, $5/pt). Use NIY here so the
+    # replay compares apples-to-apples against the bars the bot actually saw.
+    "NIKKEI": {"symbol": "NIY", "exchange": "CME", "currency": "JPY", "tc": "NIY"},
 }
 
 
@@ -95,35 +106,52 @@ def run_for_inst(df, inst_name, target_date):
 
 
 async def main():
+    # Resolve target date: argv > env > today UTC
+    if len(sys.argv) > 1:
+        target_date_str = sys.argv[1]
+    else:
+        target_date_str = os.getenv("REPLAY_DATE", datetime.utcnow().strftime("%Y-%m-%d"))
+    target_date = datetime.strptime(target_date_str, "%Y-%m-%d").date()
+
+    # Optional instrument filter
+    inst_filter = os.getenv("REPLAY_INSTRUMENTS", "").strip()
+    if inst_filter:
+        wanted = {x.strip().upper() for x in inst_filter.split(",")}
+    else:
+        wanted = set(INSTRUMENTS.keys())
+
     s = IBSharedSession.get_instance()
     await s.connect()
-    print(f"Pulling today's bars from IBKR (LIQUID contracts)...\n")
+    print(f"Pulling bars for {target_date_str} from IBKR (LIQUID contracts)...\n")
 
     bt_results = {}
     for inst, spec in INSTRUMENTS.items():
+        if inst not in wanted:
+            continue
         contract, df = await fetch_bars(s, spec)
         if contract is None or df is None or df.empty:
             print(f"  {inst}: failed to fetch")
             continue
-        target = datetime.now().date() if datetime.now().hour > 0 else datetime.now().date()
-        # NIKKEI Tokyo session ran on 2026-04-08 JST which started at 01:00 UTC,
-        # but the date label is 2026-04-08. DAX/US30 trade today.
-        target_date = datetime(2026, 4, 8).date()
         trades = run_for_inst(df, inst, target_date)
         bt_results[inst] = trades
 
     # Compare to live
     c = sqlite3.connect("/root/asrs-bot/data/trade_journal.db")
-    live_rows = c.execute("""SELECT instrument, trade_num, direction, entry_price, exit_price,
-                                    pnl_pts, exit_reason, entry_time
-                             FROM trades WHERE mode='paper' AND date='2026-04-08'
-                             ORDER BY rowid""").fetchall()
+    placeholders = ",".join(["?"] * len(wanted))
+    live_rows = c.execute(
+        f"""SELECT instrument, trade_num, direction, entry_price, exit_price,
+                   pnl_pts, exit_reason, entry_time
+            FROM trades
+            WHERE mode='paper' AND date=? AND instrument IN ({placeholders})
+            ORDER BY rowid""",
+        (target_date_str, *sorted(wanted)),
+    ).fetchall()
 
     print(f"\n{'='*78}")
-    print(f"  COMPARISON  2026-04-08")
+    print(f"  COMPARISON  {target_date_str}")
     print(f"{'='*78}")
 
-    for inst in ["DAX", "US30", "NIKKEI"]:
+    for inst in [i for i in ["DAX", "US30", "NIKKEI"] if i in wanted]:
         print(f"\n──── {inst} ────")
         bt_t = bt_results.get(inst, [])
         live_t = [r for r in live_rows if r[0] == inst]
