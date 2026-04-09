@@ -696,13 +696,43 @@ class Signal:
                 await self._poll_bracket_trigger()
                 return
 
-            # If levels set but bracket not armed (e.g. after slippage close),
-            # re-arm once price is back between the levels
+            # Re-arm bracket after a stop or slippage close.
+            #
+            # Old behaviour: required price to be strictly BETWEEN levels.
+            # On strong continuation moves price never returns inside the
+            # range, so live missed re-entries the backtest captured.
+            # US30_S2 lost ~£250 to this on 2026-04-09.
+            #
+            # New behaviour: re-arm if entering at the current price would
+            # PASS the existing slippage check. That means re-arming when
+            # price is within `max_slip` of the relevant level, OR strictly
+            # between the levels. On a continuation move, as soon as price
+            # pulls back to within `max_slip` of buy_level, we re-arm and
+            # the tick trigger fires almost immediately — capturing the
+            # re-entry without burning entries on excessive-slippage closes.
             if self.state.phase == Phase.LEVELS_SET and self.state.buy_level > 0:
                 price = await self.broker.get_current_price()
-                if price and self.state.sell_level < price < self.state.buy_level:
-                    logger.info(f"[{self.name}] Price {price} back between levels — re-arming bracket")
-                    await self._arm_bracket()
+                if price:
+                    initial_risk = self.state.bar_range + self.cfg["buffer"] * 2
+                    max_slip = initial_risk * self.cfg["max_slippage_pct"]
+                    # Acceptable re-arm window: from sell_level - max_slip
+                    # (price below the breakout, will trigger SHORT cleanly)
+                    # to buy_level + max_slip (price just above the breakout,
+                    # will trigger LONG with tolerable slippage).
+                    rearm_low  = self.state.sell_level - max_slip
+                    rearm_high = self.state.buy_level + max_slip
+                    if rearm_low < price < rearm_high:
+                        logger.info(
+                            f"[{self.name}] Price {price} within re-arm window "
+                            f"[{rearm_low:.1f}, {rearm_high:.1f}] (max_slip={max_slip:.1f}) — "
+                            f"re-arming bracket"
+                        )
+                        await self._arm_bracket()
+                    else:
+                        logger.debug(
+                            f"[{self.name}] LEVELS_SET wait: price {price} outside "
+                            f"re-arm window [{rearm_low:.1f}, {rearm_high:.1f}]"
+                        )
                 return
 
             # If in active position, manage it
