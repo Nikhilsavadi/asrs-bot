@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -40,16 +40,30 @@ TZ_UK = ZoneInfo("Europe/London")
 
 @dataclass
 class RiskGateConfig:
-    starting_equity_gbp: float = float(os.getenv("STARTING_EQUITY_GBP", "5000"))
-    daily_loss_limit_pct: float = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "3.0"))
-    weekly_loss_limit_pct: float = float(os.getenv("WEEKLY_LOSS_LIMIT_PCT", "6.0"))
-    max_concurrent_positions: int = int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))
-    consecutive_loss_kill: int = int(os.getenv("CONSECUTIVE_LOSS_KILL", "6"))
-    risk_pct_per_trade: float = float(os.getenv("RISK_PCT_PER_TRADE", "0.5"))
+    """Risk gate config read from env vars.
+
+    Uses default_factory so each RiskGateConfig() call re-reads os.environ.
+    Without this, the env is frozen at class-definition time (module import)
+    and changing STARTING_EQUITY_GBP etc. requires a full python restart —
+    which breaks testing AND breaks any runtime env override.
+    """
+    starting_equity_gbp: float = field(
+        default_factory=lambda: float(os.getenv("STARTING_EQUITY_GBP", "5000")))
+    daily_loss_limit_pct: float = field(
+        default_factory=lambda: float(os.getenv("DAILY_LOSS_LIMIT_PCT", "3.0")))
+    weekly_loss_limit_pct: float = field(
+        default_factory=lambda: float(os.getenv("WEEKLY_LOSS_LIMIT_PCT", "6.0")))
+    max_concurrent_positions: int = field(
+        default_factory=lambda: int(os.getenv("MAX_CONCURRENT_POSITIONS", "3")))
+    consecutive_loss_kill: int = field(
+        default_factory=lambda: int(os.getenv("CONSECUTIVE_LOSS_KILL", "6")))
+    risk_pct_per_trade: float = field(
+        default_factory=lambda: float(os.getenv("RISK_PCT_PER_TRADE", "0.5")))
     # Ignore trades before this YYYY-MM-DD when computing equity / limits.
     # Use this to reset the gate baseline after fixing bugs (so historic
     # bug-period losses don't permanently lock the gate).
-    start_date: str = os.getenv("RISK_GATE_START_DATE", "")
+    start_date: str = field(
+        default_factory=lambda: os.getenv("RISK_GATE_START_DATE", ""))
 
 
 CFG = RiskGateConfig()

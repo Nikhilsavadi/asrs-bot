@@ -307,8 +307,83 @@ async def check_stream_health_all(shared_session, stream_mgr, tg_send, signals=N
                 )
 
 
+def _validate_startup_env() -> None:
+    """Fail fast on obviously bad configuration.
+
+    Refuses to start if any critical env var is missing, malformed, or
+    outside a sensible range. Every failure mode caught here is one
+    that used to produce "bot is running but silently wrong" behaviour.
+    """
+    errors = []
+
+    # Telegram — must be present or we can't alert the operator
+    if not os.getenv("TELEGRAM_BOT_TOKEN", "").strip():
+        errors.append("TELEGRAM_BOT_TOKEN not set — no alerts possible")
+    if not os.getenv("TELEGRAM_CHAT_ID", "").strip():
+        errors.append("TELEGRAM_CHAT_ID not set — no alerts possible")
+
+    # Risk gate numeric bounds
+    def _num(key: str, default: str, lo: float, hi: float, kind=float):
+        raw = os.getenv(key, default)
+        try:
+            v = kind(raw)
+        except ValueError:
+            errors.append(f"{key}={raw!r} is not a valid {kind.__name__}")
+            return
+        if v < lo or v > hi:
+            errors.append(f"{key}={v} outside allowed range [{lo}, {hi}]")
+
+    _num("STARTING_EQUITY_GBP", "5000", lo=100, hi=10_000_000)
+    _num("RISK_PCT_PER_TRADE", "0.5", lo=0.01, hi=5.0)
+    _num("MAX_CONTRACTS", "10", lo=1, hi=100, kind=int)
+    _num("DAILY_LOSS_LIMIT_PCT", "3.0", lo=0.1, hi=10000.0)
+    _num("WEEKLY_LOSS_LIMIT_PCT", "6.0", lo=0.1, hi=10000.0)
+    _num("MAX_CONCURRENT_POSITIONS", "3", lo=1, hi=20, kind=int)
+    _num("CONSECUTIVE_LOSS_KILL", "6", lo=1, hi=10000, kind=int)
+
+    # Broker selection must be recognised
+    broker_type = os.getenv("BROKER_TYPE", "ig").lower()
+    if broker_type not in ("ig", "ib"):
+        errors.append(f"BROKER_TYPE={broker_type!r} must be 'ig' or 'ib'")
+
+    # IBKR-specific checks
+    if broker_type == "ib":
+        _num("IB_PORT", "4002", lo=1, hi=65535, kind=int)
+        # TWS allows up to 32 SIMULTANEOUS client connections but the ID
+        # value itself can be any int. Upper bound kept generous.
+        _num("IB_CLIENT_ID", "1", lo=0, hi=999, kind=int)
+        priority = os.getenv("IB_ADAPTIVE_PRIORITY", "Urgent")
+        if priority not in ("Urgent", "Normal", "Patient"):
+            errors.append(
+                f"IB_ADAPTIVE_PRIORITY={priority!r} must be "
+                f"Urgent/Normal/Patient"
+            )
+
+    # Runtime directory must be writable
+    runtime_dir = os.getenv("ASRS_RUNTIME_DIR", "/tmp")
+    try:
+        os.makedirs(runtime_dir, exist_ok=True)
+        test_file = os.path.join(runtime_dir, ".asrs_write_test")
+        with open(test_file, "w") as f:
+            f.write("ok")
+        os.remove(test_file)
+    except Exception as e:
+        errors.append(f"ASRS_RUNTIME_DIR={runtime_dir} not writable: {e}")
+
+    if errors:
+        logger.error("=" * 60)
+        logger.error("STARTUP VALIDATION FAILED — refusing to run")
+        for err in errors:
+            logger.error(f"  ✗ {err}")
+        logger.error("=" * 60)
+        raise SystemExit(2)
+
+
 async def main():
     """Boot all 6 signals with one shared IG session."""
+
+    # Fail fast on bad config BEFORE touching broker / scheduler / state.
+    _validate_startup_env()
 
     # Write PID for healthcheck. Path is configurable via ASRS_RUNTIME_DIR
     # so Docker can bind-mount a host-visible directory.
@@ -639,6 +714,48 @@ async def main():
 
     scheduler.add_job(_stream_health, "interval", minutes=5,
         id="stream_health", misfire_grace_time=60)
+
+    # -- Periodic position reconcile (every 60s) -----------------------------
+    # Reconcile was previously ONLY on startup. During normal operation a
+    # broker-side force-close (margin call, manual TWS close, fat-finger
+    # auto-liquidation) would leave the strategy thinking it still has a
+    # position until the next stop hit — or forever. This catches
+    # broker/state divergence within 60s and alerts the operator.
+    async def _periodic_reconcile():
+        if stack.kind != "ib":
+            return
+        try:
+            from asrs.strategy import Phase
+            discrepancies = []
+            for _pr_sig in ALL_SIGNALS:
+                try:
+                    pos = await _pr_sig.broker.get_position()
+                except Exception:
+                    continue
+                pos_dir = pos.get("direction", "FLAT")
+                state_phase = _pr_sig.state.phase
+                state_dir = _pr_sig.state.direction
+                # Case 1: strategy thinks we have a position, broker says FLAT
+                if state_phase in (Phase.LONG, Phase.SHORT) and pos_dir == "FLAT":
+                    discrepancies.append(
+                        f"{_pr_sig.name}: state={state_phase}/{state_dir} "
+                        f"but broker FLAT — position closed externally?"
+                    )
+                # Case 2: strategy thinks we're flat, broker has a position
+                elif state_phase not in (Phase.LONG, Phase.SHORT) and pos_dir != "FLAT":
+                    discrepancies.append(
+                        f"{_pr_sig.name}: state={state_phase} "
+                        f"but broker has {pos_dir} — orphan?"
+                    )
+            if discrepancies:
+                msg = "POSITION RECONCILE MISMATCH:\n" + "\n".join(discrepancies)
+                logger.error(msg)
+                await tg_send(msg)
+        except Exception as e:
+            logger.error(f"_periodic_reconcile error: {e}", exc_info=True)
+
+    scheduler.add_job(_periodic_reconcile, "interval", seconds=60,
+        id="periodic_reconcile", misfire_grace_time=30)
 
     # -- Monitoring: missed job alerts ----------------------------------------
     try:

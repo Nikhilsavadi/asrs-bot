@@ -99,6 +99,15 @@ class IBBroker:
         # IBKR-specific: parallel real stop order (belt + braces)
         self._real_stop_trade: Trade | None = None
 
+        # Consecutive order-error counter. If place_market_order fails
+        # N times in a row (e.g. data permissions pulled mid-session,
+        # margin rejected, algo unavailable), auto-pause the bot via
+        # the sentinel file so we don't hammer IBKR with bad orders.
+        self._consecutive_order_errors: int = 0
+        self._max_consecutive_order_errors: int = int(
+            os.getenv("MAX_CONSECUTIVE_ORDER_ERRORS", "3")
+        )
+
         # Captured event loop for sync→async scheduling from tick handlers.
         # Set in connect(). Avoids asyncio.get_event_loop() (deprecated 3.10+,
         # raises 3.12).
@@ -562,9 +571,12 @@ class IBBroker:
             return {"error": "Contract not qualified"}
 
         # Try Adaptive first, then raw MKT on rejection
+        result = None
         for use_adaptive in (True, False):
             result = await self._place_market_order_attempt(action, qty, use_adaptive)
             if "error" not in result:
+                # Success — reset consecutive error counter
+                self._consecutive_order_errors = 0
                 return result
             # Detect "algo rejected" errors and retry without algo.
             err = result.get("error", "").lower()
@@ -575,12 +587,51 @@ class IBBroker:
                 )
             )
             if not use_adaptive or not algo_rejected:
-                return result
+                break
             logger.warning(
                 f"Adaptive Algo rejected ({self.instrument}): {err} — "
                 f"retrying as raw MKT"
             )
-        return {"error": "Both adaptive and raw MKT failed"}
+        # Final failure path — increment counter + maybe auto-pause
+        self._consecutive_order_errors += 1
+        logger.error(
+            f"Order failure count for {self.instrument}: "
+            f"{self._consecutive_order_errors}/{self._max_consecutive_order_errors}"
+        )
+        if self._consecutive_order_errors >= self._max_consecutive_order_errors:
+            self._auto_pause_on_order_errors()
+        if result is None:
+            result = {"error": "Both adaptive and raw MKT failed"}
+        return result
+
+    def _auto_pause_on_order_errors(self) -> None:
+        """Touch the pause sentinel so no further entries fire. The
+        operator must investigate and /resume once the root cause is
+        resolved (data permission, margin, contract roll, etc.).
+        """
+        try:
+            from telegram_cmd import _set_paused, PAUSE_SENTINEL
+            _set_paused(True)
+            logger.error(
+                f"AUTO-PAUSE: {self._max_consecutive_order_errors} consecutive "
+                f"order errors on {self.instrument}. Sentinel: {PAUSE_SENTINEL}. "
+                f"Operator must investigate and /resume."
+            )
+            # Fire a callback-free telegram if possible
+            try:
+                import asyncio as _asyncio
+                from telegram_cmd import _send
+                if self._loop:
+                    self._loop.create_task(_send(
+                        f"🚨 AUTO-PAUSE: {self._max_consecutive_order_errors} "
+                        f"consecutive order errors on {self.instrument}.\n"
+                        f"Investigate IBKR permissions / margin / roll.\n"
+                        f"Use /resume once fixed."
+                    ))
+            except Exception as e:
+                logger.error(f"Failed to telegram auto-pause alert: {e}")
+        except Exception as e:
+            logger.error(f"Failed to write pause sentinel: {e}", exc_info=True)
 
     async def _place_market_order_attempt(
         self, action: str, qty: int, use_adaptive: bool,
