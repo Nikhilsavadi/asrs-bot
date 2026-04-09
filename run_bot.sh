@@ -37,10 +37,14 @@ while true; do
     echo "[$(date '+%F %T')] Starting bot" | tee -a "$LOG_DIR/wrapper.log"
     started=$(date +%s)
 
+    # PAPER MODE — sized to test the bot at the equity tier the live
+    # account will reach within 6 months. Live wrapper will use a
+    # separate run_live.sh with STARTING_EQUITY_GBP=5000 + the
+    # production loss limits (3%/6%/3 concurrent/6 consecutive).
     LOG_DIR="$LOG_DIR" \
     IB_CLIENT_ID=42 \
     BROKER_TYPE=ib \
-    STARTING_EQUITY_GBP="${STARTING_EQUITY_GBP:-5000}" \
+    STARTING_EQUITY_GBP="${STARTING_EQUITY_GBP:-40000}" \
     RISK_GATE_START_DATE="${RISK_GATE_START_DATE:-2026-04-09}" \
     DAILY_LOSS_LIMIT_PCT="${DAILY_LOSS_LIMIT_PCT:-9999}" \
     WEEKLY_LOSS_LIMIT_PCT="${WEEKLY_LOSS_LIMIT_PCT:-9999}" \
@@ -49,7 +53,7 @@ while true; do
     RISK_PCT_PER_TRADE="${RISK_PCT_PER_TRADE:-0.5}" \
     MAX_CONTRACTS="${MAX_CONTRACTS:-5}" \
     IB_ADAPTIVE_PRIORITY="${IB_ADAPTIVE_PRIORITY:-Urgent}" \
-    DISABLE_INSTRUMENTS="${DISABLE_INSTRUMENTS:-NIKKEI}" \
+    DISABLE_INSTRUMENTS="${DISABLE_INSTRUMENTS:-}" \
         python3 -m asrs.main 2>&1 | tee -a "$LOG_DIR/asrs.stderr.log"
 
     exitcode=$?

@@ -99,7 +99,7 @@ INSTRUMENTS = {
         "epic": "IX.D.NIKKEI.DAILY.IP",
         "currency": "GBP",
         "label": "Nikkei 225",
-        "gbp_per_pt": 2.65,   # NIY ¥500/pt → ~£2.65/pt
+        "gbp_per_pt": 4.0,    # NKD $5/pt → ~£4/pt (matches firstrate backtest)
         "buffer": 2.0,
         "narrow_range": 50,
         "wide_range": 150,

@@ -56,12 +56,12 @@ SPECS: dict[str, ContractSpec] = {
     ),
     "NIKKEI": ContractSpec(
         instrument="NIKKEI",
-        symbol="NIY",                  # Nikkei Yen ¥500/pt (~£2.65/pt)
+        symbol="NKD",                  # Nikkei Dollar $5/pt (~£4/pt)
         exchange="CME",
-        currency="JPY",
+        currency="USD",
         trading_class="",
-        description="Nikkei 225 Yen Future (¥500/pt, CME)",
-        expected_multiplier=500.0,
+        description="Nikkei 225 Dollar Future ($5/pt, CME) — matches firstrate backtest",
+        expected_multiplier=5.0,
     ),
 }
 
