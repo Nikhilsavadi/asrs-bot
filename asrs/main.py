@@ -821,13 +821,33 @@ async def main():
             return
         try:
             import asyncio as _asyncio, subprocess
+            # Path resolution: check container first (/app), fall back to repo root
+            replay_paths = [
+                "/app/replay_today.py",
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "replay_today.py"),
+                "/root/asrs-bot/replay_today.py",
+            ]
+            replay_script = next((p for p in replay_paths if os.path.exists(p)), None)
+            if not replay_script:
+                logger.error(f"_replay_check: replay_today.py not found in any of {replay_paths}")
+                await tg_send("replay_check: script not found in expected paths")
+                return
+            # Only replay enabled instruments — match the bot's actual config
+            enabled = ",".join(
+                inst for inst in config.INSTRUMENTS.keys()
+                if inst.upper() not in DISABLED_INSTRUMENTS
+            )
+            env = {**os.environ, "REPLAY_INSTRUMENTS": enabled}
             proc = await _asyncio.create_subprocess_exec(
-                "python3", "/root/asrs-bot/replay_today.py",
+                "python3", replay_script,
                 stdout=_asyncio.subprocess.PIPE,
                 stderr=_asyncio.subprocess.STDOUT,
+                env=env,
             )
             stdout, _ = await _asyncio.wait_for(proc.communicate(), timeout=180)
             output = stdout.decode("utf-8", errors="replace")
+            # Log full output so we can debug "no output" cases
+            logger.info(f"_replay_check stdout ({len(output)} chars):\n{output[:2000]}")
             # Parse last DELTA lines
             deltas = []
             for line in output.splitlines():
