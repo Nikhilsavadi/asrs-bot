@@ -54,6 +54,10 @@ class IBStreamManager:
         self._rtbar_received: set[str] = set()                # keys that have received >=1 rtbar
         self._use_mid_fallback: set[str] = set()              # keys with no rtbar permissions → mid-tick bars
         self._bar_lists: dict[str, BarDataList] = {}          # reqHistoricalData (warmup)
+        # Last REAL bar timestamp per key (rtbar/wall-clock, NOT synth).
+        # Used by zero-trade gap-fill freshness check so synth bars cannot
+        # self-perpetuate by advancing the deque tail.
+        self._last_real_bar_time: dict[str, datetime] = {}
 
         # Last mid + bid/ofr per key. Also "{key}_bid", "{key}_ofr", "{key}_time"
         self._prices: dict[str, float] = {}
@@ -227,6 +231,11 @@ class IBStreamManager:
         else:
             deck.append(completed)
         self._last_bar_emit[key] = datetime.now(timezone.utc)
+        # Track last REAL bar time separately. The zero-trade gap-fill
+        # uses this (NOT deck[-1]) to decide if the contract is "actively
+        # trading". Without this separation, synth bars self-perpetuate.
+        if not source.startswith("synth"):
+            self._last_real_bar_time[key] = completed["time"]
         logger.info(
             f"Bar finalised ({source}) {key} {completed['time'].strftime('%H:%M')} "
             f"O={completed['Open']:.0f} H={completed['High']:.0f} "
@@ -269,17 +278,25 @@ class IBStreamManager:
         deck = self._candle_bars.get(key)
         if not deck or len(deck) == 0:
             return
+
+        # SAFETY 1: freshness check uses LAST REAL BAR time, not deck[-1].
+        # Synth bars getting inserted into the deque would otherwise
+        # advance the tail and trick this check into perpetually firing.
+        # If we have no real bar OR the last real bar is > 15 min old,
+        # the contract isn't actively trading — refuse to synthesize.
+        last_real = self._last_real_bar_time.get(key)
+        if last_real is None:
+            return
+        if last_real.tzinfo is None:
+            last_real = last_real.replace(tzinfo=timezone.utc)
+        age = (now - last_real).total_seconds()
+        if age > 15 * 60:
+            return
+
         last_bar = deck[-1]
         last_start = last_bar["time"]
         if last_start.tzinfo is None:
             last_start = last_start.replace(tzinfo=timezone.utc)
-
-        # SAFETY 1: only fill gaps when last bar is within 15 min of now.
-        # If we haven't seen a real trade in 15+ min, the contract isn't
-        # trading and synthesizing is wrong.
-        age = (now - last_start).total_seconds()
-        if age > 15 * 60:
-            return
 
         # The window we EXPECT to land next
         next_start = last_start + timedelta(minutes=5)
@@ -576,6 +593,10 @@ class IBStreamManager:
                 "Volume": float(getattr(bar, "volume", 0) or 0),
             })
         self._last_bar_emit[key] = datetime.now(timezone.utc)
+        # Pre-loaded historical bars are real (came from IBKR's HMDS).
+        # Backfill _last_real_bar_time so the first synth gap-fill check
+        # has a baseline to work from.
+        self._last_real_bar_time[key] = bar_time
 
     def _on_bar_update(self, key: str, bars: BarDataList, has_new_bar: bool) -> None:
         """
