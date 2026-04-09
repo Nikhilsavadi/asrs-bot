@@ -1,13 +1,28 @@
 """Tests for re-entry re-arm logic in monitor_cycle.
 
-Regression guard for the US30_S2 -£250 bug discovered 2026-04-09:
-- Live re-entry only fired when price was strictly BETWEEN buy/sell levels
-- Backtest re-enters whenever price touches a level (no slippage modelling)
-- On strong continuation moves, live missed all re-entries
-- Fix: re-arm when price is within `max_slip` of either level, not just inside
+The re-arm gate requires price to be strictly BETWEEN buy_level and
+sell_level. This does TWO jobs:
 
-Also guards against the slippage cascade alternative where immediate
-re-arm on a runaway price burns all entries to slippage closes.
+1. Slippage protection: if price is far above buy_level and we re-arm,
+   the tick trigger fires immediately at the runaway price, the
+   slippage check kills it, entries_used burns through all 3.
+
+2. Direction-flip protection: after a LONG stop-out, requires price to
+   pull back ALL THE WAY to inside the range before allowing a SHORT
+   re-entry. Without this, the bot whipsaws on shallow wicks
+   (LONG → stop → SHORT → stop → LONG → DONE with ~zero P&L).
+
+Trade-off: on monotonic continuation moves where price never returns
+inside the range (US30_S2 on 2026-04-09), live misses re-entries the
+backtest captures. Backtest assumes free fills at level (no slippage
+modelling), so it overstates this re-entry edge. Real headline PF is
+lower than backtest 4.22 by the value of these missed re-entries.
+
+We tried relaxing this to a max_slip window on 2026-04-09 to capture
+the missed re-entries — reverted same day after realising it would
+trigger direction-flip whipsaws on choppy days, which are MUCH more
+common than monotonic continuations. The strict gate is the right
+trade.
 """
 import pytest
 from unittest.mock import MagicMock, AsyncMock
@@ -57,17 +72,16 @@ async def test_rearm_when_price_strictly_inside_levels():
 
 
 @pytest.mark.asyncio
-async def test_rearm_when_price_just_above_buy_level():
-    """Price 5pt above buy_level — within max_slip window → re-arm.
-    Bar range 50, buffer 5, max_slip_pct 0.5 → max_slip = 30pt
-    rearm_high = 48095 + 30 = 48125
-    Price 48100 < 48125 → re-arm."""
+async def test_no_rearm_when_price_just_above_buy_level():
+    """Price 5pt above buy_level — STRICT gate prevents re-arm.
+    This is the direction-flip protection: requires meaningful pullback
+    back inside the range, not just a tick wick. Today's US30_S2 case."""
     sig = _mk_signal_with_levels(
         buy_level=48095, sell_level=48016, bar_range=50,
         current_price=48100,
     )
     await sig._monitor_cycle_impl()
-    sig._arm_bracket.assert_awaited_once()
+    sig._arm_bracket.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -95,24 +109,51 @@ async def test_no_rearm_when_price_far_below_sell_level():
 
 
 @pytest.mark.asyncio
-async def test_rearm_at_exactly_max_slip_above():
-    """Edge case: price at exactly buy_level + max_slip - 1 → re-arm.
-    rearm_high = 48095 + 30 = 48125, price 48124 < 48125 → re-arm."""
+async def test_rearm_at_buy_level_minus_1():
+    """Edge case: price 1pt below buy_level → re-arm (price IS inside)."""
     sig = _mk_signal_with_levels(
         buy_level=48095, sell_level=48016, bar_range=50,
-        current_price=48124,
+        current_price=48094,
     )
     await sig._monitor_cycle_impl()
     sig._arm_bracket.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_no_rearm_at_max_slip_boundary():
-    """Edge case: price at exactly buy_level + max_slip → no re-arm
-    (strict inequality). Prevents the boundary slippage cascade."""
+async def test_rearm_at_exactly_buy_level():
+    """Edge case: price exactly AT buy_level → re-arm (touches the level).
+    Changed 2026-04-09 from strict < to <= so that pullback right to
+    the breakout level (more common than back inside the range) fires
+    re-entry. Slippage cost ~1pt, safe."""
     sig = _mk_signal_with_levels(
         buy_level=48095, sell_level=48016, bar_range=50,
-        current_price=48125,  # exactly buy_level + max_slip
+        current_price=48095,
+    )
+    await sig._monitor_cycle_impl()
+    sig._arm_bracket.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_rearm_at_exactly_sell_level():
+    """Symmetric: price exactly AT sell_level → re-arm."""
+    sig = _mk_signal_with_levels(
+        buy_level=48095, sell_level=48016, bar_range=50,
+        current_price=48016,
+    )
+    await sig._monitor_cycle_impl()
+    sig._arm_bracket.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_no_rearm_just_above_buy_level():
+    """Price 1pt above buy_level → no re-arm.
+    Critical: this is the chop-protection case. If price is at 48096
+    with buy_level=48095, we don't re-arm because re-arming would
+    fire the tick trigger immediately at slippage and start the
+    direction-flip cascade the user warned about."""
+    sig = _mk_signal_with_levels(
+        buy_level=48095, sell_level=48016, bar_range=50,
+        current_price=48096,
     )
     await sig._monitor_cycle_impl()
     sig._arm_bracket.assert_not_awaited()
