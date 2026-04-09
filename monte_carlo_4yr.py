@@ -56,8 +56,13 @@ INSTRUMENTS = {
         "min_equity_gbp": 30_000,     # NKD margin requirement gate
     },
 }
-MAX_CONTRACTS = 5
+MAX_CONTRACTS = 10  # bumped from 5 → 10 (2026-04-09); still well below NKD inside-liquidity ~22
 STARTING_EQUITY = 5000
+
+# Wife-account model
+WIFE_TRIGGER_EQUITY = 60_000   # primary must reach this before gifting
+WIFE_GIFT_AMOUNT    = 30_000   # how much to send to wife on trigger
+WIFE_COOLDOWN_DAYS  = 60       # primary must be at trigger for N days before gifting
 
 
 def contracts_for(inst: str, equity: float) -> int:
@@ -75,45 +80,105 @@ def contracts_for(inst: str, equity: float) -> int:
     return max(1, min(MAX_CONTRACTS, int(raw)))
 
 
+def _day_pnl_gbp(idx: int, equity: float,
+                  daily_inst_pts: dict[str, np.ndarray],
+                  degradation: float) -> tuple[float, dict]:
+    """Compute one day's £ P&L given current equity (used by both accounts)."""
+    day_gbp = 0.0
+    qty_per_inst = {}
+    for inst in INSTRUMENTS:
+        qty = contracts_for(inst, equity)
+        qty_per_inst[inst] = qty
+        if qty == 0:
+            continue
+        pts = daily_inst_pts[inst][idx]
+        if degradation > 0:
+            pts = pts * (1 - degradation) if pts > 0 else pts * (1 + degradation)
+        day_gbp += pts * qty * INSTRUMENTS[inst]["gbp_per_pt"]
+    return day_gbp, qty_per_inst
+
+
 def simulate_one(daily_inst_pts: dict[str, np.ndarray], n_days: int,
                  degradation: float, rng,
-                 start_equity: float = STARTING_EQUITY) -> tuple[np.ndarray, dict]:
+                 start_equity: float = STARTING_EQUITY,
+                 dual_account: bool = False) -> tuple[np.ndarray, dict]:
     """
-    Simulate n_days. Each step:
-      1. Sample a random historical day index
-      2. For each instrument, compute current contract count from equity
-      3. daily £ = sum over instruments of (pts × contracts × £/pt × (1 - degradation))
-      4. Update equity
+    Simulate n_days. Single or dual-account mode.
 
-    Returns: (equity[n_days+1], debug_dict_with_per_inst_contracts_history)
+    Single mode: bot trades one account that grows from start_equity.
+
+    Dual mode: starts as single. When primary equity ≥ WIFE_TRIGGER_EQUITY
+    for WIFE_COOLDOWN_DAYS, gift WIFE_GIFT_AMOUNT to wife account. From
+    that day forward, BOTH accounts run independently against the SAME
+    sampled day (correlation = 1, which is realistic — same strategy on
+    same instruments will move together).
+
+    Returns: (combined_equity[n_days+1], debug)
     """
     n_avail = len(next(iter(daily_inst_pts.values())))
     sample_idx = rng.integers(0, n_avail, size=n_days)
 
-    equity = np.zeros(n_days + 1)
-    equity[0] = start_equity
+    primary = np.zeros(n_days + 1)
+    wife    = np.zeros(n_days + 1)
+    primary[0] = start_equity
+    wife[0] = 0.0
+
     contracts_hist = {inst: np.zeros(n_days, dtype=int) for inst in INSTRUMENTS}
-    nikkei_on_day = -1  # -1 means never enabled
+    nikkei_on_day = -1
+    wife_open_day = -1
+    wife_nikkei_on_day = -1
+    days_above_trigger = 0
 
     for i in range(n_days):
-        eq = equity[i]
         idx = sample_idx[i]
-        day_gbp = 0.0
-        for inst in INSTRUMENTS:
-            qty = contracts_for(inst, eq)
-            contracts_hist[inst][i] = qty
-            if qty == 0:
-                continue
-            pts = daily_inst_pts[inst][idx]
-            # Apply degradation only to gross P&L (winners less, losers more)
-            if degradation > 0:
-                pts = pts * (1 - degradation) if pts > 0 else pts * (1 + degradation)
-            day_gbp += pts * qty * INSTRUMENTS[inst]["gbp_per_pt"]
-            if inst == "NIKKEI" and qty > 0 and nikkei_on_day < 0:
-                nikkei_on_day = i
-        equity[i + 1] = max(0.0, eq + day_gbp)
 
-    return equity, {"contracts": contracts_hist, "nikkei_on_day": nikkei_on_day}
+        # Primary
+        p_pnl, p_qty = _day_pnl_gbp(idx, primary[i], daily_inst_pts, degradation)
+        for inst, q in p_qty.items():
+            contracts_hist[inst][i] = q
+        if nikkei_on_day < 0 and p_qty.get("NIKKEI", 0) > 0:
+            nikkei_on_day = i
+        primary_after = max(0.0, primary[i] + p_pnl)
+
+        # Wife (only if already opened)
+        if wife_open_day >= 0 and wife[i] > 0:
+            w_pnl, w_qty = _day_pnl_gbp(idx, wife[i], daily_inst_pts, degradation)
+            wife_after = max(0.0, wife[i] + w_pnl)
+            if wife_nikkei_on_day < 0 and w_qty.get("NIKKEI", 0) > 0:
+                wife_nikkei_on_day = i
+        else:
+            wife_after = wife[i]
+
+        # Wife trigger check (only in dual mode, only if not yet opened)
+        if dual_account and wife_open_day < 0:
+            if primary_after >= WIFE_TRIGGER_EQUITY:
+                days_above_trigger += 1
+            else:
+                days_above_trigger = 0
+            # Also need PSR-equivalent: 30+ days post-NKD-on
+            ready = (
+                days_above_trigger >= WIFE_COOLDOWN_DAYS
+                and nikkei_on_day >= 0
+                and (i - nikkei_on_day) >= 60
+                and primary_after - WIFE_GIFT_AMOUNT >= 30_000
+            )
+            if ready:
+                primary_after -= WIFE_GIFT_AMOUNT
+                wife_after = WIFE_GIFT_AMOUNT
+                wife_open_day = i
+
+        primary[i + 1] = primary_after
+        wife[i + 1] = wife_after
+
+    combined = primary + wife
+    return combined, {
+        "contracts": contracts_hist,
+        "nikkei_on_day": nikkei_on_day,
+        "wife_open_day": wife_open_day,
+        "wife_nikkei_on_day": wife_nikkei_on_day,
+        "primary": primary,
+        "wife": wife,
+    }
 
 
 def main():
@@ -126,6 +191,8 @@ def main():
     ap.add_argument("--out", default="data/monte_carlo_4yr.png")
     ap.add_argument("--no-nikkei", action="store_true",
                     help="Disable NIKKEI entirely (DAX+US30 only forever)")
+    ap.add_argument("--dual", action="store_true",
+                    help="Enable wife-account model (gifts £30k when primary ≥ £60k for 60d)")
     args = ap.parse_args()
 
     if args.no_nikkei:
@@ -153,7 +220,11 @@ def main():
 
     print(f"\nAccount start: £{args.account:,.0f}  Years: {args.years}  "
           f"Degradation: {args.degradation*100:.0f}%  Runs: {args.runs:,}")
+    print(f"MAX_CONTRACTS: {MAX_CONTRACTS}")
     print(f"NIKKEI gate:   equity ≥ £{INSTRUMENTS.get('NIKKEI', {}).get('min_equity_gbp', 0):,}")
+    if args.dual:
+        print(f"DUAL ACCOUNT: wife gets £{WIFE_GIFT_AMOUNT:,} when primary ≥ "
+              f"£{WIFE_TRIGGER_EQUITY:,} for {WIFE_COOLDOWN_DAYS}d (post-NKD-on)")
 
     # Sizing preview at key equity tiers
     print(f"\nSIZING PREVIEW (contracts per instrument at each equity tier):")
@@ -174,11 +245,13 @@ def main():
 
     all_equity = np.zeros((args.runs, n_days + 1))
     nikkei_on_days = np.zeros(args.runs)
+    wife_open_days = np.zeros(args.runs)
     for i in range(args.runs):
         eq, dbg = simulate_one(daily_inst_pts, n_days, args.degradation, rng,
-                                start_equity=args.account)
+                                start_equity=args.account, dual_account=args.dual)
         all_equity[i] = eq
         nikkei_on_days[i] = dbg["nikkei_on_day"]
+        wife_open_days[i] = dbg["wife_open_day"]
 
     pcts = [5, 25, 50, 75, 95]
     bands = {p: np.percentile(all_equity, p, axis=0) for p in pcts}
@@ -360,6 +433,18 @@ def main():
         else:
             yr = d / TRADING_DAYS_PER_YEAR
             print(f"    p{p:<3}: day {d} (year {yr:.2f})")
+
+    if args.dual:
+        opened = wife_open_days[wife_open_days >= 0]
+        if len(opened) > 0:
+            print(f"\n  WIFE ACCOUNT OPENED ({len(opened)}/{args.runs} sims = "
+                  f"{len(opened)/args.runs*100:.0f}%):")
+            for p in pcts:
+                d = np.percentile(opened, p)
+                yr = d / TRADING_DAYS_PER_YEAR
+                print(f"    p{p:<3}: day {int(d)} (year {yr:.2f})")
+        else:
+            print(f"\n  WIFE ACCOUNT: never opened in any sim")
 
     median_final = bands[50][-1]
     print(f"\n  YEAR-BY-YEAR MEDIAN £:")
