@@ -310,8 +310,11 @@ async def check_stream_health_all(shared_session, stream_mgr, tg_send, signals=N
 async def main():
     """Boot all 6 signals with one shared IG session."""
 
-    # Write PID for healthcheck
-    with open("/tmp/asrs.pid", "w") as f:
+    # Write PID for healthcheck. Path is configurable via ASRS_RUNTIME_DIR
+    # so Docker can bind-mount a host-visible directory.
+    _runtime_dir = os.getenv("ASRS_RUNTIME_DIR", "/tmp")
+    os.makedirs(_runtime_dir, exist_ok=True)
+    with open(os.path.join(_runtime_dir, "asrs.pid"), "w") as f:
         f.write(str(os.getpid()))
 
     loop = asyncio.get_event_loop()

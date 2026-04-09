@@ -9,3 +9,4 @@ flask>=3.0
 trading-ig>=0.0.22
 lightstreamer-client-lib>=1.0
 munch>=4.0
+ib_async>=1.0.0   # IBKR API client (maintained fork of ib_insync)

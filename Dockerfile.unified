@@ -1,30 +1,51 @@
 FROM python:3.12-slim
 
+# System deps for sqlite, build tools for any wheels that need compilation,
+# and tzdata for ZoneInfo (Asia/Tokyo etc).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        tzdata \
+        sqlite3 \
+        build-essential \
+        ca-certificates \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+ENV TZ=Europe/London
+
 WORKDIR /app
 
-# Install dependencies (superset of both bots)
+# Install Python dependencies first (cache layer)
 COPY requirements.txt .
 COPY requirements.ftse.txt requirements.ftse.txt
 RUN pip install --no-cache-dir -r requirements.txt -r requirements.ftse.txt
 
-# Copy all bot code
+# Copy bot code — only what asrs/ actually needs.
+# Legacy dax_bot/spx_bot/nikkei_bot trees are intentionally NOT copied:
+# the unified asrs/ codebase replaced them on Apr 7 2026.
 COPY shared/ shared/
 COPY asrs/ asrs/
-COPY dax_bot/ dax_bot/
-COPY spx_bot/ spx_bot/
-COPY nikkei_bot/ nikkei_bot/
 COPY telegram_cmd.py .
 COPY sync_to_railway.py .
 COPY reports.py .
-COPY run_all.py .
 COPY backtest.py .
-COPY watchdog.py .
+COPY replay_today.py .
+COPY replay_nkd_multiday.py .
+COPY monte_carlo_4yr.py .
+COPY run_dsr_significance.py .
 
-# Create data directory
-RUN mkdir -p data
+# Create data + state + logs directories. These are bind-mounted by
+# docker-compose so the host can read state files and logs without
+# entering the container.
+RUN mkdir -p /app/data /app/data/state /tmp/asrs-logs
 
-HEALTHCHECK --interval=60s --timeout=10s --retries=3 \
-    CMD python -c "import os, signal; pid=int(open('/tmp/asrs.pid').read()); os.kill(pid, 0)" || exit 1
+# Health check — bot writes /tmp/asrs.heartbeat every 60s. Container
+# is unhealthy if heartbeat is older than 3 minutes.
+HEALTHCHECK --interval=60s --timeout=10s --start-period=120s --retries=3 \
+    CMD test -f /tmp/asrs.heartbeat \
+    && [ $(($(date +%s) - $(stat -c %Y /tmp/asrs.heartbeat))) -lt 180 ] \
+    || exit 1
 
-# New unified bot (asrs/) — switch back to run_all.py if issues
+# Default command — runs the unified asrs/ bot. All operator config
+# (STARTING_EQUITY_GBP, RISK_PCT_PER_TRADE, DISABLE_INSTRUMENTS, etc.)
+# is passed via environment from docker-compose.yml. No wrapper script
+# needed — Docker's restart policy handles crashes.
 CMD ["python", "-m", "asrs.main"]

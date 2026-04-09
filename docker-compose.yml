@@ -3,7 +3,6 @@ services:
     image: ghcr.io/gnzsnz/ib-gateway:latest
     container_name: asrs-ibgateway
     restart: unless-stopped
-    profiles: ["ib"]    # only starts when --profile ib is passed
     network_mode: host  # bot connects via 127.0.0.1, no IP whitelist gymnastics
     environment:
       TWS_USERID: ${IB_USERNAME}
@@ -29,25 +28,54 @@ services:
       dockerfile: Dockerfile.unified
     container_name: asrs-bot
     restart: unless-stopped
+    network_mode: host  # share the gateway's network so 127.0.0.1:4002 works
     logging:
       driver: json-file
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: "20m"
+        max-file: "5"
     env_file:
       - .env
     environment:
-      # When BROKER_TYPE=ib, point at the gateway container hostname
-      IB_HOST: ${IB_HOST:-ibgateway}
-      IB_PORT: ${IB_PORT:-4002}
-    ports:
-      - "8080:8080"
+      # ── IBKR connection (HARDCODED for paper cutover; for live use
+      #    docker-compose.live.yml override file) ─────────────────────
+      BROKER_TYPE: ib
+      IB_HOST: 127.0.0.1
+      IB_PORT: 4002          # 4002 paper, 4001 live
+      IB_CLIENT_ID: 42       # locked — overrides .env's IB_CLIENT_ID=1
+      IB_MARKET_DATA_TYPE: 1 # 1=live data, 3=delayed
+      IB_ADAPTIVE_PRIORITY: Urgent
+      # ── Risk gate (paper-mode — disable limits) ─────────────────────
+      STARTING_EQUITY_GBP: "40000"
+      RISK_GATE_START_DATE: "2026-04-09"
+      DAILY_LOSS_LIMIT_PCT: "9999"
+      WEEKLY_LOSS_LIMIT_PCT: "9999"
+      MAX_CONCURRENT_POSITIONS: "8"
+      CONSECUTIVE_LOSS_KILL: "9999"
+      RISK_PCT_PER_TRADE: "0.5"
+      MAX_CONTRACTS: "10"
+      DISABLE_INSTRUMENTS: ""
+      # ── Runtime / log directories (host-visible via volumes) ────────
+      ASRS_RUNTIME_DIR: /var/run/asrs
+      LOG_DIR: /var/run/asrs/logs
     volumes:
+      # State files (signal JSONs, journal DB, heartbeat) — bot writes
+      # /app/data/* and host can read via ./data
       - ./data:/app/data
+      # Runtime dir: pause sentinel, PID file, logs. Bind-mounted to host
+      # /var/lib/asrs-runtime so the operator can `touch ...paused` from
+      # outside the container without docker exec.
+      - /var/lib/asrs-runtime:/var/run/asrs
     depends_on:
       ibgateway:
         condition: service_started
         required: false
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/asrs.heartbeat"]
+      interval: 60s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
 
 volumes:
   ibgateway-data:

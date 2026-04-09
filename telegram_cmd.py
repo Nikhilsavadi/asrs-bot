@@ -64,10 +64,17 @@ TG_CHAT_ID = _cfg.TG_CHAT_ID if _cfg else os.getenv("TELEGRAM_CHAT_ID", "")
 API_BASE = f"https://api.telegram.org/bot{TG_TOKEN}"
 
 # Pause is controlled by the SENTINEL FILE — single source of truth.
-# An external `rm /tmp/asrs-bot.paused` or `touch /tmp/asrs-bot.paused`
-# changes the bot's behaviour on the next is_paused() call. No stale
-# in-memory flag, no import-time race.
-PAUSE_SENTINEL = "/tmp/asrs-bot.paused"
+# An external `rm $ASRS_RUNTIME_DIR/asrs-bot.paused` or
+# `touch $ASRS_RUNTIME_DIR/asrs-bot.paused` changes the bot's behaviour
+# on the next is_paused() call. No stale in-memory flag, no import-time
+# race.
+#
+# ASRS_RUNTIME_DIR defaults to /tmp for host execution. In Docker it's
+# set to /var/run/asrs which is bind-mounted to a host directory so
+# the operator can touch/rm the sentinel from outside the container.
+_RUNTIME_DIR = os.getenv("ASRS_RUNTIME_DIR", "/tmp")
+os.makedirs(_RUNTIME_DIR, exist_ok=True)
+PAUSE_SENTINEL = os.path.join(_RUNTIME_DIR, "asrs-bot.paused")
 
 # Backward-compat shim: some legacy code reads `paused` directly. Keep
 # it as a property of the file existence so reads stay consistent.
