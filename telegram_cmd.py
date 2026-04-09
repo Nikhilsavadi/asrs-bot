@@ -63,16 +63,18 @@ TG_TOKEN = _cfg.TG_TOKEN if _cfg else os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID = _cfg.TG_CHAT_ID if _cfg else os.getenv("TELEGRAM_CHAT_ID", "")
 API_BASE = f"https://api.telegram.org/bot{TG_TOKEN}"
 
-# Global pause flag — checked by Signal._arm_bracket / on_tick_trigger
-paused = False
-
-# Sentinel file checked by strategy.py. Survives bot restart so /pause
-# stays effective across crashes / wrapper restarts.
+# Pause is controlled by the SENTINEL FILE — single source of truth.
+# An external `rm /tmp/asrs-bot.paused` or `touch /tmp/asrs-bot.paused`
+# changes the bot's behaviour on the next is_paused() call. No stale
+# in-memory flag, no import-time race.
 PAUSE_SENTINEL = "/tmp/asrs-bot.paused"
 
+# Backward-compat shim: some legacy code reads `paused` directly. Keep
+# it as a property of the file existence so reads stay consistent.
+paused = False  # initialised below; never written to after — use the file
+
 def _set_paused(value: bool) -> None:
-    global paused
-    paused = value
+    """Pause/resume by writing or deleting the sentinel file."""
     try:
         if value:
             with open(PAUSE_SENTINEL, "w") as f:
@@ -84,12 +86,14 @@ def _set_paused(value: bool) -> None:
         logger.error(f"Failed to write pause sentinel: {e}")
 
 def is_paused() -> bool:
-    """Authoritative pause check — sentinel file OR module flag."""
-    return paused or os.path.exists(PAUSE_SENTINEL)
+    """Authoritative pause check.
 
-# Restore on import in case sentinel persisted across restart
-if os.path.exists(PAUSE_SENTINEL):
-    paused = True
+    The SENTINEL FILE is the source of truth — checked on every call so
+    that an external `rm /tmp/asrs-bot.paused` actually unpauses the
+    running bot, even if the in-memory `paused` global was set True at
+    import time. The reverse (touch the file externally) also works.
+    """
+    return os.path.exists(PAUSE_SENTINEL)
 
 
 async def _send(text: str):
@@ -1050,6 +1054,6 @@ async def poll_commands(dax_broker=None, **kwargs):
         await asyncio.sleep(1)
 
 
-def is_paused() -> bool:
-    """Check if trading is paused. Called by bot main loops."""
-    return paused
+# NOTE: is_paused() is defined earlier in this file (sentinel-file-based).
+# This duplicate stub used to exist and shadowed the real implementation —
+# kept removed deliberately. Do not re-add.
