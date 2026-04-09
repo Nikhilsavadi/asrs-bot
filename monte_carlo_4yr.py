@@ -64,6 +64,16 @@ WIFE_TRIGGER_EQUITY = 60_000   # primary must reach this before gifting
 WIFE_GIFT_AMOUNT    = 30_000   # how much to send to wife on trigger
 WIFE_COOLDOWN_DAYS  = 60       # primary must be at trigger for N days before gifting
 
+# Tax model — UK CGT applied at end of each tax year (Apr 6 → Apr 5).
+# The MC starts "today" so the first ~250 trading days hit the first
+# year-end. Each year-end deducts:
+#   tax = max(0, (year_profit - allowance) × rate)
+# from the equity. Both primary and wife accounts have their own
+# annual allowance.
+TAX_RATE = 0.20                # 20% UK CGT (basic rate; could be 24% higher rate)
+TAX_ALLOWANCE_GBP = 3000       # £3k annual CGT allowance per person
+TAX_DAYS_PER_YEAR = TRADING_DAYS_PER_YEAR  # apply tax every 252 trading days
+
 
 def contracts_for(inst: str, equity: float) -> int:
     """Vol-targeted contract count for one instrument at current equity.
@@ -181,6 +191,63 @@ def simulate_one(daily_inst_pts: dict[str, np.ndarray], n_days: int,
     }
 
 
+def apply_tax_post(primary: np.ndarray, wife: np.ndarray,
+                    start_equity: float, tax_rate: float,
+                    allowance: float) -> tuple[np.ndarray, np.ndarray, list]:
+    """
+    Apply UK CGT to a pair of (primary, wife) equity curves at year-end
+    boundaries. Returns (post_tax_primary, post_tax_wife, tax_events).
+
+    Each "year" = TAX_DAYS_PER_YEAR trading days from start. At each
+    year-end, deducts tax on (gain since previous year-end - allowance)
+    per account, only if positive. Allowance is per-account per-year.
+    """
+    n = len(primary)
+    p_post = primary.copy()
+    w_post = wife.copy()
+    tax_events = []
+    p_anchor = float(start_equity)   # last year-end equity (primary)
+    w_anchor = 0.0                    # wife starts at 0 until gifted
+
+    for ye_day in range(TAX_DAYS_PER_YEAR, n, TAX_DAYS_PER_YEAR):
+        # Primary tax
+        p_gain = p_post[ye_day] - p_anchor
+        p_tax = max(0.0, (p_gain - allowance) * tax_rate) if p_gain > 0 else 0.0
+        # Wife tax (only if currently funded; gifts don't count as gain)
+        # Find net gift inflows since last year-end by checking diff
+        # of wife between anchors. If wife was 0 at last anchor and is
+        # now > 0, the difference is gift+gain. We approximate the gift
+        # as WIFE_GIFT_AMOUNT if wife went from 0 → positive in this window.
+        w_post_ye = w_post[ye_day]
+        if w_anchor == 0.0 and w_post_ye > 0:
+            # Wife opened during this year. Subtract the gift amount
+            # before computing taxable gain.
+            w_gain = max(0.0, w_post_ye - WIFE_GIFT_AMOUNT)
+        else:
+            w_gain = w_post_ye - w_anchor
+        w_tax = max(0.0, (w_gain - allowance) * tax_rate) if w_gain > 0 else 0.0
+
+        # Apply
+        p_post[ye_day:] -= p_tax
+        w_post[ye_day:] -= w_tax
+        # Make sure post-tax doesn't go negative
+        p_post[ye_day:] = np.maximum(p_post[ye_day:], 0)
+        w_post[ye_day:] = np.maximum(w_post[ye_day:], 0)
+
+        if p_tax > 0 or w_tax > 0:
+            tax_events.append({
+                "day": ye_day,
+                "p_gain": p_gain,
+                "p_tax": p_tax,
+                "w_gain": w_gain,
+                "w_tax": w_tax,
+            })
+        p_anchor = float(p_post[ye_day])
+        w_anchor = float(w_post[ye_day])
+
+    return p_post, w_post, tax_events
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", default="data/backtest_firstrate_results.csv")
@@ -193,7 +260,16 @@ def main():
                     help="Disable NIKKEI entirely (DAX+US30 only forever)")
     ap.add_argument("--dual", action="store_true",
                     help="Enable wife-account model (gifts £30k when primary ≥ £60k for 60d)")
+    ap.add_argument("--tax-rate", type=float, default=TAX_RATE,
+                    help=f"UK CGT rate applied at year-end (default {TAX_RATE})")
+    ap.add_argument("--tax-allowance", type=float, default=TAX_ALLOWANCE_GBP,
+                    help=f"Annual CGT allowance per account (default £{TAX_ALLOWANCE_GBP})")
+    ap.add_argument("--no-tax", action="store_true",
+                    help="Disable tax (gross-only mode)")
     args = ap.parse_args()
+    if args.no_tax:
+        args.tax_rate = 0.0
+        args.tax_allowance = 0.0
 
     if args.no_nikkei:
         INSTRUMENTS.pop("NIKKEI", None)
@@ -244,17 +320,27 @@ def main():
     rng = np.random.default_rng(42)
 
     all_equity = np.zeros((args.runs, n_days + 1))
+    all_equity_post_tax = np.zeros((args.runs, n_days + 1))
     nikkei_on_days = np.zeros(args.runs)
     wife_open_days = np.zeros(args.runs)
+    sample_dbgs = []
     for i in range(args.runs):
         eq, dbg = simulate_one(daily_inst_pts, n_days, args.degradation, rng,
                                 start_equity=args.account, dual_account=args.dual)
         all_equity[i] = eq
         nikkei_on_days[i] = dbg["nikkei_on_day"]
         wife_open_days[i] = dbg["wife_open_day"]
+        # Post-tax: split primary + wife and apply CGT separately
+        p_post, w_post, _ = apply_tax_post(
+            dbg["primary"], dbg["wife"], args.account,
+            args.tax_rate, args.tax_allowance,
+        )
+        all_equity_post_tax[i] = p_post + w_post
+        sample_dbgs.append(dbg)
 
     pcts = [5, 25, 50, 75, 95]
     bands = {p: np.percentile(all_equity, p, axis=0) for p in pcts}
+    bands_post = {p: np.percentile(all_equity_post_tax, p, axis=0) for p in pcts}
 
     # Date index
     start_date = datetime.today().date()
@@ -266,26 +352,25 @@ def main():
             dates.append(d)
     dates = dates[:n_days + 1]
 
-    # Pick representative sample path
-    final_pnls = all_equity[:, -1] - args.account
-    target = np.percentile(final_pnls, 50)
-    sample_idx = int(np.argmin(np.abs(final_pnls - target)))
+    # Pick representative sample path (median post-tax outcome)
+    final_pnls_post = all_equity_post_tax[:, -1] - args.account
+    target = np.percentile(final_pnls_post, 50)
+    sample_idx = int(np.argmin(np.abs(final_pnls_post - target)))
     sample_eq = all_equity[sample_idx]
-    daily_pnl = np.diff(sample_eq)
+    sample_eq_post = all_equity_post_tax[sample_idx]
+    daily_pnl = np.diff(sample_eq_post)  # post-tax daily for the bar charts
 
-    # Re-simulate the sample path to get its contracts trajectory (deterministic w/ seed)
-    rng2 = np.random.default_rng(42)
-    for i in range(sample_idx + 1):
-        _, sample_dbg = simulate_one(daily_inst_pts, n_days, args.degradation, rng2,
-                                      start_equity=args.account)
+    sample_dbg = sample_dbgs[sample_idx]
     sample_contracts = sample_dbg["contracts"]
     sample_nikkei_on = sample_dbg["nikkei_on_day"]
 
-    print(f"\nSAMPLE PATH #{sample_idx}: final P&L £{final_pnls[sample_idx]:+,.0f}")
-    print(f"  Final equity:   £{sample_eq[-1]:,.0f}")
-    print(f"  Worst day:      £{daily_pnl.min():+,.0f}")
-    print(f"  Worst drawdown: £{(sample_eq - np.maximum.accumulate(sample_eq)).min():+,.0f}")
-    print(f"  Losing days:    {(daily_pnl < 0).sum()}/{len(daily_pnl)} "
+    print(f"\nSAMPLE PATH #{sample_idx}:")
+    print(f"  Final equity GROSS: £{sample_eq[-1]:,.0f}  (P&L £{sample_eq[-1] - args.account:+,.0f})")
+    print(f"  Final equity NET:   £{sample_eq_post[-1]:,.0f}  (P&L £{sample_eq_post[-1] - args.account:+,.0f})")
+    print(f"  Tax paid total:     £{sample_eq[-1] - sample_eq_post[-1]:,.0f}")
+    print(f"  Worst day NET:      £{daily_pnl.min():+,.0f}")
+    print(f"  Worst drawdown:     £{(sample_eq_post - np.maximum.accumulate(sample_eq_post)).min():+,.0f}")
+    print(f"  Losing days:        {(daily_pnl < 0).sum()}/{len(daily_pnl)} "
           f"({(daily_pnl < 0).sum()/len(daily_pnl)*100:.1f}%)")
     if sample_nikkei_on >= 0:
         yr = sample_nikkei_on / TRADING_DAYS_PER_YEAR
@@ -340,14 +425,20 @@ def main():
     gs = fig.add_gridspec(4, 1, height_ratios=[2.4, 1, 1, 0.8], hspace=0.35)
 
     ax1 = fig.add_subplot(gs[0])
-    ax1.fill_between(dates, bands[5], bands[95], alpha=0.15,
-                     color="#2ca02c", label="p5–p95 (90% CI)")
-    ax1.fill_between(dates, bands[25], bands[75], alpha=0.30,
-                     color="#2ca02c", label="p25–p75 (50% CI)")
-    ax1.plot(dates, bands[50], color="#1f7a1f", linewidth=1.5,
-             label="Median across all sims", alpha=0.7, linestyle="--")
-    ax1.plot(dates, sample_eq, color="#0d4b0d", linewidth=2.0,
-             label=f"Sample path #{sample_idx} (real chop)")
+    # Gross bands (light, faded)
+    ax1.fill_between(dates, bands[5], bands[95], alpha=0.10,
+                     color="#999", label="GROSS p5–p95")
+    ax1.plot(dates, bands[50], color="#666", linewidth=1.0,
+             label="GROSS median", alpha=0.6, linestyle=":")
+    # POST-TAX bands (the real numbers)
+    ax1.fill_between(dates, bands_post[5], bands_post[95], alpha=0.15,
+                     color="#2ca02c", label=f"NET p5–p95 (after {int(args.tax_rate*100)}% CGT)")
+    ax1.fill_between(dates, bands_post[25], bands_post[75], alpha=0.30,
+                     color="#2ca02c", label="NET p25–p75")
+    ax1.plot(dates, bands_post[50], color="#1f7a1f", linewidth=1.5,
+             label="NET median (post-tax)", alpha=0.85, linestyle="--")
+    ax1.plot(dates, sample_eq_post, color="#0d4b0d", linewidth=2.0,
+             label=f"NET sample path #{sample_idx}")
     ax1.axhline(y=args.account, color="#888", linestyle=":", linewidth=1, label="Start")
     ax1.axhline(y=30_000, color="#d62728", linestyle="--", linewidth=1,
                 label="NKD enable threshold (£30k)", alpha=0.6)
@@ -355,13 +446,14 @@ def main():
     # Mark NKD enable on sample path
     if sample_nikkei_on >= 0:
         ax1.axvline(x=dates[sample_nikkei_on], color="#d62728", linewidth=0.8, linestyle="--", alpha=0.5)
-        ax1.annotate("NKD ON", xy=(dates[sample_nikkei_on], sample_eq[sample_nikkei_on]),
+        ax1.annotate("NKD ON", xy=(dates[sample_nikkei_on], sample_eq_post[sample_nikkei_on]),
                      xytext=(8, 8), textcoords="offset points",
                      fontsize=9, color="#d62728", fontweight="bold")
 
+    tax_str = f"{int(args.tax_rate*100)}% CGT, £{int(args.tax_allowance):,} allowance"
     ax1.set_title(f"4-Year Monte Carlo Equity Curve  "
                   f"(£{args.account:,.0f} start, {args.degradation*100:.0f}% degradation, "
-                  f"{args.runs:,} sims, NKD gated at £30k)")
+                  f"{args.runs:,} sims, NKD gated at £30k, {tax_str})")
     ax1.set_ylabel("Account")
     ax1.set_yscale("log")
     log_ticks = [5_000, 10_000, 30_000, 50_000, 100_000, 250_000, 500_000,
@@ -418,11 +510,19 @@ def main():
     print(f"  4-YEAR MONTE CARLO SUMMARY  ({args.degradation*100:.0f}% degradation, NKD@£30k)")
     print(f"{'='*78}")
     print(f"  {'Year':<8}{'p5 (worst)':>14}{'p25':>14}{'Median':>14}{'p75':>14}{'p95 (best)':>14}")
+    print(f"  GROSS (pre-tax)")
     for yr in range(1, args.years + 1):
         idx = yr * TRADING_DAYS_PER_YEAR
         if idx >= len(bands[50]):
             idx = len(bands[50]) - 1
         row = "".join(f"£{bands[p][idx]:>12,.0f}" for p in pcts)
+        print(f"  Year {yr}  {row}")
+    print(f"  NET (post-{int(args.tax_rate*100)}% CGT, £{int(args.tax_allowance):,} allowance)")
+    for yr in range(1, args.years + 1):
+        idx = yr * TRADING_DAYS_PER_YEAR
+        if idx >= len(bands_post[50]):
+            idx = len(bands_post[50]) - 1
+        row = "".join(f"£{bands_post[p][idx]:>12,.0f}" for p in pcts)
         print(f"  Year {yr}  {row}")
 
     print(f"\n  NKD ENABLE TIMING (when each percentile sim crosses £30k):")
@@ -446,13 +546,20 @@ def main():
         else:
             print(f"\n  WIFE ACCOUNT: never opened in any sim")
 
-    median_final = bands[50][-1]
-    print(f"\n  YEAR-BY-YEAR MEDIAN £:")
-    print(f"    Year 1:  £{bands[50][min(252, len(bands[50])-1)] - args.account:+,.0f}")
-    print(f"    Year 2:  £{bands[50][min(504, len(bands[50])-1)] - bands[50][min(252, len(bands[50])-1)]:+,.0f}")
-    print(f"    Year 3:  £{bands[50][min(756, len(bands[50])-1)] - bands[50][min(504, len(bands[50])-1)]:+,.0f}")
-    print(f"    Year 4:  £{bands[50][min(1008, len(bands[50])-1)] - bands[50][min(756, len(bands[50])-1)]:+,.0f}")
-    print(f"    EOY 4:   £{median_final:,.0f}  ({(median_final/args.account - 1)*100:.0f}% total return)")
+    median_g = bands[50][-1]
+    median_n = bands_post[50][-1]
+    print(f"\n  YEAR-BY-YEAR MEDIAN £ (gross / net):")
+    g_prev = args.account
+    n_prev = args.account
+    for yr in range(1, args.years + 1):
+        idx = min(yr * TRADING_DAYS_PER_YEAR, len(bands[50]) - 1)
+        g = bands[50][idx]
+        n = bands_post[50][idx]
+        print(f"    Year {yr}:  GROSS £{g - g_prev:+12,.0f}    NET £{n - n_prev:+12,.0f}")
+        g_prev = g
+        n_prev = n
+    print(f"    EOY {args.years}:   GROSS £{median_g:>12,.0f}  NET £{median_n:>12,.0f}  "
+          f"(tax paid £{median_g - median_n:,.0f}, {(median_g - median_n)/(median_g - args.account)*100:.0f}% effective)")
 
 
 if __name__ == "__main__":
