@@ -1,12 +1,19 @@
 """
-monte_carlo_4yr.py — 4-year MC with scaling ladder, plotted daily/weekly/monthly.
+monte_carlo_4yr.py — 4-year MC with vol-targeted contract sizing + NKD gate.
 
-Simulates 4 years of trading with stake auto-scaling per the ladder:
-  £0.50/pt → £1/pt at £8k → £2/pt at £15k → £4/pt at £30k → £8/pt at £55k →
-  £15/pt at £110k → £30/pt at £200k → £60/pt at £400k (cap)
+REWRITTEN 2026-04-09 to match the post-IBKR-migration sizing model:
+  - Per-instrument integer-contract sizing (DAX FDXS, US30 MYM, NIKKEI NKD)
+  - Vol-targeted: contracts = floor(equity × 0.5% / (stop × £/pt))
+  - Capped at MAX_CONTRACTS=5 per signal
+  - NIKKEI GATED on equity ≥ £30k (NKD margin requirement)
+  - NIKKEI uses RISK_PCT=0.66% override (per scaling plan)
+  - No more £/pt scaling ladder — sizing scales linearly with equity
 
-Block bootstrap by trading day, 30% degradation default.
-Outputs PNG with 3 panels: daily equity, weekly bars, monthly bars.
+Block-bootstrap by trading day. Each sampled day brings ALL three
+instruments' P&L points; the simulation applies the per-instrument
+contract count current at that equity tier.
+
+Outputs PNG with 4 panels: equity curve + daily/weekly/monthly £.
 """
 import argparse
 import numpy as np
@@ -20,133 +27,163 @@ from datetime import datetime, timedelta
 
 
 def _money_fmt(x, _pos=None):
-    """Format £ values as 5k, 100k, 1.5M etc."""
-    if x >= 1_000_000:
+    if abs(x) >= 1_000_000:
         return f"£{x/1_000_000:.1f}M".replace(".0M", "M")
-    if x >= 1_000:
+    if abs(x) >= 1_000:
         return f"£{x/1_000:.0f}k"
     return f"£{x:.0f}"
+
 
 DEFAULT_RUNS = 2000
 TRADING_DAYS_PER_YEAR = 252
 
-# Scaling ladder: (account threshold £, stake £/pt)
-# Each step ALSO requires MIN_DAYS_AT_LEVEL trading days at the previous
-# stake before upgrading — so the bot can't race up the ladder in weeks.
-LADDER = [
-    (5000,    0.5),
-    (8000,    1.0),
-    (15000,   2.0),
-    (30000,   4.0),
-    (55000,   8.0),
-    (110000,  15.0),
-    (200000,  30.0),
-    (400000,  60.0),     # ceiling — never scales above this
-]
-MIN_DAYS_AT_LEVEL = 60   # ~3 months — must trade clean at each step before upgrading
+# Per-instrument config — matches asrs/config.py + asrs/risk_gate.py
+INSTRUMENTS = {
+    "DAX": {
+        "gbp_per_pt": 0.86,           # FDXS €1/pt → ~£0.86/pt
+        "typical_stop_pts": 12.0,     # mean bar_range (8.4) + buffer*2 (4)
+        "risk_pct": 0.5,
+    },
+    "US30": {
+        "gbp_per_pt": 0.40,           # MYM $0.50/pt → ~£0.40/pt
+        "typical_stop_pts": 30.0,     # mean bar_range (19.8) + buffer*2 (10)
+        "risk_pct": 0.5,
+    },
+    "NIKKEI": {
+        "gbp_per_pt": 4.00,           # NKD $5/pt → ~£4/pt
+        "typical_stop_pts": 14.0,     # mean bar_range (10) + buffer*2 (4)
+        "risk_pct": 0.66,             # override per scaling plan
+        "min_equity_gbp": 30_000,     # NKD margin requirement gate
+    },
+}
+MAX_CONTRACTS = 5
+STARTING_EQUITY = 5000
 
 
-def stake_for_account_with_cooldown(account: float, current_stake: float,
-                                     days_at_current: int) -> float:
-    """Pick the next stake from the ladder, but only if we've spent
-    MIN_DAYS_AT_LEVEL at the current one. Always allow downgrades immediately.
+def contracts_for(inst: str, equity: float) -> int:
+    """Vol-targeted contract count for one instrument at current equity.
+
+    Returns 0 if instrument is gated out (e.g. NKD below margin threshold).
+    Otherwise returns max(1, min(MAX_CONTRACTS, floor(budget / risk_per_lot))).
     """
-    target = LADDER[0][1]
-    for thresh, st in LADDER:
-        if account >= thresh:
-            target = st
-        else:
-            break
-    # Allow downgrade always (drawdown protection)
-    if target < current_stake:
-        return target
-    # Allow upgrade only if cooldown elapsed
-    if target > current_stake and days_at_current < MIN_DAYS_AT_LEVEL:
-        return current_stake
-    return target
+    cfg = INSTRUMENTS[inst]
+    if equity < cfg.get("min_equity_gbp", 0):
+        return 0
+    budget = equity * cfg["risk_pct"] / 100.0
+    risk_per_lot = cfg["typical_stop_pts"] * cfg["gbp_per_pt"]
+    raw = budget / risk_per_lot
+    return max(1, min(MAX_CONTRACTS, int(raw)))
 
 
-def simulate_one(daily_pnls_pts: np.ndarray, account_start: float, n_days: int,
-                  degradation: float, rng) -> tuple[np.ndarray, np.ndarray]:
+def simulate_one(daily_inst_pts: dict[str, np.ndarray], n_days: int,
+                 degradation: float, rng,
+                 start_equity: float = STARTING_EQUITY) -> tuple[np.ndarray, dict]:
     """
-    Simulate n_days of trading with auto-scaling stake.
+    Simulate n_days. Each step:
+      1. Sample a random historical day index
+      2. For each instrument, compute current contract count from equity
+      3. daily £ = sum over instruments of (pts × contracts × £/pt × (1 - degradation))
+      4. Update equity
 
-    Returns:
-        equity[n_days+1]: account value over time (£)
-        stakes[n_days]:    stake used each day (£/pt)
+    Returns: (equity[n_days+1], debug_dict_with_per_inst_contracts_history)
     """
-    # Apply degradation
-    if degradation > 0:
-        daily_adj = daily_pnls_pts.astype(float).copy()
-        daily_adj[daily_adj > 0] *= (1 - degradation)
-        daily_adj[daily_adj < 0] *= (1 + degradation)
-    else:
-        daily_adj = daily_pnls_pts.astype(float)
-
-    n_avail = len(daily_adj)
+    n_avail = len(next(iter(daily_inst_pts.values())))
     sample_idx = rng.integers(0, n_avail, size=n_days)
-    sample_pts = daily_adj[sample_idx]
 
     equity = np.zeros(n_days + 1)
-    equity[0] = account_start
-    stakes = np.zeros(n_days)
-
-    current_stake = LADDER[0][1]
-    days_at_current = MIN_DAYS_AT_LEVEL  # allow first scale-up immediately if account warrants
+    equity[0] = start_equity
+    contracts_hist = {inst: np.zeros(n_days, dtype=int) for inst in INSTRUMENTS}
+    nikkei_on_day = -1  # -1 means never enabled
 
     for i in range(n_days):
-        new_stake = stake_for_account_with_cooldown(equity[i], current_stake, days_at_current)
-        if new_stake != current_stake:
-            current_stake = new_stake
-            days_at_current = 0
-        else:
-            days_at_current += 1
-        stakes[i] = current_stake
-        equity[i + 1] = equity[i] + sample_pts[i] * current_stake
+        eq = equity[i]
+        idx = sample_idx[i]
+        day_gbp = 0.0
+        for inst in INSTRUMENTS:
+            qty = contracts_for(inst, eq)
+            contracts_hist[inst][i] = qty
+            if qty == 0:
+                continue
+            pts = daily_inst_pts[inst][idx]
+            # Apply degradation only to gross P&L (winners less, losers more)
+            if degradation > 0:
+                pts = pts * (1 - degradation) if pts > 0 else pts * (1 + degradation)
+            day_gbp += pts * qty * INSTRUMENTS[inst]["gbp_per_pt"]
+            if inst == "NIKKEI" and qty > 0 and nikkei_on_day < 0:
+                nikkei_on_day = i
+        equity[i + 1] = max(0.0, eq + day_gbp)
 
-    return equity, stakes
+    return equity, {"contracts": contracts_hist, "nikkei_on_day": nikkei_on_day}
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", default="data/backtest_firstrate_results.csv")
-    ap.add_argument("--account", type=float, default=5000)
+    ap.add_argument("--account", type=float, default=STARTING_EQUITY)
     ap.add_argument("--years", type=int, default=4)
     ap.add_argument("--degradation", type=float, default=0.30)
     ap.add_argument("--runs", type=int, default=DEFAULT_RUNS)
     ap.add_argument("--out", default="data/monte_carlo_4yr.png")
-    ap.add_argument("--instruments", nargs="*", default=None)
+    ap.add_argument("--no-nikkei", action="store_true",
+                    help="Disable NIKKEI entirely (DAX+US30 only forever)")
     args = ap.parse_args()
 
+    if args.no_nikkei:
+        INSTRUMENTS.pop("NIKKEI", None)
+        print("NIKKEI disabled (--no-nikkei flag)")
+
     df = pd.read_csv(args.csv)
-    if args.instruments:
-        df = df[df["instrument"].isin(args.instruments)]
+    print(f"Source: {args.csv} ({len(df):,} trades)")
 
-    # Aggregate to daily P&L per (date,instrument), then sum across instruments per date
-    daily = df.groupby("date")["pnl_pts"].sum().values
+    # Pivot to per-(date, instrument) daily pts. Missing combos → 0.
+    daily_per_inst = (
+        df.groupby(["date", "instrument"])["pnl_pts"].sum().unstack(fill_value=0)
+    )
+    daily_inst_pts = {}
+    for inst in INSTRUMENTS:
+        if inst in daily_per_inst.columns:
+            daily_inst_pts[inst] = daily_per_inst[inst].values.astype(float)
+        else:
+            daily_inst_pts[inst] = np.zeros(len(daily_per_inst))
+    n_avail = len(daily_per_inst)
+    print(f"  {n_avail:,} historical trading days")
+    for inst, pts in daily_inst_pts.items():
+        print(f"    {inst:7} mean +{pts.mean():.1f} pts/day, "
+              f"std {pts.std():.1f}, win days {(pts > 0).mean()*100:.1f}%")
 
-    print(f"Source: {args.csv}")
-    print(f"  daily P&L points (cross-instrument): {len(daily):,}")
-    print(f"  mean: {daily.mean():+.1f} pts/day  std: {daily.std():.1f}")
-    print(f"  Account start: £{args.account:,.0f}  Years: {args.years}  Degradation: {args.degradation*100:.0f}%")
-    print(f"  Runs: {args.runs:,}")
+    print(f"\nAccount start: £{args.account:,.0f}  Years: {args.years}  "
+          f"Degradation: {args.degradation*100:.0f}%  Runs: {args.runs:,}")
+    print(f"NIKKEI gate:   equity ≥ £{INSTRUMENTS.get('NIKKEI', {}).get('min_equity_gbp', 0):,}")
+
+    # Sizing preview at key equity tiers
+    print(f"\nSIZING PREVIEW (contracts per instrument at each equity tier):")
+    print(f"  {'Equity':<12}{'DAX':>6}{'US30':>6}{'NKD':>6}{'Daily £ exp':>15}")
+    for tier in [5000, 10000, 15000, 20000, 30000, 50000, 100000, 250000, 500000]:
+        sizes = {}
+        exp_gbp = 0.0
+        for inst in INSTRUMENTS:
+            q = contracts_for(inst, tier)
+            sizes[inst] = q
+            mean_pts = daily_inst_pts[inst].mean() * (1 - args.degradation)
+            exp_gbp += mean_pts * q * INSTRUMENTS[inst]["gbp_per_pt"]
+        sz_str = f"{sizes.get('DAX',0):>6}{sizes.get('US30',0):>6}{sizes.get('NIKKEI',0):>6}"
+        print(f"  £{tier:>10,}{sz_str}  £{exp_gbp:>+13,.0f}")
 
     n_days = args.years * TRADING_DAYS_PER_YEAR
     rng = np.random.default_rng(42)
 
-    # Run all simulations, store full equity curves
     all_equity = np.zeros((args.runs, n_days + 1))
-    all_stakes = np.zeros((args.runs, n_days))
+    nikkei_on_days = np.zeros(args.runs)
     for i in range(args.runs):
-        eq, st = simulate_one(daily, args.account, n_days, args.degradation, rng)
+        eq, dbg = simulate_one(daily_inst_pts, n_days, args.degradation, rng,
+                                start_equity=args.account)
         all_equity[i] = eq
-        all_stakes[i] = st
+        nikkei_on_days[i] = dbg["nikkei_on_day"]
 
-    # Compute percentile bands for each day
     pcts = [5, 25, 50, 75, 95]
     bands = {p: np.percentile(all_equity, p, axis=0) for p in pcts}
 
-    # Build a date index for plotting
+    # Date index
     start_date = datetime.today().date()
     dates = [start_date]
     d = start_date
@@ -156,27 +193,34 @@ def main():
             dates.append(d)
     dates = dates[:n_days + 1]
 
-    # ── Pick a representative SAMPLE PATH for the bar charts ──────────
-    # The median across N sims smooths out variance — every day looks
-    # positive because positive days slightly outnumber negative ones in
-    # any large sample. To show realistic chop, pick ONE simulation
-    # whose final P&L is close to the median. That single path has all
-    # the variance of real life: losing days, losing weeks, occasional
-    # losing months.
-    median_eq = bands[50]
+    # Pick representative sample path
     final_pnls = all_equity[:, -1] - args.account
     target = np.percentile(final_pnls, 50)
     sample_idx = int(np.argmin(np.abs(final_pnls - target)))
     sample_eq = all_equity[sample_idx]
-    sample_stakes = all_stakes[sample_idx]
     daily_pnl = np.diff(sample_eq)
-    print(f"\nSample path #{sample_idx}: final P&L £{final_pnls[sample_idx]:+,.0f} "
-          f"(median across all sims: £{target:+,.0f})")
-    print(f"  Losing days:    {(daily_pnl < 0).sum()} / {len(daily_pnl)} "
-          f"({(daily_pnl < 0).sum()/len(daily_pnl)*100:.1f}%)")
+
+    # Re-simulate the sample path to get its contracts trajectory (deterministic w/ seed)
+    rng2 = np.random.default_rng(42)
+    for i in range(sample_idx + 1):
+        _, sample_dbg = simulate_one(daily_inst_pts, n_days, args.degradation, rng2,
+                                      start_equity=args.account)
+    sample_contracts = sample_dbg["contracts"]
+    sample_nikkei_on = sample_dbg["nikkei_on_day"]
+
+    print(f"\nSAMPLE PATH #{sample_idx}: final P&L £{final_pnls[sample_idx]:+,.0f}")
+    print(f"  Final equity:   £{sample_eq[-1]:,.0f}")
     print(f"  Worst day:      £{daily_pnl.min():+,.0f}")
     print(f"  Worst drawdown: £{(sample_eq - np.maximum.accumulate(sample_eq)).min():+,.0f}")
+    print(f"  Losing days:    {(daily_pnl < 0).sum()}/{len(daily_pnl)} "
+          f"({(daily_pnl < 0).sum()/len(daily_pnl)*100:.1f}%)")
+    if sample_nikkei_on >= 0:
+        yr = sample_nikkei_on / TRADING_DAYS_PER_YEAR
+        print(f"  NKD enabled:    day {sample_nikkei_on} (year {yr:.2f}) — equity £{sample_eq[sample_nikkei_on]:,.0f}")
+    else:
+        print(f"  NKD enabled:    NEVER (sample never hit £30k)")
 
+    # Aggregate
     weekly_pnl = []
     monthly_pnl = []
     week_buf = []
@@ -205,19 +249,23 @@ def main():
         monthly_pnl.append(sum(month_buf))
         month_dates.append(dates[-1])
 
-    # Stats for the sample path
     losing_weeks = sum(1 for w in weekly_pnl if w < 0)
     losing_months = sum(1 for m in monthly_pnl if m < 0)
-    print(f"  Losing weeks:   {losing_weeks} / {len(weekly_pnl)} "
+    print(f"  Losing weeks:   {losing_weeks}/{len(weekly_pnl)} "
           f"({losing_weeks/max(1,len(weekly_pnl))*100:.1f}%)")
-    print(f"  Losing months:  {losing_months} / {len(monthly_pnl)} "
+    print(f"  Losing months:  {losing_months}/{len(monthly_pnl)} "
           f"({losing_months/max(1,len(monthly_pnl))*100:.1f}%)")
+
+    # When does each percentile sim cross £30k (NKD trigger)?
+    nkd_trigger_day = {}
+    for p in pcts:
+        crossings = np.where(bands[p] >= 30_000)[0]
+        nkd_trigger_day[p] = int(crossings[0]) if len(crossings) > 0 else -1
 
     # ── Plot ──────────────────────────────────────────────────────────
     fig = plt.figure(figsize=(15, 13))
     gs = fig.add_gridspec(4, 1, height_ratios=[2.4, 1, 1, 0.8], hspace=0.35)
 
-    # 1. Equity curves with confidence bands + sample path overlay
     ax1 = fig.add_subplot(gs[0])
     ax1.fill_between(dates, bands[5], bands[95], alpha=0.15,
                      color="#2ca02c", label="p5–p95 (90% CI)")
@@ -228,24 +276,23 @@ def main():
     ax1.plot(dates, sample_eq, color="#0d4b0d", linewidth=2.0,
              label=f"Sample path #{sample_idx} (real chop)")
     ax1.axhline(y=args.account, color="#888", linestyle=":", linewidth=1, label="Start")
+    ax1.axhline(y=30_000, color="#d62728", linestyle="--", linewidth=1,
+                label="NKD enable threshold (£30k)", alpha=0.6)
 
-    # Mark stake-up events on the SAMPLE path
-    last_stake = LADDER[0][1]
-    for i, st in enumerate(sample_stakes):
-        if st != last_stake:
-            ax1.axvline(x=dates[i], color="#bbbbbb", linewidth=0.5, linestyle=":")
-            ax1.annotate(f"£{st:.0f}/pt", xy=(dates[i], sample_eq[i]),
-                         xytext=(5, -5), textcoords="offset points",
-                         fontsize=7, color="#666")
-            last_stake = st
+    # Mark NKD enable on sample path
+    if sample_nikkei_on >= 0:
+        ax1.axvline(x=dates[sample_nikkei_on], color="#d62728", linewidth=0.8, linestyle="--", alpha=0.5)
+        ax1.annotate("NKD ON", xy=(dates[sample_nikkei_on], sample_eq[sample_nikkei_on]),
+                     xytext=(8, 8), textcoords="offset points",
+                     fontsize=9, color="#d62728", fontweight="bold")
 
     ax1.set_title(f"4-Year Monte Carlo Equity Curve  "
-                  f"(£{args.account:,.0f} start, {args.degradation*100:.0f}% degradation, {args.runs:,} sims)")
+                  f"(£{args.account:,.0f} start, {args.degradation*100:.0f}% degradation, "
+                  f"{args.runs:,} sims, NKD gated at £30k)")
     ax1.set_ylabel("Account")
     ax1.set_yscale("log")
-    # Friendly £ ticks at 5k, 10k, 50k, 100k, 500k, 1M, 5M, 10M, 50M
-    log_ticks = [5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
-                 1_000_000, 2_500_000, 5_000_000, 10_000_000, 25_000_000, 50_000_000]
+    log_ticks = [5_000, 10_000, 30_000, 50_000, 100_000, 250_000, 500_000,
+                 1_000_000, 2_500_000, 5_000_000, 10_000_000, 25_000_000]
     ax1.yaxis.set_major_locator(FixedLocator(log_ticks))
     ax1.yaxis.set_major_formatter(FuncFormatter(_money_fmt))
     ax1.grid(True, alpha=0.3)
@@ -253,7 +300,6 @@ def main():
     ax1.xaxis.set_major_locator(mdates.MonthLocator(interval=6))
     ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
 
-    # 2. Daily P&L (sample path — shows real losing days)
     ax2 = fig.add_subplot(gs[1])
     colors = ["#2ca02c" if p > 0 else "#d62728" for p in daily_pnl]
     ax2.bar(dates[1:], daily_pnl, color=colors, width=1.5)
@@ -266,7 +312,6 @@ def main():
     ax2.xaxis.set_major_locator(mdates.MonthLocator(interval=6))
     ax2.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
 
-    # 3. Weekly P&L (sample path)
     ax3 = fig.add_subplot(gs[2])
     wcolors = ["#2ca02c" if p > 0 else "#d62728" for p in weekly_pnl]
     ax3.bar(week_dates, weekly_pnl, color=wcolors, width=5)
@@ -279,7 +324,6 @@ def main():
     ax3.xaxis.set_major_locator(mdates.MonthLocator(interval=6))
     ax3.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
 
-    # 4. Monthly P&L
     ax4 = fig.add_subplot(gs[3])
     mcolors = ["#2ca02c" if p > 0 else "#d62728" for p in monthly_pnl]
     ax4.bar(month_dates, monthly_pnl, color=mcolors, width=20)
@@ -296,41 +340,34 @@ def main():
     plt.savefig(args.out, dpi=110, bbox_inches="tight")
     print(f"\nSaved chart → {args.out}")
 
-    # ── Print summary table ───────────────────────────────────────────
-    print(f"\n{'='*70}")
-    print(f"  4-YEAR MONTE CARLO SUMMARY  ({args.degradation*100:.0f}% degradation)")
-    print(f"{'='*70}")
-    print(f"  {'Year':<8}{'Worst (p5)':>14}{'Conservative':>14}{'Median':>14}{'Optimistic':>14}{'Best (p95)':>14}")
+    # ── Summary table ─────────────────────────────────────────────────
+    print(f"\n{'='*78}")
+    print(f"  4-YEAR MONTE CARLO SUMMARY  ({args.degradation*100:.0f}% degradation, NKD@£30k)")
+    print(f"{'='*78}")
+    print(f"  {'Year':<8}{'p5 (worst)':>14}{'p25':>14}{'Median':>14}{'p75':>14}{'p95 (best)':>14}")
     for yr in range(1, args.years + 1):
         idx = yr * TRADING_DAYS_PER_YEAR
         if idx >= len(bands[50]):
             idx = len(bands[50]) - 1
-        row = [yr]
-        for p in pcts:
-            row.append(f"£{bands[p][idx]:>12,.0f}")
-        print(f"  Year {yr}  " + "".join(f"{v:>14}" for v in row[1:]))
+        row = "".join(f"£{bands[p][idx]:>12,.0f}" for p in pcts)
+        print(f"  Year {yr}  {row}")
 
-    # Sample path stake progression
-    print(f"\n  STAKE LADDER PROGRESSION (sample path #{sample_idx}):")
-    last_stake = LADDER[0][1]
-    for i, st in enumerate(sample_stakes):
-        if st != last_stake:
-            year_frac = i / TRADING_DAYS_PER_YEAR
-            print(f"    Day {i:>4} (Year {year_frac:.1f}): £{last_stake:.1f}/pt → £{st:.1f}/pt  "
-                  f"(account ≈ £{sample_eq[i]:,.0f})")
-            last_stake = st
+    print(f"\n  NKD ENABLE TIMING (when each percentile sim crosses £30k):")
+    for p in pcts:
+        d = nkd_trigger_day[p]
+        if d < 0:
+            print(f"    p{p:<3}: NEVER")
+        else:
+            yr = d / TRADING_DAYS_PER_YEAR
+            print(f"    p{p:<3}: day {d} (year {yr:.2f})")
 
-    # Median per-year P&L
-    print(f"\n  MEDIAN £/PERIOD (rolling):")
-    final = bands[50][-1]
-    print(f"    Day  1:  £{daily_pnl[0]:+,.0f}")
-    print(f"    Week 1:  £{sum(daily_pnl[:5]):+,.0f}")
-    print(f"    Month 1: £{sum(daily_pnl[:21]):+,.0f}")
+    median_final = bands[50][-1]
+    print(f"\n  YEAR-BY-YEAR MEDIAN £:")
     print(f"    Year 1:  £{bands[50][min(252, len(bands[50])-1)] - args.account:+,.0f}")
     print(f"    Year 2:  £{bands[50][min(504, len(bands[50])-1)] - bands[50][min(252, len(bands[50])-1)]:+,.0f}")
     print(f"    Year 3:  £{bands[50][min(756, len(bands[50])-1)] - bands[50][min(504, len(bands[50])-1)]:+,.0f}")
     print(f"    Year 4:  £{bands[50][min(1008, len(bands[50])-1)] - bands[50][min(756, len(bands[50])-1)]:+,.0f}")
-    print(f"    EOY 4:   £{final:,.0f}  ({(final/args.account - 1)*100:.0f}% total return)")
+    print(f"    EOY 4:   £{median_final:,.0f}  ({(median_final/args.account - 1)*100:.0f}% total return)")
 
 
 if __name__ == "__main__":
