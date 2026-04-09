@@ -266,10 +266,41 @@ def main():
                     help=f"Annual CGT allowance per account (default £{TAX_ALLOWANCE_GBP})")
     ap.add_argument("--no-tax", action="store_true",
                     help="Disable tax (gross-only mode)")
+    ap.add_argument("--scenario", choices=["optimistic","median","conservative","stress"],
+                    help="Shortcut for canonical degradation tiers (sets --degradation)")
+    ap.add_argument("--all-scenarios", action="store_true",
+                    help="Run all 4 canonical scenarios in sequence (single + dual)")
     args = ap.parse_args()
     if args.no_tax:
         args.tax_rate = 0.0
         args.tax_allowance = 0.0
+    # Resolve scenario shortcut → degradation
+    SCENARIO_DEG = {
+        "optimistic":   0.30,   # live execution recovers 70% of theoretical edge
+        "median":       0.50,   # live recovers 50% (probable post-fix anchor)
+        "conservative": 0.65,   # live recovers 35% (planning anchor)
+        "stress":       0.75,   # live recovers 25% (worst plausible — psychological floor)
+    }
+    if args.scenario:
+        args.degradation = SCENARIO_DEG[args.scenario]
+        # Update output filename to match scenario for clarity
+        if args.out == "data/monte_carlo_4yr.png":
+            tag = "dual" if args.dual else "single"
+            args.out = f"data/mc_4yr_{tag}_{args.scenario}.png"
+
+    # --all-scenarios shortcut: run every canonical tier (single + dual) and exit
+    if args.all_scenarios:
+        import subprocess, sys as _sys
+        for sc in ["optimistic", "median", "conservative", "stress"]:
+            for mode in ["single", "dual"]:
+                cmd = [_sys.executable, __file__,
+                       "--scenario", sc,
+                       "--runs", str(args.runs)]
+                if mode == "dual":
+                    cmd.append("--dual")
+                print(f"\n{'='*78}\n  RUNNING {sc.upper()} {mode}\n{'='*78}")
+                subprocess.run(cmd)
+        return
 
     if args.no_nikkei:
         INSTRUMENTS.pop("NIKKEI", None)
