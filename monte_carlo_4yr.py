@@ -324,6 +324,7 @@ def main():
     nikkei_on_days = np.zeros(args.runs)
     wife_open_days = np.zeros(args.runs)
     sample_dbgs = []
+    sample_tax_events = []
     for i in range(args.runs):
         eq, dbg = simulate_one(daily_inst_pts, n_days, args.degradation, rng,
                                 start_equity=args.account, dual_account=args.dual)
@@ -331,12 +332,13 @@ def main():
         nikkei_on_days[i] = dbg["nikkei_on_day"]
         wife_open_days[i] = dbg["wife_open_day"]
         # Post-tax: split primary + wife and apply CGT separately
-        p_post, w_post, _ = apply_tax_post(
+        p_post, w_post, tax_evs = apply_tax_post(
             dbg["primary"], dbg["wife"], args.account,
             args.tax_rate, args.tax_allowance,
         )
         all_equity_post_tax[i] = p_post + w_post
         sample_dbgs.append(dbg)
+        sample_tax_events.append(tax_evs)
 
     pcts = [5, 25, 50, 75, 95]
     bands = {p: np.percentile(all_equity, p, axis=0) for p in pcts}
@@ -358,11 +360,25 @@ def main():
     sample_idx = int(np.argmin(np.abs(final_pnls_post - target)))
     sample_eq = all_equity[sample_idx]
     sample_eq_post = all_equity_post_tax[sample_idx]
-    daily_pnl = np.diff(sample_eq_post)  # post-tax daily for the bar charts
-
     sample_dbg = sample_dbgs[sample_idx]
     sample_contracts = sample_dbg["contracts"]
     sample_nikkei_on = sample_dbg["nikkei_on_day"]
+
+    # Trading-only daily P&L = gross diff. Tax events live in a separate
+    # array indexed by day, so they show up as their own bars (purple)
+    # rather than contaminating the trading bars (red/green).
+    daily_pnl_trading = np.diff(sample_eq)         # gross trading P&L only
+    tax_per_day = np.zeros(n_days)
+    for ev in sample_tax_events[sample_idx]:
+        # ev["day"] is the absolute day index in the equity curve.
+        # eq diff at that index reflects the tax deduction.
+        d = ev["day"] - 1  # diff index = equity index - 1
+        if 0 <= d < n_days:
+            tax_per_day[d] -= (ev["p_tax"] + ev["w_tax"])
+    # daily_pnl is what the user sees on the bar chart — for backward
+    # compat keep it as the post-tax diff. But the bar chart code below
+    # will use trading + tax separately.
+    daily_pnl = np.diff(sample_eq_post)
 
     print(f"\nSAMPLE PATH #{sample_idx}:")
     print(f"  Final equity GROSS: £{sample_eq[-1]:,.0f}  (P&L £{sample_eq[-1] - args.account:+,.0f})")
@@ -378,41 +394,55 @@ def main():
     else:
         print(f"  NKD enabled:    NEVER (sample never hit £30k)")
 
-    # Aggregate
-    weekly_pnl = []
-    monthly_pnl = []
-    week_buf = []
-    month_buf = []
+    # Aggregate — track trading P&L and tax payments separately so the
+    # bar charts can plot them in different colours.
+    weekly_trading = []
+    weekly_tax = []
+    monthly_trading = []
+    monthly_tax = []
+    week_t_buf = []
+    week_x_buf = []
+    month_t_buf = []
+    month_x_buf = []
     cur_week = dates[1].isocalendar().week
     cur_month = dates[1].month
     week_dates = []
     month_dates = []
     for i, day in enumerate(dates[1:]):
         if day.isocalendar().week != cur_week:
-            weekly_pnl.append(sum(week_buf))
+            weekly_trading.append(sum(week_t_buf))
+            weekly_tax.append(sum(week_x_buf))
             week_dates.append(dates[i])
-            week_buf = []
+            week_t_buf = []
+            week_x_buf = []
             cur_week = day.isocalendar().week
         if day.month != cur_month:
-            monthly_pnl.append(sum(month_buf))
+            monthly_trading.append(sum(month_t_buf))
+            monthly_tax.append(sum(month_x_buf))
             month_dates.append(dates[i])
-            month_buf = []
+            month_t_buf = []
+            month_x_buf = []
             cur_month = day.month
-        week_buf.append(daily_pnl[i])
-        month_buf.append(daily_pnl[i])
-    if week_buf:
-        weekly_pnl.append(sum(week_buf))
+        week_t_buf.append(daily_pnl_trading[i])
+        week_x_buf.append(tax_per_day[i])
+        month_t_buf.append(daily_pnl_trading[i])
+        month_x_buf.append(tax_per_day[i])
+    if week_t_buf:
+        weekly_trading.append(sum(week_t_buf))
+        weekly_tax.append(sum(week_x_buf))
         week_dates.append(dates[-1])
-    if month_buf:
-        monthly_pnl.append(sum(month_buf))
+    if month_t_buf:
+        monthly_trading.append(sum(month_t_buf))
+        monthly_tax.append(sum(month_x_buf))
         month_dates.append(dates[-1])
 
-    losing_weeks = sum(1 for w in weekly_pnl if w < 0)
-    losing_months = sum(1 for m in monthly_pnl if m < 0)
-    print(f"  Losing weeks:   {losing_weeks}/{len(weekly_pnl)} "
-          f"({losing_weeks/max(1,len(weekly_pnl))*100:.1f}%)")
-    print(f"  Losing months:  {losing_months}/{len(monthly_pnl)} "
-          f"({losing_months/max(1,len(monthly_pnl))*100:.1f}%)")
+    # Losing-period stats are now based on TRADING-only (excluding tax)
+    losing_weeks = sum(1 for w in weekly_trading if w < 0)
+    losing_months = sum(1 for m in monthly_trading if m < 0)
+    print(f"  Losing weeks:   {losing_weeks}/{len(weekly_trading)} "
+          f"({losing_weeks/max(1,len(weekly_trading))*100:.1f}%)")
+    print(f"  Losing months:  {losing_months}/{len(monthly_trading)} "
+          f"({losing_months/max(1,len(monthly_trading))*100:.1f}%)")
 
     # When does each percentile sim cross £30k (NKD trigger)?
     nkd_trigger_day = {}
@@ -465,40 +495,71 @@ def main():
     ax1.xaxis.set_major_locator(mdates.MonthLocator(interval=6))
     ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
 
+    TAX_COLOR = "#7e44b8"  # purple — clearly distinct from trading green/red
+
+    # 2. Daily P&L — TRADING ONLY (tax events overlaid in purple)
     ax2 = fig.add_subplot(gs[1])
-    colors = ["#2ca02c" if p > 0 else "#d62728" for p in daily_pnl]
-    ax2.bar(dates[1:], daily_pnl, color=colors, width=1.5)
+    colors = ["#2ca02c" if p > 0 else "#d62728" for p in daily_pnl_trading]
+    ax2.bar(dates[1:], daily_pnl_trading, color=colors, width=1.5,
+            label="Trading P&L")
+    # Tax bars (negative purple) on the same axis
+    tax_dates_only = [dates[1:][i] for i in range(n_days) if tax_per_day[i] < 0]
+    tax_vals_only = [tax_per_day[i] for i in range(n_days) if tax_per_day[i] < 0]
+    if tax_dates_only:
+        ax2.bar(tax_dates_only, tax_vals_only, color=TAX_COLOR, width=4,
+                label="HMRC tax (year-end)", alpha=0.85)
     ax2.axhline(y=0, color="#888", linewidth=0.5)
-    losing_days_pct = (daily_pnl < 0).sum() / len(daily_pnl) * 100
-    ax2.set_title(f"Daily P&L (sample path) — {losing_days_pct:.0f}% losing days")
+    losing_days_pct = (daily_pnl_trading < 0).sum() / len(daily_pnl_trading) * 100
+    ax2.set_title(f"Daily P&L (sample path) — {losing_days_pct:.0f}% losing days "
+                  f"(trading only; tax events shown in purple)")
     ax2.set_ylabel("£/day")
     ax2.yaxis.set_major_formatter(FuncFormatter(_money_fmt))
     ax2.grid(True, alpha=0.3)
+    ax2.legend(loc="lower left", fontsize=8)
     ax2.xaxis.set_major_locator(mdates.MonthLocator(interval=6))
     ax2.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
 
+    # 3. Weekly P&L — trading + tax stacked clearly
     ax3 = fig.add_subplot(gs[2])
-    wcolors = ["#2ca02c" if p > 0 else "#d62728" for p in weekly_pnl]
-    ax3.bar(week_dates, weekly_pnl, color=wcolors, width=5)
+    wcolors = ["#2ca02c" if p > 0 else "#d62728" for p in weekly_trading]
+    ax3.bar(week_dates, weekly_trading, color=wcolors, width=5,
+            label="Trading P&L")
+    # Tax weeks
+    tw_dates = [week_dates[i] for i in range(len(weekly_tax)) if weekly_tax[i] < 0]
+    tw_vals = [weekly_tax[i] for i in range(len(weekly_tax)) if weekly_tax[i] < 0]
+    if tw_dates:
+        ax3.bar(tw_dates, tw_vals, color=TAX_COLOR, width=5,
+                label="HMRC tax", alpha=0.85)
     ax3.axhline(y=0, color="#888", linewidth=0.5)
-    lw_pct = losing_weeks / max(1, len(weekly_pnl)) * 100
-    ax3.set_title(f"Weekly P&L (sample path) — {losing_weeks}/{len(weekly_pnl)} losing weeks ({lw_pct:.0f}%)")
+    lw_pct = losing_weeks / max(1, len(weekly_trading)) * 100
+    ax3.set_title(f"Weekly P&L (sample path) — {losing_weeks}/{len(weekly_trading)} losing weeks "
+                  f"({lw_pct:.0f}%, trading only; purple bars are year-end tax)")
     ax3.set_ylabel("£/week")
     ax3.yaxis.set_major_formatter(FuncFormatter(_money_fmt))
     ax3.grid(True, alpha=0.3)
+    ax3.legend(loc="lower left", fontsize=8)
     ax3.xaxis.set_major_locator(mdates.MonthLocator(interval=6))
     ax3.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
 
+    # 4. Monthly P&L
     ax4 = fig.add_subplot(gs[3])
-    mcolors = ["#2ca02c" if p > 0 else "#d62728" for p in monthly_pnl]
-    ax4.bar(month_dates, monthly_pnl, color=mcolors, width=20)
+    mcolors = ["#2ca02c" if p > 0 else "#d62728" for p in monthly_trading]
+    ax4.bar(month_dates, monthly_trading, color=mcolors, width=20,
+            label="Trading P&L")
+    tm_dates = [month_dates[i] for i in range(len(monthly_tax)) if monthly_tax[i] < 0]
+    tm_vals = [monthly_tax[i] for i in range(len(monthly_tax)) if monthly_tax[i] < 0]
+    if tm_dates:
+        ax4.bar(tm_dates, tm_vals, color=TAX_COLOR, width=20,
+                label="HMRC tax", alpha=0.85)
     ax4.axhline(y=0, color="#888", linewidth=0.5)
-    lm_pct = losing_months / max(1, len(monthly_pnl)) * 100
-    ax4.set_title(f"Monthly P&L (sample path) — {losing_months}/{len(monthly_pnl)} losing months ({lm_pct:.0f}%)")
+    lm_pct = losing_months / max(1, len(monthly_trading)) * 100
+    ax4.set_title(f"Monthly P&L (sample path) — {losing_months}/{len(monthly_trading)} losing months "
+                  f"({lm_pct:.0f}%, trading only)")
     ax4.set_ylabel("£/month")
     ax4.yaxis.set_major_formatter(FuncFormatter(_money_fmt))
     ax4.set_xlabel("Date")
     ax4.grid(True, alpha=0.3)
+    ax4.legend(loc="lower left", fontsize=8)
     ax4.xaxis.set_major_locator(mdates.MonthLocator(interval=6))
     ax4.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
 
