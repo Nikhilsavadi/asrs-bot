@@ -57,18 +57,18 @@ def test_sizing_nkd_at_30k_gives_at_least_1(at_equity):
     assert qty >= 1
 
 
-def test_sizing_zero_stop_returns_1():
-    """Edge case: zero stop distance should default to 1 lot, not crash."""
+def test_sizing_zero_stop_returns_minimum():
+    """Edge case: zero stop distance should default to minimum, not crash."""
     qty = position_size_contracts("X", "X", stop_distance_pts=0,
                                     gbp_per_pt=1.0, max_contracts=10)
-    assert qty == 1
+    assert qty == 0.5  # IG minimum £0.50/pt
 
 
-def test_sizing_negative_stop_returns_1():
-    """Negative stop (bug upstream) should default to 1, not crash."""
+def test_sizing_negative_stop_returns_minimum():
+    """Negative stop (bug upstream) should default to minimum, not crash."""
     qty = position_size_contracts("X", "X", stop_distance_pts=-10,
                                     gbp_per_pt=1.0, max_contracts=10)
-    assert qty == 1
+    assert qty == 0.5  # IG minimum £0.50/pt
 
 
 # ─────────────────────────────────────────────────────────────────────

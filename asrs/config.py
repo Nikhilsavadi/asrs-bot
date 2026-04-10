@@ -46,7 +46,7 @@ INSTRUMENTS = {
         "epic": "IX.D.DAX.DAILY.IP",
         "currency": "GBP",
         "label": "DAX 40",
-        "gbp_per_pt": 0.86,   # FDXS €1/pt → ~£0.86/pt
+        "gbp_per_pt": 1.0,    # IG spread bet: 1 unit of size = £1/pt
         "buffer": 2.0,
         "narrow_range": 15,
         "wide_range": 40,
@@ -72,7 +72,7 @@ INSTRUMENTS = {
         "epic": "IX.D.DOW.DAILY.IP",
         "currency": "GBP",
         "label": "US30 (Dow)",
-        "gbp_per_pt": 0.40,   # MYM $0.50/pt → ~£0.40/pt
+        "gbp_per_pt": 1.0,    # IG spread bet: 1 unit of size = £1/pt
         "buffer": 5.0,
         "narrow_range": 30,
         "wide_range": 100,
@@ -99,7 +99,7 @@ INSTRUMENTS = {
         "epic": "IX.D.NIKKEI.DAILY.IP",
         "currency": "GBP",
         "label": "Nikkei 225",
-        "gbp_per_pt": 4.0,    # NKD $5/pt → ~£4/pt (matches firstrate backtest)
+        "gbp_per_pt": 1.0,    # IG spread bet: 1 unit of size = £1/pt
         "buffer": 2.0,
         "narrow_range": 50,
         "wide_range": 150,

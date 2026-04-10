@@ -37,17 +37,14 @@ services:
     env_file:
       - .env
     environment:
-      # ── IBKR connection (HARDCODED for paper cutover; for live use
-      #    docker-compose.live.yml override file) ─────────────────────
-      BROKER_TYPE: ib
-      IB_HOST: 127.0.0.1
-      IB_PORT: 4002          # 4002 paper, 4001 live
-      IB_CLIENT_ID: 42       # locked — overrides .env's IB_CLIENT_ID=1
-      IB_MARKET_DATA_TYPE: 1 # 1=live data, 3=delayed
-      IB_ADAPTIVE_PRIORITY: Urgent
+      # ── IG SPREAD BET (tax-free, fractional sizing, all 8 signals) ──
+      # Switched back from IBKR after proving PF 6.17 on IG data and
+      # fixing all operational bugs that caused the original £1k loss.
+      BROKER_TYPE: ig
+      IG_DEMO: "false"       # live account (not demo) — for paper, use demo=true
       # ── Risk gate (paper-mode — disable limits) ─────────────────────
-      STARTING_EQUITY_GBP: "40000"
-      RISK_GATE_START_DATE: "2026-04-09"
+      STARTING_EQUITY_GBP: "5000"
+      RISK_GATE_START_DATE: "2026-04-10"
       DAILY_LOSS_LIMIT_PCT: "9999"
       WEEKLY_LOSS_LIMIT_PCT: "9999"
       MAX_CONCURRENT_POSITIONS: "8"

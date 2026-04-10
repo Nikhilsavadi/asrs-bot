@@ -227,24 +227,42 @@ def position_size_contracts(
     stop_distance_pts: float,
     gbp_per_pt: float,
     max_contracts: int,
-) -> int:
+) -> float:
     """
-    Vol-targeted position sizing. Returns the number of contracts that
-    risks exactly RISK_PCT_PER_TRADE of current equity for the given
-    stop distance, capped at max_contracts and floored at 1.
+    Vol-targeted position sizing. Returns the size to trade.
 
-    qty = floor(risk_budget_gbp / (stop_distance_pts * gbp_per_pt))
+    On IBKR (gbp_per_pt varies by contract): returns integer contracts.
+    On IG (gbp_per_pt = 1.0): returns £/pt stake rounded to IG's
+    minimum increment (£0.50/pt).
+
+    qty = risk_budget_gbp / (stop_distance_pts * gbp_per_pt)
+
+    Examples at £5k equity, 0.5% risk, 50pt stop:
+      IBKR DAX (gbp_per_pt=0.86): raw=0.58 → 1 contract
+      IG DAX   (gbp_per_pt=1.0):  raw=0.50 → £0.50/pt stake
     """
     if stop_distance_pts <= 0 or gbp_per_pt <= 0:
-        return 1
+        return 0.5  # IG minimum
     equity = current_equity_gbp()
     risk_budget_gbp = equity * CFG.risk_pct_per_trade / 100.0
     raw = risk_budget_gbp / (stop_distance_pts * gbp_per_pt)
-    qty = max(1, min(max_contracts, int(raw)))
+
+    # Detect IG mode: gbp_per_pt = 1.0 for all instruments on IG spread bet
+    ig_mode = abs(gbp_per_pt - 1.0) < 0.01
+    if ig_mode:
+        # IG spread bet: round to nearest £0.50 increment, min £0.50
+        IG_INCREMENT = 0.5
+        qty = max(IG_INCREMENT, round(raw / IG_INCREMENT) * IG_INCREMENT)
+        # Cap: on IG, max_contracts translates to max £/pt stake
+        qty = min(qty, float(max_contracts))
+    else:
+        # IBKR futures: integer contracts, min 1
+        qty = max(1, min(max_contracts, int(raw)))
+
     logger.info(
         f"[{signal_name}] sizing: equity=£{equity:.0f} budget=£{risk_budget_gbp:.0f} "
         f"stop={stop_distance_pts:.0f}pts £/pt={gbp_per_pt:.2f} → "
-        f"raw={raw:.2f} → qty={qty} (cap={max_contracts})"
+        f"raw={raw:.2f} → qty={qty} ({'IG £/pt' if ig_mode else 'contracts'} cap={max_contracts})"
     )
     return qty
 
