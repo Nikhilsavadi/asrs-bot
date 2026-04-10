@@ -1,26 +1,29 @@
 services:
-  ibgateway:
-    image: ghcr.io/gnzsnz/ib-gateway:latest
-    container_name: asrs-ibgateway
-    restart: unless-stopped
-    network_mode: host  # bot connects via 127.0.0.1, no IP whitelist gymnastics
-    environment:
-      TWS_USERID: ${IB_USERNAME}
-      TWS_PASSWORD: ${IB_PASSWORD}
-      TRADING_MODE: ${IB_TRADING_MODE:-paper}      # paper | live
-      READ_ONLY_API: "no"
-      BYPASS_WARNING: "yes"
-      TWS_ACCEPT_INCOMING: "accept"
-      AUTO_RESTART_TIME: "11:59 PM"
-      RELOGIN_AFTER_TWOFA_TIMEOUT: "yes"
-      TIME_ZONE: "Europe/London"
-    volumes:
-      - ibgateway-data:/home/ibgateway/Jts
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+  # ── IB Gateway — DISABLED while trading on IG (Apr 10 2026) ────────
+  # Kept for reference. To re-enable: uncomment and docker compose up -d
+  #
+  # ibgateway:
+  #   image: ghcr.io/gnzsnz/ib-gateway:latest
+  #   container_name: asrs-ibgateway
+  #   restart: unless-stopped
+  #   network_mode: host
+  #   environment:
+  #     TWS_USERID: ${IB_USERNAME}
+  #     TWS_PASSWORD: ${IB_PASSWORD}
+  #     TRADING_MODE: ${IB_TRADING_MODE:-paper}
+  #     READ_ONLY_API: "no"
+  #     BYPASS_WARNING: "yes"
+  #     TWS_ACCEPT_INCOMING: "accept"
+  #     AUTO_RESTART_TIME: "11:59 PM"
+  #     RELOGIN_AFTER_TWOFA_TIMEOUT: "yes"
+  #     TIME_ZONE: "Europe/London"
+  #   volumes:
+  #     - ibgateway-data:/home/ibgateway/Jts
+  #   logging:
+  #     driver: json-file
+  #     options:
+  #       max-size: "10m"
+  #       max-file: "3"
 
   bot:
     build:
@@ -63,12 +66,13 @@ services:
       # /var/lib/asrs-runtime so the operator can `touch ...paused` from
       # outside the container without docker exec.
       - /var/lib/asrs-runtime:/var/run/asrs
-    depends_on:
-      ibgateway:
-        condition: service_started
-        required: false
+    # depends_on ibgateway — DISABLED while on IG
+    # depends_on:
+    #   ibgateway:
+    #     condition: service_started
+    #     required: false
     healthcheck:
-      test: ["CMD", "test", "-f", "/tmp/asrs.heartbeat"]
+      test: ["CMD", "test", "-f", "/app/data/heartbeat"]
       interval: 60s
       timeout: 10s
       start_period: 120s
