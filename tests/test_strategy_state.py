@@ -63,9 +63,12 @@ def test_save_state_atomic_no_partial_file(tmp_path):
 
 def test_save_state_roundtrip(tmp_path):
     """Save then load → same values."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
     sig = _mk_signal_with_state_dir(tmp_path, "US30", 2)
     sig.state.phase = Phase.LONG
-    sig.state.date = "2026-04-09"
+    sig.state.date = today
     sig.state.entries_used = 2
     sig.state.entry_price = 48060.0
     sig.state.trailing_stop = 48020.0

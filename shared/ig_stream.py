@@ -33,7 +33,8 @@ class _TickListener(SubscriptionListener):
                  tick_callbacks: dict,
                  loop: asyncio.AbstractEventLoop,
                  tick_bars: dict = None, candle_bars: dict = None,
-                 candle_callbacks: dict = None, bar_emit_times: dict = None):
+                 candle_callbacks: dict = None, bar_emit_times: dict = None,
+                 last_real_bar_time: dict = None):
         self._epic = epic
         self._prices = prices
         self._events = events
@@ -43,22 +44,32 @@ class _TickListener(SubscriptionListener):
         self._candle_bars = candle_bars if candle_bars is not None else {}
         self._candle_callbacks = candle_callbacks if candle_callbacks is not None else {}
         self._bar_emit_times = bar_emit_times if bar_emit_times is not None else {}
+        self._last_real_bar_time = last_real_bar_time if last_real_bar_time is not None else {}
 
     def onItemUpdate(self, update):
         try:
             bid = update.getValue("BID")
             ofr = update.getValue("OFR")
+            ltp = update.getValue("LTP")  # Last Traded Price (may be None for OTC DFB)
+            utm = update.getValue("UTM")  # Server time ms (Unix epoch)
             if bid and ofr:
                 mid = round((float(bid) + float(ofr)) / 2, 1)
                 self._prices[self._epic] = mid
                 self._prices[f"{self._epic}_bid"] = float(bid)
                 self._prices[f"{self._epic}_ofr"] = float(ofr)
                 self._prices[f"{self._epic}_time"] = time.time()
+                # Store LTP if available (for future use — DFB may be None)
+                if ltp:
+                    try:
+                        self._prices[f"{self._epic}_ltp"] = float(ltp)
+                    except (ValueError, TypeError):
+                        pass
                 # Log every 60th tick to avoid flooding
                 count = self._prices.get(f"{self._epic}_count", 0) + 1
                 self._prices[f"{self._epic}_count"] = count
                 if count <= 3 or count % 60 == 0:
-                    logger.info(f"Tick #{count} ({self._epic}): bid={bid} ofr={ofr} mid={mid}")
+                    ltp_str = f" ltp={ltp}" if ltp else ""
+                    logger.info(f"Tick #{count} ({self._epic}): bid={bid} ofr={ofr} mid={mid}{ltp_str}")
                 # Wake any coroutine waiting for a fresh price
                 event = self._events.get(self._epic)
                 if event:
@@ -68,19 +79,47 @@ class _TickListener(SubscriptionListener):
                     self._loop.call_soon_threadsafe(cb, mid, float(bid), float(ofr))
 
                 # ── Tick-based bar builder ─────────────────────────────
-                # Build 5-min OHLC bars in real-time from ticks
-                # Bars emit on our clock, not IG's CONS_END delay
-                self._update_tick_bar(mid)
+                # Build 5-min OHLC bars from MID ticks.
+                #
+                # Why MID (not LTP): IG DFB is an OTC product where
+                # LTP may not be populated (confirmed by IG docs — DFB
+                # trades are between you and IG, not on an exchange).
+                # MID = (BID+OFR)/2 is the fair value on IG's book.
+                # The strategy's backtest on IG data uses mid bars, and
+                # the PF 6.17 was measured on mid-priced bars. Using MID
+                # here matches that baseline.
+                #
+                # On IBKR (exchange) we use trade prints (TRADES) because
+                # exchange bid/ask wicks can be phantom. On IG, bid/ask
+                # IS the market — there's no separate trade print feed.
+                #
+                # Bar timing: use UTM (server time) if available for
+                # consistent boundary detection across restarts. Fall back
+                # to local CET clock if UTM missing (shouldn't happen).
+                bar_time = None
+                if utm:
+                    try:
+                        bar_time = datetime.fromtimestamp(
+                            int(utm) / 1000, tz=CET
+                        )
+                    except (ValueError, TypeError, OSError):
+                        pass
+                self._update_tick_bar(mid, bar_time=bar_time)
 
         except Exception as e:
             logger.debug(f"Tick update error ({self._epic}): {e}")
 
-    def _update_tick_bar(self, mid: float):
-        """Accumulate tick into current 5-min bar. Emit when clock crosses boundary."""
+    def _update_tick_bar(self, mid: float, bar_time: datetime | None = None):
+        """Accumulate tick into current 5-min bar. Emit when clock crosses boundary.
+
+        bar_time: if provided, use this (from IG's UTM server timestamp)
+                  for bar boundary detection instead of local clock. Prevents
+                  drift between tick bars and CONS_END bars (which use UTM).
+        """
         # Reject garbage ticks (negative, zero, or absurdly large)
         if mid <= 0 or mid > 1_000_000:
             return
-        now = datetime.now(CET)
+        now = bar_time if bar_time is not None else datetime.now(CET)
         bar_min = (now.minute // 5) * 5
         bar_start = now.replace(minute=bar_min, second=0, microsecond=0)
 
@@ -106,6 +145,8 @@ class _TickListener(SubscriptionListener):
                 if not already:
                     epic_bars.append(completed)
                     self._bar_emit_times[self._epic] = datetime.now(CET)
+                    # Track last REAL bar time for synth gap-fill freshness check
+                    self._last_real_bar_time[self._epic] = completed["time"]
                     logger.info(
                         f"Tick-bar ({self._epic}): {completed['time'].strftime('%H:%M')}-"
                         f"{end_time.strftime('%H:%M')} CET | "
@@ -337,6 +378,16 @@ class IGStreamManager:
         self._tick_bars: dict[str, dict] = {}  # epic -> current accumulating bar
         self._tick_bar_lock: dict[str, bool] = {}  # prevent race conditions
 
+        # Wall-clock bar finalizer task (same pattern as ib_stream.py)
+        # Ensures bars complete on schedule even if Lightstreamer goes
+        # quiet for 60+ seconds. Without this, sparse-tick periods
+        # (early morning, thin liquidity) would delay bar 5 past the
+        # strategy's wait timeout — the same bug we had on IBKR.
+        self._wall_clock_task: asyncio.Task | None = None
+        # Last REAL bar time per epic (not synth). Prevents synth
+        # self-perpetuation — the IBKR runaway bug from Apr 9.
+        self._last_real_bar_time: dict[str, datetime] = {}
+
     # ── Tick streaming ─────────────────────────────────────────────
 
     async def subscribe_ticks(self, epic: str):
@@ -358,11 +409,132 @@ class IGStreamManager:
         listener = _TickListener(
             epic, self._prices, self._price_events, self._tick_callbacks, self._loop,
             tick_bars=self._tick_bars, candle_bars=self._candle_bars,
-            candle_callbacks=self._candle_callbacks, bar_emit_times=self._last_bar_emit
+            candle_callbacks=self._candle_callbacks, bar_emit_times=self._last_bar_emit,
+            last_real_bar_time=self._last_real_bar_time,
         )
         sub.addListener(listener)
         self._session.stream.subscribe(sub)
         self._tick_subs[epic] = sub
+
+        # Start wall-clock finalizer once on first subscribe
+        if self._wall_clock_task is None or self._wall_clock_task.done():
+            self._wall_clock_task = self._loop.create_task(self._wall_clock_finalizer())
+            logger.info("IG wall-clock bar finaliser started")
+
+    async def _wall_clock_finalizer(self) -> None:
+        """Periodic task: finalise any tick-bar whose 5-min window closed.
+
+        Same pattern as ib_stream.py's _wall_clock_finalizer. Runs every
+        2 seconds. If a tick-bar is building and the wall-clock window
+        has closed (>8s grace), emit it even if no new tick arrived.
+
+        Also detects missing 5-min windows (zero-tick gaps) and inserts
+        synthetic bars to keep the deque continuous — matching IBKR's
+        _maybe_insert_zero_trade_bars with the same safety guards:
+        only within 15 min of last real bar, max 2 per call, never
+        overwrite existing bars.
+        """
+        GRACE_S = 8
+        while True:
+            try:
+                await asyncio.sleep(2)
+                now = datetime.now(CET)
+                for epic, current in list(self._tick_bars.items()):
+                    if current is None or current.get("tick_count", 0) == 0:
+                        continue
+                    bar_end = current["time"] + timedelta(minutes=5)
+                    age = (now - bar_end).total_seconds()
+                    if age >= GRACE_S:
+                        # Finalise this bar — same code as _update_tick_bar boundary crossing
+                        completed = {
+                            "time": current["time"],
+                            "Open": current["Open"],
+                            "High": current["High"],
+                            "Low": current["Low"],
+                            "Close": current["Close"],
+                        }
+                        epic_bars = self._candle_bars.setdefault(epic, deque(maxlen=300))
+                        already = any(b["time"] == completed["time"] for b in epic_bars)
+                        if not already:
+                            epic_bars.append(completed)
+                            self._last_bar_emit[epic] = now
+                            self._last_real_bar_time[epic] = completed["time"]
+                            logger.info(
+                                f"Wall-clock bar ({epic}): {completed['time'].strftime('%H:%M')} "
+                                f"O={completed['Open']:.0f} H={completed['High']:.0f} "
+                                f"L={completed['Low']:.0f} C={completed['Close']:.0f}"
+                            )
+                            for cb in self._candle_callbacks.get(epic, []):
+                                self._loop.call_soon_threadsafe(
+                                    self._loop.create_task, cb(completed)
+                                )
+                        # Clear current bar — next tick starts a new one
+                        self._tick_bars[epic] = None
+
+                # Zero-tick gap fill (same safety as IBKR)
+                for epic in list(self._candle_bars.keys()):
+                    self._maybe_insert_zero_tick_bars(epic, now)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"IG wall-clock finalizer error: {e}", exc_info=True)
+
+    def _maybe_insert_zero_tick_bars(self, epic: str, now: datetime) -> None:
+        """Insert synthetic no-tick bars for missing 5-min windows.
+
+        Same safety rules as ib_stream.py's _maybe_insert_zero_trade_bars:
+        - Only fill if last REAL bar is within 15 min of now
+        - Max 2 synth bars per call
+        - Never overwrite existing bars
+        - Synth bars do NOT update _last_real_bar_time (prevents
+          self-perpetuation — the runaway bug from IBKR Apr 9)
+        """
+        deck = self._candle_bars.get(epic)
+        if not deck or len(deck) == 0:
+            return
+
+        last_real = self._last_real_bar_time.get(epic)
+        if last_real is None:
+            return
+        age = (now - last_real).total_seconds()
+        if age > 15 * 60:
+            return
+
+        last_bar = deck[-1]
+        last_start = last_bar["time"]
+        next_start = last_start + timedelta(minutes=5)
+        cur_min = (now.minute // 5) * 5
+        cur_window = now.replace(minute=cur_min, second=0, microsecond=0)
+
+        cur_tick = self._tick_bars.get(epic)
+        if cur_tick and cur_tick.get("time") and cur_tick["time"] < cur_window:
+            cur_window = cur_tick["time"]
+
+        MAX_SYNTH = 2
+        last_close = float(last_bar["Close"])
+        existing_times = {b["time"] for b in deck}
+        filled = 0
+
+        while next_start < cur_window and filled < MAX_SYNTH:
+            if next_start in existing_times:
+                next_start += timedelta(minutes=5)
+                continue
+            synth = {
+                "time": next_start,
+                "Open": last_close, "High": last_close,
+                "Low": last_close, "Close": last_close,
+            }
+            deck.append(synth)
+            existing_times.add(next_start)
+            logger.info(
+                f"Synth bar ({epic}): {next_start.strftime('%H:%M')} "
+                f"O=H=L=C={last_close:.0f} V=0"
+            )
+            # NOTE: do NOT update _last_real_bar_time (prevents self-perpetuation)
+            # NOTE: do NOT fire candle callbacks (synth bars shouldn't trigger strategy)
+            next_start += timedelta(minutes=5)
+            filled += 1
 
     async def get_price(self, epic: str) -> float | None:
         """

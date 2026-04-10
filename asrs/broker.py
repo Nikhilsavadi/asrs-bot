@@ -23,6 +23,19 @@ logger = logging.getLogger(__name__)
 class IGBroker:
     """IG Markets broker -- one per epic. Shares session + stream manager."""
 
+    # Per-epic entry lock shared across all signals on the same epic.
+    # Without this, sibling signals (DAX_S1 + DAX_S2) can both fire on
+    # the same tick and place duplicate market orders before either's
+    # get_position() check reflects the other's fill.
+    # Same pattern as IBBroker._contract_entry_locks.
+    _epic_entry_locks: dict[str, asyncio.Lock] = {}
+
+    @classmethod
+    def _get_entry_lock(cls, epic: str) -> asyncio.Lock:
+        if epic not in cls._epic_entry_locks:
+            cls._epic_entry_locks[epic] = asyncio.Lock()
+        return cls._epic_entry_locks[epic]
+
     def __init__(
         self,
         shared: IGSharedSession,
@@ -53,6 +66,17 @@ class IGBroker:
         # Track open position deal IDs (for multi-deal stop updates)
         self._position_deal_ids: dict[str, dict] = {}
 
+        # Captured event loop for sync→async scheduling from tick handlers.
+        # Same pattern as IBBroker._loop.
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+        # Consecutive order-error counter (same pattern as IBBroker)
+        import os
+        self._consecutive_order_errors: int = 0
+        self._max_consecutive_order_errors: int = int(
+            os.getenv("MAX_CONSECUTIVE_ORDER_ERRORS", "3")
+        )
+
         # Register tick callback for real-time entry detection
         self._stream.register_tick_callback(epic, self._on_tick)
 
@@ -60,6 +84,8 @@ class IGBroker:
 
     async def connect(self) -> bool:
         """Connect using shared session. Subscribe to streaming."""
+        # Capture loop for sync→async scheduling from tick handlers
+        self._loop = asyncio.get_running_loop()
         try:
             ok = await self._shared.ensure_connected()
             if not ok:
@@ -248,8 +274,17 @@ class IGBroker:
                 exit_price = bid if sm["direction"] == "LONG" else ofr
                 logger.info(f"Stop hit ({self.epic}): {sm['direction']} stop={stop} "
                             f"exit_price={exit_price:.1f} (bid={bid:.1f} ofr={ofr:.1f})")
-                loop = asyncio.get_event_loop()
-                loop.create_task(self._execute_stop_exit(sm["direction"], exit_price))
+                loop = self._loop
+                if loop is None:
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        logger.error(f"{self.epic}: no loop for stop exit")
+                        self._stop_exit_active = False
+                        return
+                asyncio.run_coroutine_threadsafe(
+                    self._execute_stop_exit(sm["direction"], exit_price), loop
+                )
 
         # Bracket trigger: entry signals
         if not self._pending_bracket or not self._pending_bracket.get("active"):
@@ -281,21 +316,40 @@ class IGBroker:
         self._tick_trigger_active = True
         bracket["active"] = False
         trigger_price = ofr if triggered_dir == "BUY" else bid
+        # Capture microstructure at trigger (TCA)
+        bracket["_trigger_bid"] = bid
+        bracket["_trigger_ofr"] = ofr
+        bracket["_trigger_spread"] = round(spread, 2)
         logger.info(f"Tick trigger ({self.epic}): {triggered_dir} @ {trigger_price:.1f} "
                      f"(bid={bid:.1f} ofr={ofr:.1f} spread={spread:.1f})")
 
-        loop = asyncio.get_event_loop()
-        loop.create_task(self._execute_tick_trigger(triggered_dir, trigger_price, bracket))
+        # Use captured loop (not get_event_loop which is deprecated 3.10+/broken 3.12)
+        loop = self._loop
+        if loop is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                logger.error(f"{self.epic}: no loop for tick trigger")
+                self._tick_trigger_active = False
+                return
+        asyncio.run_coroutine_threadsafe(
+            self._execute_tick_trigger(triggered_dir, trigger_price, bracket), loop
+        )
 
     async def _execute_tick_trigger(self, direction: str, price: float, bracket: dict):
         """Execute market order triggered by tick."""
+        # Per-epic lock prevents sibling bracket double-fill race
+        lock = self._get_entry_lock(self.epic)
         try:
-            # Pre-entry safety: no existing position
+            await lock.acquire()
+            # Pre-entry safety: no existing position (checked INSIDE the lock)
             try:
                 pos = await self.get_position()
                 if pos["direction"] != "FLAT":
-                    logger.error(f"BLOCKED: existing {pos['direction']} on {self.epic}")
+                    logger.error(f"BLOCKED: existing {pos['direction']} on {self.epic} "
+                                 f"(sibling already entered)")
                     self._tick_trigger_active = False
+                    lock.release()
                     return
             except Exception:
                 pass
@@ -322,6 +376,11 @@ class IGBroker:
             logger.error(f"Tick trigger execution failed: {e}", exc_info=True)
         finally:
             self._tick_trigger_active = False
+            try:
+                if lock.locked():
+                    lock.release()
+            except Exception:
+                pass
 
     # -- Order Management -----------------------------------------------------
 
