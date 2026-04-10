@@ -41,14 +41,14 @@ services:
       # Switched back from IBKR after proving PF 6.17 on IG data and
       # fixing all operational bugs that caused the original £1k loss.
       BROKER_TYPE: ig
-      IG_DEMO: "false"       # live account (not demo) — for paper, use demo=true
+      IG_DEMO: "false"       # live account, minimum stake (£0.50/pt = ~£15 max loss/trade)
       # ── Risk gate (paper-mode — disable limits) ─────────────────────
-      STARTING_EQUITY_GBP: "5000"
+      STARTING_EQUITY_GBP: "2000"
       RISK_GATE_START_DATE: "2026-04-10"
-      DAILY_LOSS_LIMIT_PCT: "9999"
-      WEEKLY_LOSS_LIMIT_PCT: "9999"
-      MAX_CONCURRENT_POSITIONS: "8"
-      CONSECUTIVE_LOSS_KILL: "9999"
+      DAILY_LOSS_LIMIT_PCT: "3.0"
+      WEEKLY_LOSS_LIMIT_PCT: "6.0"
+      MAX_CONCURRENT_POSITIONS: "3"
+      CONSECUTIVE_LOSS_KILL: "6"
       RISK_PCT_PER_TRADE: "0.5"
       MAX_CONTRACTS: "10"
       DISABLE_INSTRUMENTS: ""
