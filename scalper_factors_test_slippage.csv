@@ -1,0 +1,10 @@
+factor,binding_count,pct_of_trades
+ema_stack,0,0.0
+trend,0,0.0
+macd_cross,8,80.0
+rsi,0,0.0
+adx,1,10.0
+volume,6,60.0
+bb_break,5,50.0
+(none - all passed same bar as prev),0,0.0
+"(volume was marginal, <2.5x MA)",4,40.0
