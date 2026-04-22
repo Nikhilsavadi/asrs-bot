@@ -16,6 +16,7 @@ import pandas as pd
 
 from shared.ig_session import IGSharedSession
 from shared.ig_stream import IGStreamManager
+from asrs import audit_log
 
 logger = logging.getLogger(__name__)
 
@@ -58,10 +59,25 @@ class IGBroker:
         self._tick_trigger_active = False
         self._on_trigger_callbacks: list = []
 
+        # Local position mirror + sibling-broker list for deferred arming.
+        # Updated on entry/exit so ticks can do a cheap sibling check without
+        # hitting IG REST API on every crossing tick.
+        self._local_in_position: bool = False
+        self._sibling_brokers: list = []
+
         # Tick-based stop monitoring (exit via market order)
         self._stop_monitor: dict | None = None
         self._stop_exit_active = False
         self._on_stop_callbacks: list = []
+        self._tick_rearm_callbacks: list = []
+
+        # Stop breach confirmation timer (filters DFB spread noise).
+        # When bid/ofr first breaches the stop level, start a timer.
+        # Only execute stop exit if breach persists for STOP_CONFIRM_SECS.
+        # Resets if price recovers above stop within the window.
+        import time as _time
+        self._stop_breach_since: float = 0  # timestamp of first breach (0 = no active breach)
+        self.STOP_CONFIRM_SECS = 60  # 1 minute confirmation
 
         # Track open position deal IDs (for multi-deal stop updates)
         self._position_deal_ids: dict[str, dict] = {}
@@ -174,15 +190,18 @@ class IGBroker:
         """Register async callback for tick-triggered fills."""
         self._on_trigger_callbacks.append(callback)
 
-    def deactivate_bracket(self):
+    def deactivate_bracket(self, reason: str = "deactivated"):
         """Deactivate the pending bracket (e.g. S2 cancels S1)."""
         if self._pending_bracket:
             self._pending_bracket["active"] = False
+            audit_log.cancel(signal=getattr(self, "_signal_name", "unknown"),
+                             epic=self.epic, reason=reason)
 
     # -- Tick-based stop monitor (exits via market order, not IG stop) ---------
 
     def activate_stop_monitor(self, direction: str, stop_level: float):
         """Activate tick-level stop monitoring. Exit via market order on hit."""
+        self._stop_breach_since = 0  # reset confirmation timer on new position
         self._stop_monitor = {
             "active": True,
             "direction": direction,
@@ -195,6 +214,7 @@ class IGBroker:
         if self._stop_monitor and self._stop_monitor["active"]:
             old = self._stop_monitor["stop_level"]
             self._stop_monitor["stop_level"] = new_stop
+            self._stop_breach_since = 0  # reset timer on new stop level
             if abs(new_stop - old) > 0.1:
                 logger.info(f"Stop monitor updated ({self.epic}): {old} -> {new_stop}")
 
@@ -208,13 +228,20 @@ class IGBroker:
         """Register async callback for tick-triggered stop exits."""
         self._on_stop_callbacks.append(callback)
 
+    def register_tick_rearm_callback(self, callback):
+        """Register sync callback for tick-level re-entry gate check."""
+        self._tick_rearm_callbacks.append(callback)
+
     async def _execute_stop_exit(self, direction: str, exit_price: float):
         """Close all positions via market order when stop is hit."""
+        import time as _time
+        t_detect = _time.time()
         try:
             self._stop_monitor["active"] = False  # prevent re-trigger
 
             # Close all individual deals — retry up to 3 times
             import asyncio
+            t_send = _time.time()
             for attempt in range(1, 4):
                 closed = await self.close_position()
                 if closed:
@@ -222,22 +249,43 @@ class IGBroker:
                 logger.error(f"Stop exit close attempt {attempt}/3 failed ({self.epic})")
                 if attempt < 3:
                     await asyncio.sleep(2)
+            t_filled = _time.time()
 
             # Verify position is flat and get actual fill
             pos = await self.get_position()
             fills = getattr(self, '_last_close_fills', [])
             actual_exit = sum(fills) / len(fills) if fills else exit_price
-            if fills:
-                logger.info(f"Actual close fills ({self.epic}): {fills} avg={actual_exit:.1f}")
             if pos["direction"] != "FLAT":
                 logger.error(f"STOP EXIT FAILED — position still open ({self.epic})")
-                # Re-enable monitor to try again on next tick
                 if self._stop_monitor:
                     self._stop_monitor["active"] = True
                 self._stop_exit_active = False
                 return
+            self._local_in_position = False  # siblings can now arm/fire
+            for sb in self._sibling_brokers:
+                sb._local_in_position = False
 
-            logger.info(f"Stop exit filled ({self.epic}): closed all deals @ ~{actual_exit}")
+            # Exit slippage: positive = WORSE than intended (LONG fill below stop, SHORT fill above stop)
+            if direction == "LONG":
+                exit_slip = exit_price - actual_exit  # paid less than expected = positive slip
+            else:
+                exit_slip = actual_exit - exit_price  # paid more than expected = positive slip
+
+            send_lat_ms = (t_send - t_detect) * 1000
+            fill_lat_ms = (t_filled - t_send) * 1000
+            total_lat_ms = (t_filled - t_detect) * 1000
+
+            logger.info(
+                f"EXIT ({self.epic}): {direction} stop_intended={exit_price:.1f} actual={actual_exit:.1f} "
+                f"slip={exit_slip:+.1f}pt | latency send={send_lat_ms:.0f}ms fill={fill_lat_ms:.0f}ms total={total_lat_ms:.0f}ms"
+            )
+
+            # Sanity check: alert on excessive exit slippage
+            if abs(exit_slip) > 10:
+                logger.error(
+                    f"SANITY: excessive exit slippage on {self.epic} {direction}: "
+                    f"intended={exit_price:.1f} actual={actual_exit:.1f} slip={exit_slip:+.1f}pt"
+                )
 
             # Fire callbacks to strategy
             for cb in self._on_stop_callbacks:
@@ -245,6 +293,8 @@ class IGBroker:
                     await cb({
                         "exit_price": actual_exit,
                         "exit_intended": exit_price,  # tick price at detection
+                        "exit_slippage_pts": round(exit_slip, 1),
+                        "exit_latency_ms": round(total_lat_ms),
                         "direction": direction,
                     })
                 except Exception as e:
@@ -259,16 +309,58 @@ class IGBroker:
         """
         Called on every tick from Lightstreamer.
         Handles: bracket entry triggers AND stop exit monitoring.
+        Also logs ticks to DB during active trades for post-analysis.
         """
+        # Tick logging during active trades (batched — every 10th tick)
+        if self._stop_monitor and self._stop_monitor.get("active"):
+            self._tick_log_counter = getattr(self, "_tick_log_counter", 0) + 1
+            if self._tick_log_counter % 10 == 0:
+                try:
+                    from shared.journal_db import log_tick
+                    from datetime import datetime
+                    trade_id = getattr(self, "_active_trade_id", 0)
+                    log_tick(trade_id, self.epic,
+                             datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f"),
+                             bid, ofr, mid)
+                except Exception:
+                    pass
+
         # Stop monitor: check if price hit trailing stop
+        # Uses confirmation timer: breach must persist for STOP_CONFIRM_SECS
+        # before exit fires. Filters DFB spread noise (90%+ of breaches are <30s).
         if self._stop_monitor and self._stop_monitor.get("active") and not self._stop_exit_active:
+            import time as _time
             sm = self._stop_monitor
             stop = sm["stop_level"]
-            hit = False
+            breached = False
             if sm["direction"] == "LONG" and bid > 0 and bid <= stop:
-                hit = True
+                breached = True
             elif sm["direction"] == "SHORT" and ofr > 0 and ofr >= stop:
-                hit = True
+                breached = True
+
+            if breached:
+                if self._stop_breach_since == 0:
+                    # First breach — start timer
+                    self._stop_breach_since = _time.time()
+                    logger.debug(f"Stop breach started ({self.epic}): {sm['direction']} stop={stop}")
+                elif (_time.time() - self._stop_breach_since) >= self.STOP_CONFIRM_SECS:
+                    # Breach persisted for confirmation period — execute exit
+                    logger.info(
+                        f"Stop CONFIRMED ({self.epic}): {sm['direction']} breached for "
+                        f"{_time.time() - self._stop_breach_since:.0f}s (threshold {self.STOP_CONFIRM_SECS}s)"
+                    )
+                    self._stop_breach_since = 0
+                    hit = True
+                else:
+                    hit = False  # still waiting for confirmation
+            else:
+                # Price recovered — reset timer
+                if self._stop_breach_since > 0:
+                    elapsed = _time.time() - self._stop_breach_since
+                    logger.debug(f"Stop breach cleared ({self.epic}): recovered after {elapsed:.0f}s")
+                    self._stop_breach_since = 0
+                hit = False
+
             if hit:
                 self._stop_exit_active = True
                 exit_price = bid if sm["direction"] == "LONG" else ofr
@@ -286,15 +378,36 @@ class IGBroker:
                     self._execute_stop_exit(sm["direction"], exit_price), loop
                 )
 
+        # Tick-level re-entry gate check (fire on every tick, sync)
+        for cb in self._tick_rearm_callbacks:
+            try:
+                cb(mid, bid, ofr)
+            except Exception:
+                pass
+
         # Bracket trigger: entry signals
         if not self._pending_bracket or not self._pending_bracket.get("active"):
             return
         if self._tick_trigger_active:
             return
 
-        spread = ofr - bid if (bid > 0 and ofr > 0) else 0
-        if spread > self._max_spread_pts:
+        # Deferred arming: if SELF or any sibling on the same epic currently
+        # holds a position (base or fade), skip silently (don't consume the
+        # bracket). When the holder closes, _local_in_position flips and the
+        # very next crossing tick fires our entry normally. Local flag — no
+        # IG REST per tick.
+        if self._local_in_position or any(
+            getattr(sb, "_local_in_position", False) for sb in self._sibling_brokers
+        ):
             return
+
+        if bid > 0 and ofr > 0:
+            spread = ofr - bid
+            if spread > self._max_spread_pts:
+                return
+        else:
+            logger.warning(f"Spread check skipped ({self.epic}): bid={bid} ofr={ofr} — incomplete tick data")
+            return  # refuse entry on incomplete data
 
         bracket = self._pending_bracket
         triggered_dir = None
@@ -340,30 +453,73 @@ class IGBroker:
         """Execute market order triggered by tick."""
         # Per-epic lock prevents sibling bracket double-fill race
         lock = self._get_entry_lock(self.epic)
+        # Latency tracking
+        import time as _time
+        t_trigger = _time.time()
         try:
             await lock.acquire()
-            # Pre-entry safety: no existing position (checked INSIDE the lock)
+            # Pre-entry safety: no existing position (final safety net — tick path
+            # already skips when any sibling has _local_in_position, but this
+            # catches races where IG reports a position we didn't track locally).
             try:
                 pos = await self.get_position()
                 if pos["direction"] != "FLAT":
-                    logger.error(f"BLOCKED: existing {pos['direction']} on {self.epic} "
-                                 f"(sibling already entered)")
+                    logger.error(f"BLOCKED: existing {pos['direction']} on {self.epic}")
+                    audit_log.trigger_blocked(
+                        signal=getattr(self, "_signal_name", "unknown"),
+                        epic=self.epic,
+                        reason=f"existing {pos['direction']} (unexpected)",
+                        direction=direction, price=price,
+                    )
+                    # Re-arm bracket so next tick can retry. Since the local
+                    # sibling check runs first, we only hit this for unexpected
+                    # (non-sibling) positions — rare, so re-arming is cheap.
+                    if self._pending_bracket:
+                        self._pending_bracket["active"] = True
                     self._tick_trigger_active = False
                     lock.release()
                     return
             except Exception:
                 pass
 
+            t_send = _time.time()
             result = await self.place_market_order(action=direction, qty=bracket["qty"])
+            t_filled = _time.time()
             if "error" in result:
                 logger.error(f"Tick-triggered order failed: {result['error']}")
                 self._tick_trigger_active = False
                 return
 
+            # Latency + slippage logging
+            fill_price = result.get("avg_price", price)
+            slippage = abs(fill_price - price)
+            send_lat_ms = (t_send - t_trigger) * 1000
+            fill_lat_ms = (t_filled - t_send) * 1000
+            total_lat_ms = (t_filled - t_trigger) * 1000
+            logger.info(
+                f"EXEC ({self.epic}): {direction} trigger={price:.1f} fill={fill_price:.1f} "
+                f"slip={slippage:.1f}pt | latency send={send_lat_ms:.0f}ms fill={fill_lat_ms:.0f}ms total={total_lat_ms:.0f}ms"
+            )
+            audit_log.trigger_fired(
+                signal=getattr(self, "_signal_name", self.epic),
+                epic=self.epic, direction=direction,
+                price=fill_price, slippage=round(slippage, 2),
+            )
+            self._local_in_position = True
+
+            # Pre-fill sanity check: alert if slippage > 10pt
+            if slippage > 10:
+                logger.error(
+                    f"SANITY: excessive slippage on {self.epic} {direction}: "
+                    f"intended={price:.1f} filled={fill_price:.1f} slip={slippage:.1f}pt"
+                )
+
             trigger_result = {
                 "direction": "LONG" if direction == "BUY" else "SHORT",
-                "fill_price": result.get("avg_price", price),
+                "fill_price": fill_price,
                 "order_id": result.get("order_id", ""),
+                "exec_latency_ms": total_lat_ms,
+                "slippage_pts": round(slippage, 1),
             }
 
             for cb in self._on_trigger_callbacks:
@@ -396,6 +552,8 @@ class IGBroker:
             "qty": qty, "oca_group": oca_group, "active": True,
         }
         logger.info(f"OCA bracket ({self.epic}): BUY@{buy_price} / SELL@{sell_price}")
+        audit_log.arm_success(signal=getattr(self, "_signal_name", oca_group),
+                              epic=self.epic, buy=buy_price, sell=sell_price, qty=qty)
         return {"buy_order_id": f"pending_buy_{oca_group}",
                 "sell_order_id": f"pending_sell_{oca_group}",
                 "oca_group": oca_group}
@@ -405,6 +563,14 @@ class IGBroker:
         if not self._pending_bracket or not self._pending_bracket.get("active"):
             return None
         if self._tick_trigger_active:
+            return None
+
+        # Deferred arming: skip if SELF or any sibling currently holds a
+        # position (mirrors _on_tick guard — otherwise check_trigger_levels
+        # bypasses sibling-block and creates orphan positions).
+        if self._local_in_position or any(
+            getattr(sb, "_local_in_position", False) for sb in self._sibling_brokers
+        ):
             return None
 
         bid = self._stream._prices.get(f"{self.epic}_bid")
@@ -446,6 +612,12 @@ class IGBroker:
             return None
 
         self._pending_bracket["active"] = False
+        self._local_in_position = True
+        audit_log.trigger_fired(
+            signal=getattr(self, "_signal_name", self.epic),
+            epic=self.epic, direction=triggered_dir,
+            price=result.get("avg_price", trigger_price), slippage=0,
+        )
         return {
             "direction": "LONG" if triggered_dir == "BUY" else "SHORT",
             "fill_price": result.get("avg_price", trigger_price),
@@ -462,7 +634,7 @@ class IGBroker:
                 self._shared.ig.create_open_position,
                 currency_code=self.currency, direction=direction,
                 epic=self.epic, expiry="DFB", force_open=True,
-                guaranteed_stop=False, level=None, limit_distance=None,
+                guaranteed_stop=True, level=None, limit_distance=None,
                 limit_level=None, order_type="MARKET", quote_id=None,
                 size=qty, stop_distance=self._disaster_stop_pts, stop_level=None,
                 trailing_stop=False, trailing_stop_increment=None,
@@ -473,7 +645,27 @@ class IGBroker:
 
             if confirm.get("dealStatus") == "REJECTED":
                 reason = confirm.get("reason", "Unknown")
-                logger.error(f"Order REJECTED: {reason}")
+                self._consecutive_order_errors += 1
+                logger.error(
+                    f"Order REJECTED: {reason} "
+                    f"(consecutive errors: {self._consecutive_order_errors}/{self._max_consecutive_order_errors})"
+                )
+                try:
+                    from asrs.alerts import send as _tg_send
+                    await _tg_send(
+                        f"⚠️ <b>Order REJECTED</b> ({self.epic})\n"
+                        f"{direction} {qty} | reason: <code>{reason}</code>\n"
+                        f"consecutive: {self._consecutive_order_errors}/{self._max_consecutive_order_errors}"
+                    )
+                except Exception as _e:
+                    logger.error(f"tg_send on rejection failed: {_e}")
+                if self._consecutive_order_errors >= self._max_consecutive_order_errors:
+                    logger.critical(f"AUTO-PAUSE: {self._consecutive_order_errors} consecutive order rejections")
+                    try:
+                        from telegram_cmd import _set_paused
+                        _set_paused(True)
+                    except Exception:
+                        pass
                 return {"error": f"Rejected: {reason}"}
 
             deal_id = confirm.get("dealId", deal_ref)
@@ -484,10 +676,22 @@ class IGBroker:
             }
 
             logger.info(f"Market order ({self.epic}): {direction} {qty}, fill={fill_level} ({deal_id})")
+            self._consecutive_order_errors = 0
             return {"order_id": deal_id, "avg_price": fill_level}
 
         except Exception as e:
-            logger.error(f"Market order failed ({self.epic}): {e}")
+            self._consecutive_order_errors += 1
+            logger.error(
+                f"Market order failed ({self.epic}): {e} "
+                f"(consecutive errors: {self._consecutive_order_errors}/{self._max_consecutive_order_errors})"
+            )
+            if self._consecutive_order_errors >= self._max_consecutive_order_errors:
+                logger.critical(f"AUTO-PAUSE: {self._consecutive_order_errors} consecutive order errors")
+                try:
+                    from telegram_cmd import _set_paused
+                    _set_paused(True)
+                except Exception:
+                    pass
             return {"error": str(e)}
 
     async def place_stop_order(
@@ -579,6 +783,43 @@ class IGBroker:
             logger.error(f"cancel_all_orders failed: {e}")
             return 0
 
+    async def close_position_by_deal_id(self, deal_id: str) -> bool:
+        """Close a specific deal (used by fade so we don't close sibling base positions)."""
+        if not await self.ensure_connected():
+            return False
+        if not deal_id:
+            logger.error(f"close_position_by_deal_id: empty deal_id")
+            return False
+        try:
+            positions = await self._shared.rest_call(self._shared.ig.fetch_open_positions)
+            pos_list = (positions if isinstance(positions, list)
+                        else positions.to_dict("records") if hasattr(positions, "to_dict")
+                        else [])
+            for pos in pos_list:
+                if pos.get("dealId") == deal_id and pos.get("epic") == self.epic:
+                    direction = pos.get("direction", "")
+                    size = pos.get("dealSize") or pos.get("size", 0)
+                    close_dir = "SELL" if direction == "BUY" else "BUY"
+                    await self._shared.rest_call(
+                        self._shared.ig.close_open_position,
+                        deal_id=deal_id, direction=close_dir,
+                        epic=None, expiry="DFB", level=None,
+                        order_type="MARKET", quote_id=None, size=size,
+                    )
+                    self._position_deal_ids.pop(deal_id, None)
+                    if not self._position_deal_ids:
+                        self._local_in_position = False
+                        # Propagate to siblings (epic is FLAT overall)
+                        for sb in self._sibling_brokers:
+                            sb._local_in_position = False
+                    logger.info(f"Closed specific deal {deal_id} ({direction} {size})")
+                    return True
+            logger.warning(f"close_position_by_deal_id: {deal_id} not found on broker")
+            return False
+        except Exception as e:
+            logger.error(f"close_position_by_deal_id failed: {e}", exc_info=True)
+            return False
+
     async def close_position(self) -> bool:
         """Close all open positions for this epic."""
         if not await self.ensure_connected():
@@ -621,7 +862,14 @@ class IGBroker:
             for did in closed:
                 self._position_deal_ids.pop(did, None)
             self._last_close_fills = fill_levels
-            return len(self._position_deal_ids) == 0
+            is_flat = len(self._position_deal_ids) == 0
+            if is_flat:
+                self._local_in_position = False
+                # Propagate: siblings on same epic also FLAT. Without this,
+                # stale sibling flags block future entries forever.
+                for sb in self._sibling_brokers:
+                    sb._local_in_position = False
+            return is_flat
 
         except Exception as e:
             logger.error(f"close_position failed: {e}")
@@ -679,15 +927,42 @@ class IGBroker:
 
     # -- Internal helpers -----------------------------------------------------
 
-    async def _confirm_deal(self, deal_reference: str) -> dict:
+    async def _confirm_deal(self, deal_reference: str, timeout_s: float = 10.0) -> dict:
+        """Confirm deal with timeout. Falls back to position query if confirm hangs."""
         if not deal_reference:
             return {}
         try:
             await asyncio.sleep(0.5)
-            confirm = await self._shared.rest_call(
-                self._shared.ig.fetch_deal_by_deal_reference, deal_reference,
+            confirm = await asyncio.wait_for(
+                self._shared.rest_call(
+                    self._shared.ig.fetch_deal_by_deal_reference, deal_reference,
+                ),
+                timeout=timeout_s,
             )
             return confirm if confirm else {}
+        except asyncio.TimeoutError:
+            # IG REST stalled — verify state via positions endpoint
+            logger.error(
+                f"Deal confirmation TIMEOUT after {timeout_s}s for {deal_reference} — "
+                f"falling back to position query"
+            )
+            try:
+                pos = await self.get_position()
+                if pos.get("direction") != "FLAT":
+                    logger.warning(
+                        f"Position EXISTS after timeout: {pos['direction']} @ {pos.get('avg_cost', 0)}"
+                    )
+                    return {
+                        "dealId": deal_reference,
+                        "dealStatus": "ACCEPTED",
+                        "level": pos.get("avg_cost", 0),
+                    }
+                else:
+                    logger.warning(f"No position after timeout — order likely never filled")
+                    return {"dealStatus": "REJECTED", "reason": "TIMEOUT_NO_POSITION"}
+            except Exception as e2:
+                logger.error(f"Position fallback also failed: {e2}")
+                return {"dealId": deal_reference, "dealStatus": "UNKNOWN"}
         except Exception as e:
             logger.warning(f"Deal confirmation failed: {e}")
             return {"dealId": deal_reference}

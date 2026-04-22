@@ -97,21 +97,23 @@ def current_equity_gbp() -> float:
 
 def today_pnl_gbp() -> float:
     try:
-        from shared.journal_db import get_trades_for_date
+        from shared.journal_db import get_trades_for_date, _trade_mode_label
         today = datetime.now(TZ_UK).date().isoformat()
         # Honour RISK_GATE_START_DATE: if today is before it, return 0
         if CFG.start_date and today < CFG.start_date:
             return 0.0
-        return float(sum(t.get("pnl_gbp", 0) or 0 for t in get_trades_for_date(today)))
+        mode = _trade_mode_label()
+        trades = get_trades_for_date(today)
+        return float(sum(t.get("pnl_gbp", 0) or 0 for t in trades if t.get("mode", "") == mode))
     except Exception as e:
         logger.error(f"today_pnl_gbp failed: {e}")
         return 0.0
 
 
 def week_pnl_gbp() -> float:
-    """Week P&L, but never older than RISK_GATE_START_DATE."""
+    """Week P&L, but never older than RISK_GATE_START_DATE. Filtered by current mode."""
     try:
-        from shared.journal_db import _get_conn
+        from shared.journal_db import _get_conn, _trade_mode_label
         from datetime import timedelta
         conn = _get_conn()
         today = datetime.now(TZ_UK).date()
@@ -119,9 +121,10 @@ def week_pnl_gbp() -> float:
         floor_str = monday.isoformat()
         if CFG.start_date and CFG.start_date > floor_str:
             floor_str = CFG.start_date
+        mode = _trade_mode_label()
         row = conn.execute(
-            "SELECT COALESCE(SUM(pnl_gbp),0) FROM trades WHERE date >= ? AND date <= ?",
-            (floor_str, today.isoformat()),
+            "SELECT COALESCE(SUM(pnl_gbp),0) FROM trades WHERE date >= ? AND date <= ? AND mode = ?",
+            (floor_str, today.isoformat(), mode),
         ).fetchone()
         return float(row[0] or 0)
     except Exception as e:

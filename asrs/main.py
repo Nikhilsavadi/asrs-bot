@@ -95,6 +95,7 @@ async def reconcile_positions(signals, shared_session, stream_mgr, tg_send):
                 continue
             try:
                 signal.broker.activate_stop_monitor(signal.state.direction, stop)
+                signal.broker._local_in_position = True  # defer sibling arming
                 rearmed += 1
                 logger.info(
                     f"[{key}] re-armed stop monitor from state: "
@@ -121,6 +122,13 @@ async def reconcile_positions(signals, shared_session, stream_mgr, tg_send):
             if pos.get("direction", "FLAT") == "FLAT":
                 continue
 
+            # Position exists at broker — reflect in local mirror on ALL
+            # brokers for this epic so any signal's base bracket defers until
+            # the position closes.
+            for sk, sig in signals.items():
+                if getattr(sig.broker, "epic", "") == br_key:
+                    sig.broker._local_in_position = True
+
             # Position exists at broker. Check if any signal on this broker
             # has it tracked in-memory (Pass 1 would have re-armed those).
             tracked = False
@@ -136,6 +144,17 @@ async def reconcile_positions(signals, shared_session, stream_mgr, tg_send):
                    abs(sig.state.entry_price - float(pos.get("avg_cost", 0))) < 5.0:
                     tracked = True
                     break
+                # Fade position claim — check fade_active + fade_direction.
+                # Fade deal_id may or may not match (IG can re-issue), so
+                # match on direction + approximate entry price.
+                if getattr(sig.state, "fade_active", False):
+                    fade_dir = getattr(sig.state, "fade_direction", "")
+                    fade_entry = getattr(sig.state, "fade_entry_price", 0.0)
+                    if fade_dir == pos["direction"] and \
+                       abs(fade_entry - float(pos.get("avg_cost", 0))) < 5.0:
+                        tracked = True
+                        logger.info(f"[{sk}] boot reconcile: claimed fade position")
+                        break
 
             if tracked:
                 continue
@@ -257,6 +276,11 @@ async def check_stream_health_all(shared_session, stream_mgr, tg_send, signals=N
         tick_age = stream_mgr.get_tick_age(epic)
         bar_age = stream_mgr.get_last_bar_age(epic)
 
+        # Fast-fail: if ticks haven't arrived in 30s during session, alert immediately
+        # (existing 120s threshold is for full stale detection; 30s catches stalls earlier)
+        if 30 <= tick_age < 120:
+            logger.warning(f"[{inst_name}] Tick gap: {tick_age:.0f}s (no resub yet)")
+
         # Healthy: ticks within 120s AND bars within 330s (just over one 5-min bar)
         if tick_age < 120 and bar_age < 330:
             _resub_fail_count[epic] = 0
@@ -290,12 +314,17 @@ async def check_stream_health_all(shared_session, stream_mgr, tg_send, signals=N
             else:
                 count = _resub_fail_count.get(epic, 0) + 1
                 _resub_fail_count[epic] = count
-                logger.error(f"[{inst_name}] Stream resubscribe failed ({count}/3)")
-                if count >= 3:
+                logger.warning(f"[{inst_name}] Stream resubscribe pending ({count}/3)")
+                if count >= 3 and hasattr(shared_session, "ensure_connected"):
                     await tg_send(
-                        f"CRITICAL: [{inst_name}] Stream resubscribe failed {count} times! "
-                        f"Manual intervention may be needed."
+                        f"[{inst_name}] Stream failed {count}x — full reconnect..."
                     )
+                    reconnected = await shared_session.ensure_connected()
+                    if reconnected:
+                        _resub_fail_count[epic] = 0
+                        logger.info(f"[{inst_name}] Full reconnect successful")
+                    else:
+                        logger.error(f"[{inst_name}] Full reconnect FAILED")
         except Exception as e:
             count = _resub_fail_count.get(epic, 0) + 1
             _resub_fail_count[epic] = count
@@ -508,12 +537,18 @@ async def main():
 
             # Register tick trigger callback on this signal's broker
             broker.register_trigger_callback(signal.on_tick_trigger)
+            broker._signal_name = key  # for audit log / Telegram labelling
             logger.info(f"Signal created: {key} (broker={stack.kind}, epic={broker.epic})")
 
         # Link siblings: each session cancels previous session's bracket
         for i in range(1, len(inst_signals)):
             inst_signals[i - 1].set_sibling(inst_signals[i])
             inst_signals[i].set_sibling(inst_signals[i - 1])
+
+        # Wire up full sibling-broker list on each broker so tick-level
+        # sibling-position checks are local (no IG REST per tick).
+        for _s in inst_signals:
+            _s.broker._sibling_brokers = [x.broker for x in inst_signals if x is not _s]
 
         # Register candle callback -- fires on_bar_complete for all sessions
         # Use the first broker's epic/contract_key as the stream key
@@ -615,6 +650,30 @@ async def main():
             scheduler.add_job(_failsafe, "cron",
                 day_of_week="mon-fri", hour=fs_h, minute=fs_m,
                 id=f"{prefix}_s{sn}_failsafe", misfire_grace_time=120,
+                timezone=sched_tz)
+
+            # DEAD-MAN: 45 min after session open, alert if STILL IDLE.
+            # Catches cases where morning_routine AND failsafe both failed silently
+            # (observed on NIKKEI Apr 10 + Apr 16 — root cause unknown).
+            dm_m = open_m + 45
+            dm_h = open_h + dm_m // 60
+            dm_m = dm_m % 60
+
+            async def _dead_man(_s=signal_obj, _sig_name=signal_obj.name):
+                _s.load_state()
+                if _s.state.phase == "IDLE":
+                    msg = (f"⚠️ <b>DEAD-MAN: {_sig_name} still IDLE</b>\n"
+                           f"45min after session open — bracket never armed.\n"
+                           f"Failsafe also failed. Manual check required.")
+                    logger.error(f"[{_sig_name}] DEAD-MAN fired: still IDLE at +45min")
+                    try:
+                        await tg_send(msg)
+                    except Exception:
+                        pass
+
+            scheduler.add_job(_dead_man, "cron",
+                day_of_week="mon-fri", hour=dm_h, minute=dm_m,
+                id=f"{prefix}_s{sn}_deadman", misfire_grace_time=60,
                 timezone=sched_tz)
 
         # -- Monitor cycle: every minute during trading hours -----------------
@@ -721,12 +780,22 @@ async def main():
     # auto-liquidation) would leave the strategy thinking it still has a
     # position until the next stop hit — or forever. This catches
     # broker/state divergence within 60s and alerts the operator.
+    # Per-discrepancy consecutive-strike counters to avoid alert spam.
+    # Alert on 3rd consecutive detection, then at most once/hour while
+    # persisting. Clears when discrepancy resolves (key disappears from
+    # current set). Seen live 2026-04-21: periodic_reconcile fired orphan
+    # Telegram alerts every minute for 9+ min — 9 duplicate alerts.
+    _reconcile_strikes: dict[str, int] = {}
+    _reconcile_last_alert: dict[str, float] = {}
+    ALERT_STRIKE = 3
+    REPEAT_COOLDOWN = 3600.0
+
     async def _periodic_reconcile():
-        if stack.kind != "ib":
-            return
         try:
+            import time as _time
             from asrs.strategy import Phase
             discrepancies = []
+            discrepancy_keys = []
             for _pr_sig in ALL_SIGNALS:
                 try:
                     pos = await _pr_sig.broker.get_position()
@@ -741,21 +810,155 @@ async def main():
                         f"{_pr_sig.name}: state={state_phase}/{state_dir} "
                         f"but broker FLAT — position closed externally?"
                     )
+                    discrepancy_keys.append(f"{_pr_sig.name}:state_but_flat")
                 # Case 2: strategy thinks we're flat, broker has a position
                 elif state_phase not in (Phase.LONG, Phase.SHORT) and pos_dir != "FLAT":
-                    discrepancies.append(
-                        f"{_pr_sig.name}: state={state_phase} "
-                        f"but broker has {pos_dir} — orphan?"
-                    )
+                    # Check if a SIBLING signal on the same epic owns this position
+                    # (base or fade)
+                    epic = getattr(_pr_sig.broker, "epic", "")
+                    sibling_owns = False
+                    for _sib in ALL_SIGNALS:
+                        if _sib is _pr_sig:
+                            continue
+                        if getattr(_sib.broker, "epic", "") != epic:
+                            continue
+                        # Base position claim
+                        if _sib.state.phase in (Phase.LONG, Phase.SHORT):
+                            sibling_owns = True; break
+                        # Fade position claim (legitimate when fade_active=True)
+                        if getattr(_sib.state, "fade_active", False):
+                            fade_dir = getattr(_sib.state, "fade_direction", "")
+                            if fade_dir == pos_dir or (pos_dir == "BUY" and fade_dir == "LONG") \
+                               or (pos_dir == "SELL" and fade_dir == "SHORT") \
+                               or (pos_dir == "LONG" and fade_dir == "LONG") \
+                               or (pos_dir == "SHORT" and fade_dir == "SHORT"):
+                                sibling_owns = True; break
+                    # Also check THIS signal's own fade
+                    if not sibling_owns and getattr(_pr_sig.state, "fade_active", False):
+                        fade_dir = getattr(_pr_sig.state, "fade_direction", "")
+                        if fade_dir in (pos_dir, "LONG" if pos_dir in ("BUY", "LONG") else "SHORT"):
+                            sibling_owns = True
+                    if not sibling_owns:
+                        discrepancies.append(
+                            f"{_pr_sig.name}: state={state_phase} "
+                            f"but broker has {pos_dir} — orphan?"
+                        )
+                        discrepancy_keys.append(f"{_pr_sig.name}:orphan_{pos_dir}")
+
+            # Always log (every cycle) — but dedup Telegram alerts:
+            # increment strike on active keys, clear resolved ones.
+            active_keys = set(discrepancy_keys)
+            for k in list(_reconcile_strikes.keys()):
+                if k not in active_keys:
+                    _reconcile_strikes.pop(k, None)
+                    _reconcile_last_alert.pop(k, None)
+
             if discrepancies:
                 msg = "POSITION RECONCILE MISMATCH:\n" + "\n".join(discrepancies)
                 logger.error(msg)
-                await tg_send(msg)
+                now = _time.time()
+                should_alert = False
+                should_autoclose = False
+                for k in discrepancy_keys:
+                    _reconcile_strikes[k] = _reconcile_strikes.get(k, 0) + 1
+                    n = _reconcile_strikes[k]
+                    last_t = _reconcile_last_alert.get(k, 0)
+                    if n == ALERT_STRIKE or (now - last_t >= REPEAT_COOLDOWN):
+                        should_alert = True
+                        _reconcile_last_alert[k] = now
+                    # Auto-close orphans after 5 consecutive strikes (5 min)
+                    # — only for "broker has position but no signal tracks it".
+                    # The "state but broker FLAT" case is already safe (just a
+                    # stale state record; closing nothing makes sense).
+                    if n >= 5 and ":orphan_" in k:
+                        should_autoclose = True
+                if should_alert:
+                    strikes_info = ", ".join(
+                        f"{k.split(':')[0]}×{_reconcile_strikes[k]}"
+                        for k in discrepancy_keys
+                    )
+                    await tg_send(f"{msg}\n\nConsecutive: {strikes_info}")
+                if should_autoclose:
+                    # Collect unique orphan epics and emergency-close them.
+                    orphan_epics = set()
+                    for _pr_sig in ALL_SIGNALS:
+                        epic = getattr(_pr_sig.broker, "epic", "")
+                        key = f"{_pr_sig.name}:orphan_"
+                        if any(k.startswith(key) for k in discrepancy_keys):
+                            orphan_epics.add((epic, _pr_sig.broker))
+                    for epic, broker in orphan_epics:
+                        try:
+                            logger.critical(
+                                f"AUTO-CLOSING orphan on {epic} (persisted 5min)"
+                            )
+                            closed = await broker.close_position()
+                            await tg_send(
+                                f"🚨 <b>ORPHAN AUTO-CLOSED</b>\n"
+                                f"Epic: {epic}\n"
+                                f"Persisted 5min without signal claim.\n"
+                                f"Closed: {'✓' if closed else '✗ (retry needed)'}"
+                            )
+                        except Exception as e:
+                            logger.error(f"orphan auto-close failed ({epic}): {e}")
         except Exception as e:
             logger.error(f"_periodic_reconcile error: {e}", exc_info=True)
 
     scheduler.add_job(_periodic_reconcile, "interval", seconds=60,
         id="periodic_reconcile", misfire_grace_time=30)
+
+    # -- _local_in_position sanity check -------------------------------------
+    # Every 5 min: per-epic, compare IG position vs local flags on all brokers.
+    # If drift detected (flag says in_position but IG FLAT, or vice versa),
+    # CORRECT the flag + log. Catches silent state drift — e.g. a close that
+    # didn't propagate or a manual external close.
+    _sanity_last_correction: dict[str, float] = {}
+
+    async def _position_sanity_check():
+        try:
+            import time as _time
+            # Group signals by epic so we only call get_position once per epic
+            by_epic: dict[str, list] = {}
+            for _sig in ALL_SIGNALS:
+                epic = getattr(_sig.broker, "epic", "")
+                if not epic: continue
+                by_epic.setdefault(epic, []).append(_sig)
+            for epic, sigs in by_epic.items():
+                try:
+                    pos = await sigs[0].broker.get_position()
+                except Exception:
+                    continue
+                actual_in_pos = pos.get("direction", "FLAT") != "FLAT"
+                flags = [getattr(s.broker, "_local_in_position", False) for s in sigs]
+                local_any = any(flags)
+                if actual_in_pos == local_any:
+                    continue
+                # Drift detected. Correct all brokers for this epic.
+                for s in sigs:
+                    s.broker._local_in_position = actual_in_pos
+                now = _time.time()
+                last = _sanity_last_correction.get(epic, 0)
+                # Alert at most once/hour per epic
+                if now - last >= 3600:
+                    _sanity_last_correction[epic] = now
+                    logger.warning(
+                        f"_local_in_position drift ({epic}): actual={actual_in_pos} "
+                        f"flags={flags} — corrected all brokers"
+                    )
+                    try:
+                        await tg_send(
+                            f"⚠️ <b>Position flag drift</b>\n"
+                            f"Epic: {epic}\n"
+                            f"IG: {'in position' if actual_in_pos else 'FLAT'} | "
+                            f"Local flags: {flags}\n"
+                            f"Auto-corrected."
+                        )
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.error(f"_position_sanity_check error: {e}", exc_info=True)
+
+    scheduler.add_job(_position_sanity_check, "interval", minutes=5,
+        id="position_sanity", misfire_grace_time=60)
 
     # -- Monitoring: missed job alerts ----------------------------------------
     try:
@@ -811,109 +1014,93 @@ async def main():
         day_of_week="mon-fri", hour=7, minute=0,
         id="roll_check", misfire_grace_time=3600)
 
-    # -- Daily backtest-vs-live drift check (21:00 UK, weekdays) -------------
-    # Runs the backtest engine on today's IBKR bars and compares the
-    # resulting trade list against the live journal. Alerts on any mismatch.
-    # This is the parity check that catches silent bar-source / strategy
-    # drift before it bleeds £k.
-    async def _replay_check():
-        if stack.kind != "ib":
-            return
+    # -- Daily tick parity check + SPC (21:00 UK, weekdays) ------------------
+    # Runs tick_backtest.py on today's tick CSVs (no API calls needed) and
+    # compares to live journal. Also runs PSR + CUSUM drift detection.
+    async def _nightly_check():
+        from datetime import datetime
+        today_str = datetime.now(config.TZ_UK).strftime("%Y-%m-%d")
         try:
             import asyncio as _asyncio, subprocess
-            # Path resolution: check container first (/app), fall back to repo root
-            replay_paths = [
-                "/app/replay_today.py",
-                os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "replay_today.py"),
-                "/root/asrs-bot/replay_today.py",
-            ]
-            replay_script = next((p for p in replay_paths if os.path.exists(p)), None)
-            if not replay_script:
-                logger.error(f"_replay_check: replay_today.py not found in any of {replay_paths}")
-                await tg_send("replay_check: script not found in expected paths")
-                return
-            # Only replay enabled instruments — match the bot's actual config
-            enabled = ",".join(
-                inst for inst in config.INSTRUMENTS.keys()
-                if inst.upper() not in DISABLED_INSTRUMENTS
-            )
-            env = {**os.environ, "REPLAY_INSTRUMENTS": enabled}
-            proc = await _asyncio.create_subprocess_exec(
-                "python3", replay_script,
-                stdout=_asyncio.subprocess.PIPE,
-                stderr=_asyncio.subprocess.STDOUT,
-                env=env,
-            )
-            stdout, _ = await _asyncio.wait_for(proc.communicate(), timeout=180)
-            output = stdout.decode("utf-8", errors="replace")
-            # Log full output so we can debug "no output" cases
-            logger.info(f"_replay_check stdout ({len(output)} chars):\n{output[:2000]}")
-            # Parse last DELTA lines
-            deltas = []
-            for line in output.splitlines():
-                if "DELTA:" in line or "TOTAL" in line:
-                    deltas.append(line.strip())
-            summary = "\n".join(deltas[-6:]) if deltas else "no output"
-            # If any per-instrument delta is non-trivial (>20 pts), alert loud
-            alert = False
-            for line in deltas:
-                try:
-                    if "DELTA:" in line:
-                        val = line.split("DELTA:")[-1].split("pts")[0].strip()
-                        if abs(int(float(val))) > 20:
-                            alert = True
-                            break
-                except Exception:
-                    pass
-            tag = "DRIFT ALERT" if alert else "DAILY PARITY"
-            msg = f"<b>{tag}</b> — replay vs live\n<pre>{summary}</pre>"
-            if alert:
-                msg += (
-                    "\n━━━━━━━━━━━━━━━━━━━━━━\n"
-                    "<b>WHAT THIS MEANS</b>\n"
-                    "Live trades diverged from what the backtest engine "
-                    "would have done on the same bars (delta &gt; 20pts). "
-                    "This is a single-day issue, not a 30-day pattern.\n\n"
-                    "<b>LIKELY CAUSES</b>\n"
-                    "1. Slippage spike on one fill (check microstructure: "
-                    "spread, last_price at trigger time)\n"
-                    "2. Bar source mismatch (rare since rtbar fix — check "
-                    "if any signal hit mid-tick fallback today)\n"
-                    "3. Order rejection / partial fill\n"
-                    "4. Manual intervention via TWS\n\n"
-                    "<b>NEXT MORNING CHECKLIST</b>\n"
-                    "1. <code>/pnl</code> — see today's trades\n"
-                    "2. Look at the worst-delta instrument's last 5 fills "
-                    "in the journal — compare entry_intended vs entry, "
-                    "exit_intended vs exit\n"
-                    "3. Check <code>/tmp/asrs-logs/asrs.log</code> for "
-                    "any 'fallback to mid-tick' or 'EXCESSIVE SLIPPAGE' "
-                    "warnings\n\n"
-                    "<b>DECISION</b>\n"
-                    "• <b>Single-day delta &lt; 50pts</b>: investigate but "
-                    "no action needed. Watch tomorrow.\n"
-                    "• <b>Same instrument drifts 3 days running</b>: that "
-                    "instrument has a real problem. Check the broker / "
-                    "data sub for that contract.\n"
-                    "• <b>Delta &gt; 100pts in one day</b>: <code>/pause</code> "
-                    "and investigate before resuming. Something material "
-                    "broke."
+
+            # 1. Tick parity: backtest on today's tick CSVs
+            tick_script = None
+            for p in ["/app/tick_backtest.py",
+                      os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tick_backtest.py")]:
+                if os.path.exists(p):
+                    tick_script = p
+                    break
+
+            async def _run_bt(extra_args: list) -> tuple[str, str]:
+                """Returns (pf_str, net_str) — one-liner headline from COMBINED row."""
+                proc = await _asyncio.create_subprocess_exec(
+                    "python3", tick_script, "--date", today_str, *extra_args,
+                    stdout=_asyncio.subprocess.PIPE,
+                    stderr=_asyncio.subprocess.STDOUT,
                 )
+                stdout, _ = await _asyncio.wait_for(proc.communicate(), timeout=300)
+                output = stdout.decode("utf-8", errors="replace")
+                # Find the COMBINED summary line — one per backtest run.
+                import re
+                for line in output.splitlines():
+                    if "COMBINED" in line and "PF=" in line:
+                        pf_m = re.search(r"PF=\s*([\-\d\.]+)", line)
+                        net_m = re.search(r"net=\s*([\+\-][\d,]+)", line)
+                        if pf_m and net_m:
+                            return (pf_m.group(1), net_m.group(1))
+                return ("—", "—")
+
+            bt_candle = bt_mfe = bt_mfe_stress = bt_unfiltered = ("—", "—")
+            if tick_script:
+                bt_candle       = await _run_bt([])
+                bt_mfe          = await _run_bt(["--exit-mode", "mfe_hybrid"])
+                bt_mfe_stress   = await _run_bt(["--exit-mode", "mfe_hybrid", "--stress"])
+                bt_unfiltered   = await _run_bt(["--no-filter"])
+
+            # 2. Live trades from journal
+            from shared.journal_db import get_trades_for_date, _trade_mode_label
+            mode = _trade_mode_label()
+            live_trades = get_trades_for_date(today_str)
+            live_trades = [t for t in live_trades if t.get("mode") == mode]
+            live_net = sum(t.get("pnl_pts", 0) or 0 for t in live_trades)
+            live_wins = sum(1 for t in live_trades if (t.get("pnl_pts", 0) or 0) > 0)
+
+            # 3. Build compact headline message — one row per variant.
+            wr_pct = (live_wins / len(live_trades) * 100) if live_trades else 0
+            msg = (
+                f"<b>NIGHTLY</b> — {today_str}\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"<b>Live:</b>     {len(live_trades)} trades  "
+                f"{live_net:+.0f}pts  WR {wr_pct:.0f}%\n"
+                f"<b>Backtest:</b>\n"
+                f"  CANDLE (live):   PF {bt_candle[0]}  net {bt_candle[1]}pts\n"
+                f"  MFE (upgrade):   PF {bt_mfe[0]}  net {bt_mfe[1]}pts\n"
+                f"  MFE stressed:    PF {bt_mfe_stress[0]}  net {bt_mfe_stress[1]}pts\n"
+                f"  UNFILTERED:      PF {bt_unfiltered[0]}  net {bt_unfiltered[1]}pts\n"
+            )
+
+            if live_trades:
+                slips = [abs(t.get("entry_slippage", 0) or 0) for t in live_trades]
+                avg_slip = sum(slips) / len(slips) if slips else 0
+                msg += f"Slippage: {avg_slip:.1f}pts\n"
+
             await tg_send(msg)
-            # Statistical process control — PSR + CUSUM on rolling 30-day P&L
+
+            # 4. PSR + CUSUM (unchanged)
             try:
                 from asrs.spc import daily_drift_report, format_drift_report
                 spc_report = daily_drift_report()
                 await tg_send(format_drift_report(spc_report))
             except Exception as e:
                 logger.error(f"spc daily_drift_report failed: {e}", exc_info=True)
-        except Exception as e:
-            logger.error(f"replay_check failed: {e}", exc_info=True)
-            await tg_send(f"replay_check exception: {e}")
 
-    scheduler.add_job(_replay_check, "cron",
+        except Exception as e:
+            logger.error(f"nightly_check failed: {e}", exc_info=True)
+            await tg_send(f"nightly_check exception: {e}")
+
+    scheduler.add_job(_nightly_check, "cron",
         day_of_week="mon-fri", hour=21, minute=0,
-        id="replay_check", misfire_grace_time=3600,
+        id="nightly_check", misfire_grace_time=3600,
         timezone=config.TZ_UK)
 
     # -- Monthly report (R7 in spec: 1st of month, 08:00 UK) -----------------

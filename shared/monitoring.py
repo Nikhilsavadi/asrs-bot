@@ -35,27 +35,45 @@ def create_job_listener(send_func, loop: asyncio.AbstractEventLoop):
     """
     Create an APScheduler event listener for missed/errored jobs.
 
-    Args:
-        send_func: async function to send Telegram message (telegram_cmd._send)
-        loop: the asyncio event loop to dispatch from scheduler thread
+    Dedup + threshold: alert on 3rd consecutive miss, then at most once/hour.
+    Clears counter on successful execution. Avoids spam (seen live 2026-04-21
+    when _monitor was skipped 9min in a row, triggering 9 Telegram alerts).
     """
     from apscheduler.events import JobEvent
 
+    # Per-job consecutive-miss counter + last-alert timestamp
+    miss_count: dict[str, int] = {}
+    last_alert: dict[str, float] = {}
+    ALERT_STRIKE = 3                  # alert after 3 consecutive misses
+    REPEAT_COOLDOWN = 3600.0          # then at most once/hour
+
     def _on_job_event(event: JobEvent):
         global _last_dax_job
+        import time
 
         job_id = getattr(event, "job_id", "unknown")
         now = datetime.now(TZ_UK).strftime("%H:%M:%S")
 
-        # Track last job execution
         if "dax" in job_id or job_id in ("heartbeat", "ig_keepalive"):
             _last_dax_job = f"{job_id} @ {now}"
 
-        # Only alert on missed/error, not normal execution
         exception = getattr(event, "exception", None)
         scheduled_run_time = getattr(event, "scheduled_run_time", None)
 
+        # Successful execution — reset miss counter
+        if exception is None and not hasattr(event, "code"):
+            miss_count.pop(job_id, None)
+            return
+        # JobExecutionEvent with no exception is a success too
+        if exception is None and getattr(event, "code", None) not in (None,):
+            from apscheduler.events import EVENT_JOB_EXECUTED
+            if event.code == EVENT_JOB_EXECUTED:
+                miss_count.pop(job_id, None)
+                return
+
         if exception:
+            if isinstance(exception, asyncio.CancelledError):
+                return
             msg = (
                 f"🚨 <b>JOB ERROR</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -64,18 +82,26 @@ def create_job_listener(send_func, loop: asyncio.AbstractEventLoop):
                 f"Time: {now}"
             )
             loop.call_soon_threadsafe(asyncio.ensure_future, send_func(msg))
-        elif hasattr(event, "code"):
-            # EVENT_JOB_MISSED
+            return
+
+        if hasattr(event, "code"):
             from apscheduler.events import EVENT_JOB_MISSED
             if event.code == EVENT_JOB_MISSED:
-                msg = (
-                    f"⚠️ <b>JOB MISSED</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"Job: <code>{job_id}</code>\n"
-                    f"Scheduled: {scheduled_run_time}\n"
-                    f"Time: {now}"
-                )
-                loop.call_soon_threadsafe(asyncio.ensure_future, send_func(msg))
+                miss_count[job_id] = miss_count.get(job_id, 0) + 1
+                n = miss_count[job_id]
+                t = time.time()
+                last_t = last_alert.get(job_id, 0)
+                should_alert = (n == ALERT_STRIKE) or (t - last_t >= REPEAT_COOLDOWN)
+                if should_alert:
+                    last_alert[job_id] = t
+                    msg = (
+                        f"⚠️ <b>JOB STUCK</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"Job: <code>{job_id}</code>\n"
+                        f"Consecutive misses: <b>{n}</b>\n"
+                        f"Time: {now}"
+                    )
+                    loop.call_soon_threadsafe(asyncio.ensure_future, send_func(msg))
 
     return _on_job_event
 

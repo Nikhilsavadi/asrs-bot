@@ -34,7 +34,7 @@ class _TickListener(SubscriptionListener):
                  loop: asyncio.AbstractEventLoop,
                  tick_bars: dict = None, candle_bars: dict = None,
                  candle_callbacks: dict = None, bar_emit_times: dict = None,
-                 last_real_bar_time: dict = None):
+                 last_real_bar_time: dict = None, tick_bar_lock=None):
         self._epic = epic
         self._prices = prices
         self._events = events
@@ -45,6 +45,7 @@ class _TickListener(SubscriptionListener):
         self._candle_callbacks = candle_callbacks if candle_callbacks is not None else {}
         self._bar_emit_times = bar_emit_times if bar_emit_times is not None else {}
         self._last_real_bar_time = last_real_bar_time if last_real_bar_time is not None else {}
+        self._tick_bar_lock = tick_bar_lock
 
     def onItemUpdate(self, update):
         try:
@@ -64,6 +65,21 @@ class _TickListener(SubscriptionListener):
                         self._prices[f"{self._epic}_ltp"] = float(ltp)
                     except (ValueError, TypeError):
                         pass
+                # Write raw tick to daily CSV (for post-session backtest validation)
+                try:
+                    import os
+                    _tick_dir = os.environ.get("TICK_LOG_DIR", "/app/data/ticks")
+                    os.makedirs(_tick_dir, exist_ok=True)
+                    _day = time.strftime("%Y-%m-%d")
+                    _tick_file = os.path.join(_tick_dir, f"{self._epic}_{_day}.csv")
+                    _exists = os.path.exists(_tick_file)
+                    with open(_tick_file, "a") as _f:
+                        if not _exists:
+                            _f.write("utm,bid,ofr,mid,ltp\n")
+                        _f.write(f"{utm or ''},{bid},{ofr},{mid},{ltp or ''}\n")
+                except Exception:
+                    pass  # never let logging break trading
+
                 # Log every 60th tick to avoid flooding
                 count = self._prices.get(f"{self._epic}_count", 0) + 1
                 self._prices[f"{self._epic}_count"] = count
@@ -74,9 +90,15 @@ class _TickListener(SubscriptionListener):
                 event = self._events.get(self._epic)
                 if event:
                     self._loop.call_soon_threadsafe(event.set)
-                # Fire tick callbacks (for real-time entry triggers)
+                # Fire tick callbacks DIRECTLY on LS thread (not event loop).
+                # Bracket trigger + stop monitor are sync checks that must
+                # run on every tick without event-loop delay. Only the actual
+                # order placement (inside the callback) uses run_coroutine_threadsafe.
                 for cb in self._tick_callbacks.get(self._epic, []):
-                    self._loop.call_soon_threadsafe(cb, mid, float(bid), float(ofr))
+                    try:
+                        cb(mid, float(bid), float(ofr))
+                    except Exception as _cb_err:
+                        logger.error(f"Tick callback error ({self._epic}): {_cb_err}")
 
                 # ── Tick-based bar builder ─────────────────────────────
                 # Build 5-min OHLC bars from MID ticks.
@@ -123,6 +145,15 @@ class _TickListener(SubscriptionListener):
         bar_min = (now.minute // 5) * 5
         bar_start = now.replace(minute=bar_min, second=0, microsecond=0)
 
+        if self._tick_bar_lock:
+            self._tick_bar_lock.acquire()
+        try:
+            self._update_tick_bar_inner(mid, bar_start, now)
+        finally:
+            if self._tick_bar_lock:
+                self._tick_bar_lock.release()
+
+    def _update_tick_bar_inner(self, mid: float, bar_start: datetime, now: datetime):
         current = self._tick_bars.get(self._epic)
 
         if current is None or current["time"] != bar_start:
@@ -376,7 +407,8 @@ class IGStreamManager:
 
         # Tick-based bar builder: real-time OHLC from ticks (no CONS_END delay)
         self._tick_bars: dict[str, dict] = {}  # epic -> current accumulating bar
-        self._tick_bar_lock: dict[str, bool] = {}  # prevent race conditions
+        import threading
+        self._tick_bar_lock = threading.Lock()  # protects _tick_bars across LS thread + event loop
 
         # Wall-clock bar finalizer task (same pattern as ib_stream.py)
         # Ensures bars complete on schedule even if Lightstreamer goes
@@ -411,6 +443,7 @@ class IGStreamManager:
             tick_bars=self._tick_bars, candle_bars=self._candle_bars,
             candle_callbacks=self._candle_callbacks, bar_emit_times=self._last_bar_emit,
             last_real_bar_time=self._last_real_bar_time,
+            tick_bar_lock=self._tick_bar_lock,
         )
         sub.addListener(listener)
         self._session.stream.subscribe(sub)
@@ -439,7 +472,9 @@ class IGStreamManager:
             try:
                 await asyncio.sleep(2)
                 now = datetime.now(CET)
-                for epic, current in list(self._tick_bars.items()):
+                with self._tick_bar_lock:
+                    snapshot = [(e, dict(c) if c else None) for e, c in self._tick_bars.items()]
+                for epic, current in snapshot:
                     if current is None or current.get("tick_count", 0) == 0:
                         continue
                     bar_end = current["time"] + timedelta(minutes=5)
@@ -469,7 +504,8 @@ class IGStreamManager:
                                     self._loop.create_task, cb(completed)
                                 )
                         # Clear current bar — next tick starts a new one
-                        self._tick_bars[epic] = None
+                        with self._tick_bar_lock:
+                            self._tick_bars[epic] = None
 
                 # Zero-tick gap fill (same safety as IBKR)
                 for epic in list(self._candle_bars.keys()):
@@ -694,6 +730,9 @@ class IGStreamManager:
         self._tick_subs.clear()
         self._candle_subs.clear()
         self._trade_sub = None
+        # Clear in-progress tick bars — stale half-bars from before
+        # the disconnect would emit with partial OHLC data otherwise.
+        self._tick_bars.clear()
 
         for epic in epics_tick:
             await self.subscribe_ticks(epic)

@@ -47,6 +47,7 @@ class IGSharedSession:
         self._lock = asyncio.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._on_reconnect: list[callable] = []  # callbacks after reconnect
+        self._resub_attempts: int = 0  # consecutive resubscribe attempts without recovery
 
         # Credentials (read once)
         self._username = os.getenv("IG_USERNAME", "")
@@ -176,6 +177,7 @@ class IGSharedSession:
 
         # Ticks flowing AND bars building — healthy
         if tick_age < 120 and bar_age < 330:  # bars within ~1 bar interval + margin
+            self._resub_attempts = 0
             return True
 
         # Bars stale but ticks OK — tick-bar builder may be broken, resubscribe
@@ -191,6 +193,17 @@ class IGSharedSession:
         else:
             logger.warning(f"Stream health: last tick {tick_age:.0f}s ago — resubscribing")
 
+        self._resub_attempts += 1
+
+        # After 2 failed resubscribe attempts, escalate to full reconnect
+        if self._resub_attempts >= 2:
+            logger.warning(
+                f"Stream still stale after {self._resub_attempts} resubscribe attempts "
+                f"— escalating to full reconnect"
+            )
+            self._resub_attempts = 0
+            return await self.ensure_connected()
+
         # Check if Lightstreamer client is still connected
         if self.stream and self.stream.ls_client:
             try:
@@ -198,18 +211,28 @@ class IGSharedSession:
                 logger.info(f"Lightstreamer status: {status}")
                 if "DISCONNECTED" in str(status).upper():
                     logger.warning("Lightstreamer disconnected — full reconnect needed")
+                    self._resub_attempts = 0
                     return await self.ensure_connected()
             except Exception as e:
                 logger.warning(f"Lightstreamer status check failed: {e}")
+                self._resub_attempts = 0
                 return await self.ensure_connected()
+        else:
+            # No LS client at all — must do full reconnect
+            logger.warning("No Lightstreamer client — full reconnect needed")
+            self._resub_attempts = 0
+            return await self.ensure_connected()
 
         # LS client exists but ticks stale — try resubscribe only
         try:
             await stream_mgr.resubscribe_all()
-            logger.info("Stream resubscribed after stale tick detection")
-            return True
+            logger.info("Stream resubscribed after stale tick detection (attempt %d)", self._resub_attempts)
+            # Return False so caller knows data isn't confirmed flowing yet.
+            # Next health check will verify and return True if ticks resume.
+            return False
         except Exception as e:
             logger.error(f"Stream resubscribe failed: {e}")
+            self._resub_attempts = 0
             return await self.ensure_connected()
 
     async def ensure_connected(self) -> bool:

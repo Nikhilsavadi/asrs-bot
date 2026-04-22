@@ -754,14 +754,6 @@ async def handle_pnl():
 
     lines.append("━━━━━━━━━━━━━━━━━━━━━━")
 
-    # Historical context — find similar days in 18-year backtest
-    try:
-        ctx = historical_day_match(day_total)
-        if ctx:
-            lines.append(ctx)
-    except Exception as e:
-        logger.warning(f"historical context failed: {e}")
-
     await _send("\n".join(lines))
 
 

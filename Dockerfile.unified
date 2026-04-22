@@ -28,6 +28,8 @@ COPY sync_to_railway.py .
 COPY reports.py .
 COPY backtest.py .
 COPY replay_today.py .
+COPY replay_today_ig.py .
+COPY tick_backtest.py .
 COPY replay_nkd_multiday.py .
 COPY monte_carlo_4yr.py .
 COPY run_dsr_significance.py .

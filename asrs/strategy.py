@@ -66,6 +66,10 @@ class SignalState:
     breakeven_hit:     bool = False
     trail_moved:       bool = False
     entries_used:      int = 0
+    first_direction:   str = ""    # direction of trade #1 (for reverse-reentry filter)
+
+    # Sizing
+    stake_per_point:   float = 1.0    # actual £/pt stake (for journal pnl_gbp)
 
     # Adds
     adds_used:         int = 0
@@ -77,6 +81,17 @@ class SignalState:
 
     # Trade log (intra-day)
     trades:            list = field(default_factory=list)
+
+    # Fade position (canary — after TRAIL_STOP winner, open opposite dir)
+    fade_active:       bool = False
+    fade_direction:    str = ""        # "LONG" / "SHORT"
+    fade_entry_price:  float = 0.0
+    fade_stop_level:   float = 0.0
+    fade_target_level: float = 0.0
+    fade_deal_id:      str = ""
+    fade_entry_time:   str = ""
+    fade_target_hit:   bool = False    # once target hit, switch to trailing (TRAIL_TARGET mode)
+    fade_trades:       list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -127,6 +142,13 @@ class Signal:
 
         # Register tick-based stop exit callback
         self.broker.register_stop_callback(self._on_stop_exit)
+
+        # Register tick callback for instant re-entry gate check.
+        # Fires on every tick on the LS thread (sync). If price is back
+        # inside the range after a stop-out, schedules re-arm immediately
+        # instead of waiting up to 60s for monitor_cycle.
+        self._rearm_pending = False
+        self.broker.register_tick_rearm_callback(self._on_tick_rearm)
         self._state_dir = os.path.join(
             os.path.dirname(__file__), "..", "data", "state"
         )
@@ -135,6 +157,39 @@ class Signal:
     def set_sibling(self, other: "Signal"):
         """Link S1 and S2 so S2 can cancel S1 bracket (R24)."""
         self._sibling = other
+
+    def _on_tick_rearm(self, mid: float, bid: float, ofr: float):
+        """Tick-level re-entry gate check (runs on LS thread, sync).
+
+        If we're in LEVELS_SET phase (after a stop-out, waiting for price
+        to return inside range), check on every tick instead of every 60s.
+        When price is inside the range, schedule re-arm immediately.
+        """
+        if self._rearm_pending:
+            return  # already scheduled, don't spam
+        if self.state.phase != Phase.LEVELS_SET:
+            return
+        if self.state.buy_level <= 0:
+            return
+        if self.state.sell_level <= mid <= self.state.buy_level:
+            self._rearm_pending = True
+            loop = self.broker._loop
+            if loop:
+                import asyncio
+                asyncio.run_coroutine_threadsafe(self._do_tick_rearm(), loop)
+
+    async def _do_tick_rearm(self):
+        """Re-arm bracket after tick-level gate check detected price in range."""
+        try:
+            async with self._lock:
+                self.load_state()
+                if self.state.phase == Phase.LEVELS_SET and self.state.buy_level > 0:
+                    logger.info(f"[{self.name}] Tick re-arm: price inside range — arming bracket")
+                    await self._arm_bracket()
+        except Exception as e:
+            logger.error(f"[{self.name}] tick rearm error: {e}")
+        finally:
+            self._rearm_pending = False
 
     # -- State persistence ----------------------------------------------------
 
@@ -155,7 +210,8 @@ class Signal:
 
     def load_state(self):
         """Load state for today, or reset if stale."""
-        today = datetime.now(self.tz).strftime("%Y-%m-%d")
+        replay = getattr(self, '_replay_date', None)
+        today = replay.isoformat() if replay else datetime.now(self.tz).strftime("%Y-%m-%d")
         path = self._state_path()
         try:
             if os.path.exists(path):
@@ -193,7 +249,22 @@ class Signal:
     # =========================================================================
 
     async def on_bar_complete(self, bar: dict):
-        """Lock-wrapped entry — see _on_bar_complete_impl for body."""
+        """Lock-wrapped entry — see _on_bar_complete_impl for body.
+
+        Pre-lock cache write: morning_routine can hold the lock for minutes
+        while polling for bar 5. If we only populated _bar_cache inside the
+        lock, morning_routine would never see bar 5 until after its own
+        timeout expired (it blocks the very callback that would feed it).
+        """
+        bar_time = bar["time"]
+        bn = self._bar_number(bar_time)
+        if bn > 0 and bar.get("High", 0) > 0 and bar.get("Low", 0) > 0 \
+                and bar["High"] >= bar["Low"]:
+            self._bar_cache = getattr(self, '_bar_cache', {})
+            self._bar_cache[bn] = {
+                "High": bar["High"], "Low": bar["Low"],
+                "Open": bar["Open"], "Close": bar["Close"],
+            }
         async with self._lock:
             await self._on_bar_complete_impl(bar)
 
@@ -204,7 +275,7 @@ class Signal:
         """
         bar_time = bar["time"]  # tz-aware datetime (CET from tick-bar builder)
         bar_local = bar_time.astimezone(self.tz) if bar_time.tzinfo else bar_time
-        today = datetime.now(self.tz).date()
+        today = getattr(self, '_replay_date', None) or datetime.now(self.tz).date()
         if bar_local.date() != today:
             return
 
@@ -217,7 +288,6 @@ class Signal:
 
         # Bar 1: stream alive confirmation via Telegram (once per signal per day)
         if bn == 1:
-            cache = getattr(self, '_bar_cache', {})
             # Persisted check: only fire once per session per day, even
             # across bot restarts. Uses a sentinel file in the state dir.
             sentinel = os.path.join(
@@ -230,7 +300,7 @@ class Signal:
             is_synth_flat = (bar.get('High') == bar.get('Low') and
                              bar.get('Open') == bar.get('Close') and
                              bar.get('High') == bar.get('Open'))
-            if 1 not in cache and not already_alerted and not is_synth_flat:
+            if not already_alerted and not is_synth_flat:
                 logger.info(f"[{self.name}] Bar 1 complete -- stream alive "
                             f"O={bar['Open']} H={bar['High']} L={bar['Low']} C={bar['Close']}")
                 try:
@@ -273,6 +343,84 @@ class Signal:
         if bn == 5 and self._bar5_event:
             self._bar5_event.set()
 
+        # Trail update on bar complete — tighten trail immediately when a
+        # new 5-min bar closes, instead of waiting up to 60s for monitor_cycle.
+        # Uses the JUST-COMPLETED bar as "previous" (it IS the previous now).
+        if self.state.phase in (Phase.LONG, Phase.SHORT) and bar["High"] > 0:
+            prev_high = bar["High"]
+            prev_low = bar["Low"]
+            prev_close = bar["Close"]
+            old_stop = self.state.trailing_stop
+
+            # Breakeven check (same as monitor_cycle R13)
+            if self.state.direction == "LONG":
+                unr = prev_close - self.state.entry_price
+            else:
+                unr = self.state.entry_price - prev_close
+            if not self.state.breakeven_hit and unr >= self.cfg["breakeven_pts"]:
+                self.state.breakeven_hit = True
+                be_buf = float(self.cfg.get("be_buffer_pts", 0))
+                if self.state.direction == "LONG":
+                    be_stop = self.state.entry_price - be_buf
+                    if be_stop > self.state.trailing_stop:
+                        self.state.trailing_stop = be_stop
+                else:
+                    be_stop = self.state.entry_price + be_buf
+                    if be_stop < self.state.trailing_stop:
+                        self.state.trailing_stop = be_stop
+
+            # Candle trail (same as _update_candle_trail R14/R15 + MILESTONE_LOCK)
+            trail_close_always = self.cfg.get("trail_to_close_always", False)
+            m_target = float(self.cfg.get("milestone_lock_pts", 0))
+            m_giveback = float(self.cfg.get("milestone_giveback_pts", 10))
+            if self.state.direction == "LONG":
+                if trail_close_always:
+                    ns = prev_close
+                else:
+                    profit = prev_close - self.state.entry_price
+                    ns = prev_close if profit >= self.cfg["tight_threshold"] else prev_low
+                if ns > self.state.trailing_stop:
+                    self.state.trailing_stop = round(ns, 1)
+                # Milestone floor
+                if m_target > 0:
+                    mfe_profit = self.state.max_favourable - self.state.entry_price
+                    if mfe_profit >= m_target:
+                        floor = self.state.entry_price + (mfe_profit - m_giveback)
+                        if floor > self.state.trailing_stop:
+                            self.state.trailing_stop = round(floor, 1)
+            else:
+                if trail_close_always:
+                    ns = prev_close
+                else:
+                    profit = self.state.entry_price - prev_close
+                    ns = prev_close if profit >= self.cfg["tight_threshold"] else prev_high
+                if ns < self.state.trailing_stop:
+                    self.state.trailing_stop = round(ns, 1)
+                if m_target > 0:
+                    mfe_profit = self.state.entry_price - self.state.max_favourable
+                    if mfe_profit >= m_target:
+                        floor = self.state.entry_price - (mfe_profit - m_giveback)
+                        if floor < self.state.trailing_stop:
+                            self.state.trailing_stop = round(floor, 1)
+
+            if self.state.trailing_stop != old_stop:
+                self.state.trail_moved = True
+                self.save_state()
+                self.broker.update_stop_level(self.state.trailing_stop)
+                move = abs(self.state.trailing_stop - old_stop)
+                if move >= self.cfg["trail_min_move"]:
+                    risk_pts = abs(self.state.trailing_stop - self.state.entry_price)
+                    if self.state.breakeven_hit:
+                        await self.alert(
+                            f"[{self.name}] TRAIL → {self.state.trailing_stop:.1f} "
+                            f"(locked {risk_pts:.0f}pts)"
+                        )
+                    else:
+                        await self.alert(
+                            f"[{self.name}] TRAIL → {self.state.trailing_stop:.1f} "
+                            f"(risk {risk_pts:.0f}pts)"
+                        )
+
     async def _on_stop_exit(self, result: dict):
         """Lock-wrapped entry — see _on_stop_exit_impl."""
         async with self._lock:
@@ -311,7 +459,11 @@ class Signal:
             self._morning_running = False
 
     async def _morning_routine_inner(self):
-        now = datetime.now(self.tz)
+        replay = getattr(self, '_replay_date', None)
+        if replay:
+            now = datetime.combine(replay, datetime.now(self.tz).time(), tzinfo=self.tz)
+        else:
+            now = datetime.now(self.tz)
         if now.weekday() >= 5:
             return
 
@@ -404,30 +556,28 @@ class Signal:
                 bar4_range = round(bar5["High"] - bar5["Low"], 1)
                 logger.info(f"[{self.name}] Using bar 5 (bar 4 was {range_flag})")
             else:
-                # Wait for bar 5 callback (fires instantly when bar completes)
+                # Wait for bar 5 by polling the bar cache every 5s.
+                # Replaces the event-based approach which had race conditions
+                # between on_bar_complete callbacks and the asyncio lock.
                 import asyncio
-                self._bar5_event = asyncio.Event()
-                logger.info(f"[{self.name}] Waiting for bar 5 callback...")
+                logger.info(f"[{self.name}] Waiting for bar 5 (polling)...")
                 await self.alert(
                     f"[{self.name}] Bar 4 ({range_flag}) — waiting for bar 5\n"
                     f"Bar 4: H={bar4['High']} L={bar4['Low']} Range={bar4_range}pts"
                 )
-                try:
-                    # 8 min — gives wall-clock finaliser headroom for sparse
-                    # contracts (NIY early Tokyo) where bar 5 finalisation can
-                    # be delayed by 60-90s due to thin trade flow.
-                    await asyncio.wait_for(self._bar5_event.wait(), timeout=480)
-                except asyncio.TimeoutError:
-                    pass
-                self._bar5_event = None
+                bar5 = None
+                for _poll in range(72):  # 72 × 5s = 360s (6 min, plenty for 5-min bar + grace)
+                    await asyncio.sleep(5)
+                    cache = getattr(self, '_bar_cache', {})
+                    if 5 in cache:
+                        bar5 = cache[5]
+                        break
 
-                cache = getattr(self, '_bar_cache', {})
-                if 5 in cache:
-                    bar5 = cache[5]
+                if bar5 is not None:
                     signal_bar = bar5
                     bar_num = 5
                     bar4_range = round(bar5["High"] - bar5["Low"], 1)
-                    logger.info(f"[{self.name}] Bar 5 received from callback")
+                    logger.info(f"[{self.name}] Bar 5 received (poll {_poll + 1})")
                 else:
                     logger.info(f"[{self.name}] Bar 5 not available -- using bar 4")
 
@@ -525,14 +675,51 @@ class Signal:
         except Exception as e:
             logger.error(f"[{self.name}] sizing failed (falling back to NUM_CONTRACTS): {e}")
             qty = config.NUM_CONTRACTS
+        self.state.stake_per_point = qty  # store for journal pnl_gbp calculation
+
+        # Reverse-reentry filter. Three modes (per-instrument config):
+        #   "always"     — no restriction (default)
+        #   "never"      — re-entries must match first_direction (DAX, US30)
+        #   "after_loss" — opposite re-entry only if trade #1 lost (NIKKEI)
+        # 18yr backtest evidence:
+        #   DAX+US30 opposite re-entries: PF 0.81-0.86 regardless of outcome → never
+        #   NIKKEI first_WON→opposite: PF 0.70 (disaster); first_LOST→opposite: PF 2.38 (edge)
+        # Combined filter: PF 2.12 → 2.66, net +32k pts over 18 years.
+        # Implementation: blocks by passing an unreachable price on the disallowed
+        # side — OCA trigger loop never fires it, no order placed, entries_used
+        # does not tick up. Next re-arm after a stop-out in the allowed direction
+        # resumes the same logic.
+        buy_px  = self.state.buy_level
+        sell_px = self.state.sell_level
+        if self.state.entries_used > 0 and self.state.first_direction:
+            policy = self.cfg.get("reverse_reentry", "always")
+            first_won = (
+                self.state.trades and self.state.trades[0].get("pnl_pts", 0) > 0
+            )
+            block_reverse = (
+                policy == "never"
+                or (policy == "after_loss" and first_won)
+            )
+            if block_reverse:
+                if self.state.first_direction == "LONG":
+                    sell_px = -1e9   # SELL side unreachable
+                else:
+                    buy_px  = 1e9    # BUY side unreachable
+                reason = (f"policy={policy}, first_won={first_won}, "
+                          f"locked to {self.state.first_direction}")
+                logger.info(f"[{self.name}] Reverse-reentry blocked: {reason}")
+
         result = await self.broker.place_oca_bracket(
-            buy_price=self.state.buy_level,
-            sell_price=self.state.sell_level,
+            buy_price=buy_px,
+            sell_price=sell_px,
             qty=qty,
             oca_group=f"ASRS_{self.name}_{self.state.date}_{self.state.entries_used + 1}",
         )
         if "error" in result:
-            await self.alert(f"[{self.name}] Bracket placement FAILED: {result['error']}")
+            from asrs import audit_log
+            audit_log.arm_fail(signal=self.name, epic=self.broker.epic,
+                               reason=str(result.get("error")))
+            await self.alert(f"[{self.name}] ⚠️ Bracket placement FAILED: {result['error']}")
             return
 
         self.state.phase = Phase.BRACKET_ARMED
@@ -545,6 +732,10 @@ class Signal:
         Handles fill processing, slippage check, stop placement.
         R5: BUY triggers on offer >= buy_level, SELL on bid <= sell_level.
         """
+        async with self._lock:
+            await self._on_tick_trigger_impl(trigger)
+
+    async def _on_tick_trigger_impl(self, trigger: dict):
         self.load_state()
         if self.state.phase != Phase.BRACKET_ARMED:
             return
@@ -628,6 +819,8 @@ class Signal:
         self.state.direction = direction
         self.state.entry_price = fill_price
         self.state.entries_used += 1
+        if self.state.entries_used == 1:
+            self.state.first_direction = direction
         self.state.adds_used = 0
         self.state.add_positions = []
         self.state.last_add_price = 0.0
@@ -686,10 +879,15 @@ class Signal:
         """
         Called every minute by scheduler.
         Handles: bracket trigger polling, trailing stop, breakeven, adds,
-        stop/exit detection, re-entry.
+        stop/exit detection, re-entry, fade position monitoring.
         """
         try:
             self.load_state()
+
+            # FADE position monitoring (runs regardless of main position phase)
+            if self.state.fade_active:
+                await self._check_fade_exit()
+                # Don't return — main signal might also need processing
 
             # If bracket armed, poll for triggers (backup to tick trigger)
             if self.state.phase == Phase.BRACKET_ARMED:
@@ -749,7 +947,10 @@ class Signal:
 
             trigger = await self.broker.check_trigger_levels()
             if trigger:
-                await self.on_tick_trigger(trigger)
+                # Use _impl directly — monitor_cycle already holds self._lock
+                # and asyncio.Lock is not re-entrant. Using on_tick_trigger
+                # here would deadlock forever (bug seen live 2026-04-21).
+                await self._on_tick_trigger_impl(trigger)
                 return
 
             await asyncio.sleep(5)
@@ -766,11 +967,28 @@ class Signal:
         # Check if tick-based stop already closed the position
         ig_pos = await self.broker.get_position()
         if ig_pos["direction"] == "FLAT" and self.state.direction:
-            logger.info(f"[{self.name}] Position closed (detected by monitor cycle)")
-            # _on_stop_exit callback should have handled this already
-            # but if not, process exit now with current price
-            if self.state.phase in (Phase.LONG, Phase.SHORT):
-                await self._process_exit(price)
+            # Race fix (2026-04-20): broker's _execute_stop_exit may be mid-flight.
+            # If we process here first, we lose the actual fill price — slippage
+            # capture breaks (journal records current_price, not actual fill).
+            # Wait up to 10s for broker to finish, then re-check state.
+            import asyncio as _asyncio
+            for _ in range(20):
+                if not getattr(self.broker, "_stop_exit_active", False):
+                    break
+                await _asyncio.sleep(0.5)
+            # Re-load — _on_stop_exit callback may have processed during wait
+            self.load_state()
+            if self.state.phase not in (Phase.LONG, Phase.SHORT):
+                return  # callback handled it — actual fill captured properly
+
+            # Callback didn't fire — fallback. Use actual fill from broker if available.
+            logger.warning(
+                f"[{self.name}] Position FLAT but callback didn't fire — fallback exit"
+            )
+            intended = self.state.trailing_stop
+            fills = getattr(self.broker, "_last_close_fills", [])
+            actual = (sum(fills) / len(fills)) if fills else intended
+            await self._process_exit(actual, exit_intended=intended)
             return
 
         # Update MFE
@@ -836,18 +1054,43 @@ class Signal:
 
         old_stop = self.state.trailing_stop
 
+        trail_close_always = self.cfg.get("trail_to_close_always", False)
+        # MILESTONE_LOCK — at MFE ≥ target, enforce stop at (MFE - giveback).
+        # 18yr PF 2.28 → 2.43 (+£39k / 8.7% lift). Acts as a floor under the trail.
+        m_target = float(self.cfg.get("milestone_lock_pts", 0))
+        m_giveback = float(self.cfg.get("milestone_giveback_pts", 10))
         if self.state.direction == "LONG":
-            profit = prev_close - self.state.entry_price
-            use_tight = profit >= self.cfg["tight_threshold"]  # R15
-            new_stop = prev_close if use_tight else prev_low   # R14
+            if trail_close_always:
+                new_stop = prev_close  # Variant B
+            else:
+                profit = prev_close - self.state.entry_price
+                use_tight = profit >= self.cfg["tight_threshold"]  # R15
+                new_stop = prev_close if use_tight else prev_low   # R14
             if new_stop > self.state.trailing_stop:
                 self.state.trailing_stop = round(new_stop, 1)
+            # Milestone floor
+            if m_target > 0:
+                mfe_profit = self.state.max_favourable - self.state.entry_price
+                if mfe_profit >= m_target:
+                    floor = self.state.entry_price + (mfe_profit - m_giveback)
+                    if floor > self.state.trailing_stop:
+                        self.state.trailing_stop = round(floor, 1)
         else:
-            profit = self.state.entry_price - prev_close
-            use_tight = profit >= self.cfg["tight_threshold"]
-            new_stop = prev_close if use_tight else prev_high
+            if trail_close_always:
+                new_stop = prev_close  # Variant B
+            else:
+                profit = self.state.entry_price - prev_close
+                use_tight = profit >= self.cfg["tight_threshold"]
+                new_stop = prev_close if use_tight else prev_high
             if new_stop < self.state.trailing_stop:
                 self.state.trailing_stop = round(new_stop, 1)
+            # Milestone floor
+            if m_target > 0:
+                mfe_profit = self.state.entry_price - self.state.max_favourable
+                if mfe_profit >= m_target:
+                    floor = self.state.entry_price - (mfe_profit - m_giveback)
+                    if floor < self.state.trailing_stop:
+                        self.state.trailing_stop = round(floor, 1)
 
         if self.state.trailing_stop != old_stop:
             self.state.trail_moved = True
@@ -855,8 +1098,11 @@ class Signal:
             await self._update_ig_stop()
             move = abs(self.state.trailing_stop - old_stop)
             if move >= self.cfg["trail_min_move"]:
-                label = "TIGHT" if (self.state.direction == "LONG" and prev_close - self.state.entry_price >= self.cfg["tight_threshold"]) or \
-                                   (self.state.direction == "SHORT" and self.state.entry_price - prev_close >= self.cfg["tight_threshold"]) else "TRAIL"
+                if trail_close_always:
+                    label = "TRAIL_C"  # Variant B: always prev_close
+                else:
+                    label = "TIGHT" if (self.state.direction == "LONG" and prev_close - self.state.entry_price >= self.cfg["tight_threshold"]) or \
+                                       (self.state.direction == "SHORT" and self.state.entry_price - prev_close >= self.cfg["tight_threshold"]) else "TRAIL"
                 # Before breakeven: show risk reduction. After: show locked profit.
                 risk_pts = abs(self.state.trailing_stop - self.state.entry_price)
                 if self.state.breakeven_hit:
@@ -985,6 +1231,7 @@ class Signal:
             t["mfe"] = mfe
             t["exit_reason"] = exit_reason
             t["contracts_stopped"] = 1 + len(self.state.add_positions)
+            t["stake_per_point"] = getattr(self.state, "stake_per_point", 1)
 
         self.save_state()
 
@@ -1018,6 +1265,20 @@ class Signal:
         self.state.breakeven_hit = False
         self.state.trail_moved = False
 
+        # FADE CANARY: after winning TRAIL_STOP >= min_winner_pts, open opposite-direction fade
+        # Target = bar 4/5 extreme, stop = fade_stop_pts away.
+        # Winner-size filter: ≥20pt threshold removes 45% of fades that lose money;
+        # 18yr post-spread PF 1.64→2.06 on US30 (all variants stress-tested 2026-04-20).
+        fade_min_winner = float(self.cfg.get("fade_min_winner_pts", 20.0))
+        if (exit_reason == "TRAIL_STOP"
+                and total_pnl >= fade_min_winner
+                and self.cfg.get("fade_on_trail_win", False)
+                and not self.state.fade_active):
+            try:
+                await self._place_fade(exit_price, direction)
+            except Exception as _e:
+                logger.error(f"[{self.name}] fade trigger failed: {_e}", exc_info=True)
+
         if self.state.entries_used < self.cfg["max_entries"]:
             # R20: Re-arm BOTH directions at ORIGINAL entry levels
             # Don't arm immediately — price may have moved past levels during exit
@@ -1037,12 +1298,258 @@ class Signal:
             logger.info(f"[{self.name}] Max entries reached ({self.cfg['max_entries']})")
 
     # =========================================================================
+    #  FADE — after TRAIL_STOP winner, open opposite-direction trade targeting
+    #  bar 4/5 extreme. Canary on US30 (2026-04-20). 18yr post-spread PF 1.64.
+    # =========================================================================
+
+    async def _place_fade(self, orig_exit_price: float, orig_direction: str):
+        """Open fade (opposite direction) after winning trail stop."""
+        fade_dir = "SHORT" if orig_direction == "LONG" else "LONG"
+        fade_stop_pts = float(self.cfg.get("fade_stop_pts", 50.0))
+
+        # Target = opposite bar 4/5 extreme
+        if fade_dir == "SHORT":
+            fade_target = float(self.state.bar_high)
+            fade_stop = orig_exit_price + fade_stop_pts
+        else:
+            fade_target = float(self.state.bar_low)
+            fade_stop = orig_exit_price - fade_stop_pts
+
+        # Place market order — use SAME float stake as base (not int — IG
+        # spread bet accepts fractional £/pt; int truncation was asking for
+        # double the intended stake → INSUFFICIENT_FUNDS rejection).
+        action = "SELL" if fade_dir == "SHORT" else "BUY"
+        qty = float(getattr(self.state, "stake_per_point", 0.5))
+        if qty < 0.5:
+            qty = 0.5  # IG minimum for indices
+        result = await self.broker.place_market_order(action=action, qty=qty)
+        if "error" in result:
+            logger.error(f"[{self.name}] FADE order failed: {result['error']}")
+            return
+
+        fade_fill = float(result.get("avg_price", orig_exit_price))
+        # Recompute stop from actual fill
+        if fade_dir == "SHORT":
+            fade_stop = fade_fill + fade_stop_pts
+        else:
+            fade_stop = fade_fill - fade_stop_pts
+
+        self.state.fade_active = True
+        self.state.fade_direction = fade_dir
+        self.state.fade_entry_price = round(fade_fill, 1)
+        self.state.fade_stop_level = round(fade_stop, 1)
+        self.state.fade_target_level = round(fade_target, 1)
+        self.state.fade_deal_id = result.get("order_id", "")
+        self.state.fade_entry_time = datetime.now(self.tz).strftime("%H:%M")
+        # Mark broker as holding a position so base-bracket ticks skip silently
+        # while fade is active (prevents TRIGGER_BLOCKED storm).
+        self.broker._local_in_position = True
+        self.save_state()
+
+        await self.alert(
+            f"<b>{self.name} FADE ARMED</b>\n"
+            f"{fade_dir} @ {fade_fill:.1f}\n"
+            f"Target: {fade_target:.1f} ({abs(fade_fill-fade_target):.1f}pt)\n"
+            f"Stop: {fade_stop:.1f} ({fade_stop_pts:.0f}pt)"
+        )
+        logger.info(
+            f"[{self.name}] FADE opened: {fade_dir} @ {fade_fill:.1f} "
+            f"target={fade_target:.1f} stop={fade_stop:.1f} deal={self.state.fade_deal_id}"
+        )
+
+    async def _check_fade_exit(self):
+        """
+        Check fade stop/target on each monitor cycle. Close if hit.
+
+        TRAIL_TARGET mode (18yr backtest: +5% vs FIXED_TARGET):
+          - Pre-target: exit on target hit OR stop hit (same as fixed)
+          - Post-target: stop trails prev_close — captures continued reversal
+        """
+        if not self.state.fade_active:
+            return
+        if not await self.broker.ensure_connected():
+            return
+
+        ig_pos = await self.broker.get_position()
+        if ig_pos["direction"] == "FLAT":
+            logger.warning(f"[{self.name}] FADE position FLAT on broker — clearing state")
+            price = await self.broker.get_current_price()
+            await self._close_fade(price or self.state.fade_entry_price, "UNKNOWN")
+            return
+
+        price = await self.broker.get_current_price()
+        if price is None or price <= 0:
+            return
+
+        fade_dir = self.state.fade_direction
+        target = self.state.fade_target_level
+        stop = self.state.fade_stop_level
+        target_hit = self.state.fade_target_hit
+
+        # Phase 1: before target hit — detect target OR stop
+        if not target_hit:
+            at_target = (fade_dir == "LONG" and price >= target) or \
+                        (fade_dir == "SHORT" and price <= target)
+            hit_stop = (fade_dir == "LONG" and price <= stop) or \
+                       (fade_dir == "SHORT" and price >= stop)
+            if at_target:
+                # Switch to trailing mode — don't exit yet
+                self.state.fade_target_hit = True
+                # Tighten stop: move to breakeven + small buffer
+                if fade_dir == "LONG":
+                    new_stop = self.state.fade_entry_price
+                else:
+                    new_stop = self.state.fade_entry_price
+                self.state.fade_stop_level = new_stop
+                self.save_state()
+                await self.alert(
+                    f"[{self.name}] FADE target hit — switching to TRAIL\n"
+                    f"Stop moved to BE: {new_stop:.1f}"
+                )
+                logger.info(f"[{self.name}] FADE target hit @ {price:.1f}, trailing from BE")
+                return
+            if hit_stop:
+                await self._close_fade(price, "STOP")
+            return
+
+        # Phase 2: after target hit — trail prev_close
+        # Get last completed 5-min bar
+        df = self.broker.get_streaming_bars_df()
+        if df is not None and not df.empty:
+            today = datetime.now(self.tz).date()
+            today_bars = df[df.index.date == today]
+            if len(today_bars) >= 2:
+                prev_close = float(today_bars.iloc[-2]["Close"])
+                if fade_dir == "LONG":
+                    if prev_close > stop:
+                        self.state.fade_stop_level = round(prev_close, 1)
+                        self.save_state()
+                else:
+                    if prev_close < stop:
+                        self.state.fade_stop_level = round(prev_close, 1)
+                        self.save_state()
+
+        # Check updated stop
+        stop = self.state.fade_stop_level
+        hit_stop = (fade_dir == "LONG" and price <= stop) or \
+                   (fade_dir == "SHORT" and price >= stop)
+        if hit_stop:
+            await self._close_fade(price, "TRAIL_STOP")
+
+    async def _close_fade(self, exit_price: float, reason: str):
+        """Close fade position, log trade. Uses deal-specific close so we
+        don't accidentally close a concurrent base re-entry on same epic."""
+        fade_deal_id = self.state.fade_deal_id
+        try:
+            if fade_deal_id:
+                ok = await self.broker.close_position_by_deal_id(fade_deal_id)
+                if not ok:
+                    logger.warning(f"[{self.name}] fade deal {fade_deal_id} not closable — "
+                                   f"falling back to close_position (may close base too)")
+                    await self.broker.close_position()
+            else:
+                await self.broker.close_position()
+        except Exception as e:
+            logger.error(f"[{self.name}] Fade close failed: {e}")
+
+        entry = self.state.fade_entry_price
+        direction = self.state.fade_direction
+        if direction == "LONG":
+            pnl = round(exit_price - entry, 1)
+        else:
+            pnl = round(entry - exit_price, 1)
+
+        fade_trade = {
+            "num": len(self.state.fade_trades) + 1,
+            "direction": direction,
+            "entry": entry,
+            "exit": round(exit_price, 1),
+            "pnl_pts": pnl,
+            "entry_time": self.state.fade_entry_time,
+            "exit_time": datetime.now(self.tz).strftime("%H:%M"),
+            "exit_reason": f"FADE_{reason}",
+            "target_level": self.state.fade_target_level,
+            "stop_level": self.state.fade_stop_level,
+        }
+        self.state.fade_trades.append(fade_trade)
+
+        # Journal: tag as FADE
+        try:
+            from asrs.journal import log_trade
+            # Use a synthetic state to log under signal_type=FADE
+            fade_state = SignalState()
+            fade_state.date = self.state.date
+            fade_state.phase = Phase.DONE
+            fade_state.direction = direction
+            fade_state.entry_price = entry
+            fade_state.buy_level = self.state.buy_level
+            fade_state.sell_level = self.state.sell_level
+            fade_state.bar_high = self.state.bar_high
+            fade_state.bar_low = self.state.bar_low
+            fade_state.bar_range = self.state.bar_range
+            fade_state.bar_number = self.state.bar_number
+            fade_state.range_flag = self.state.range_flag
+            fade_state.stake_per_point = getattr(self.state, "stake_per_point", 1)
+            fade_state.trades = [fade_trade]
+            log_trade(self.instrument, fade_trade, fade_state, signal_type="FADE",
+                      signal_name=self.name)
+        except Exception as e:
+            logger.error(f"[{self.name}] FADE journal log error: {e}")
+
+        # Clear fade state
+        self.state.fade_active = False
+        self.state.fade_direction = ""
+        self.state.fade_entry_price = 0.0
+        self.state.fade_stop_level = 0.0
+        self.state.fade_target_level = 0.0
+        self.state.fade_target_hit = False
+        self.state.fade_deal_id = ""
+        self.state.fade_entry_time = ""
+        self.save_state()
+
+        icon = "+" if pnl >= 0 else ""
+        # Dead-man: query cumulative fade pnl for this instrument over recent live trades
+        cumulative_alert = ""
+        try:
+            import sqlite3
+            conn = sqlite3.connect("/app/data/trade_journal.db")
+            row = conn.execute(
+                "SELECT ROUND(SUM(pnl_pts), 1), COUNT(*) "
+                "FROM trades WHERE mode='live' AND signal_type='FADE' "
+                "AND instrument=? AND date >= date('now', '-15 days')",
+                (self.instrument,)
+            ).fetchone()
+            conn.close()
+            cum_pts, fade_n = (row[0] or 0), (row[1] or 0)
+            cumulative_alert = f"\n15d fade: {cum_pts:+.1f}pt ({fade_n} trades)"
+            # Dead-man threshold: auto-pause fade on this instrument if cumulative ≤ -100pt
+            if cum_pts <= -100 and fade_n >= 5:
+                cumulative_alert += "\n⚠️ FADE DEAD-MAN TRIGGERED — auto-disabling fade"
+                # Flip config in-memory (will persist on next state save)
+                self.cfg["fade_on_trail_win"] = False
+        except Exception as _e:
+            logger.warning(f"fade cumulative query failed: {_e}")
+
+        await self.alert(
+            f"<b>{self.name} FADE EXIT ({reason})</b>\n"
+            f"{direction} | Entry: {entry} | Exit: {round(exit_price,1)}\n"
+            f"P&L: {icon}{pnl:.1f}pts{cumulative_alert}"
+        )
+        logger.info(f"[{self.name}] FADE closed: {direction} {pnl:+.1f}pts ({reason})")
+
+    # =========================================================================
     #  end_of_day -- force close (R19)
     # =========================================================================
 
     async def end_of_day(self):
         """Force close all positions at session end."""
         self.load_state()
+
+        # Close fade first if active
+        if self.state.fade_active:
+            logger.info(f"[{self.name}] EOD — closing fade")
+            price = await self.broker.get_current_price()
+            await self._close_fade(price or self.state.fade_entry_price, "EOD")
 
         if self.state.phase in (Phase.LONG, Phase.SHORT):
             logger.info(f"[{self.name}] EOD force close")

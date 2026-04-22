@@ -59,9 +59,15 @@ INSTRUMENTS = {
         "breakeven_pts": 15.0,
         "be_buffer_pts": 5.0,    # BE stop offset below entry to absorb tick noise
         "tight_threshold": 100.0,
+        "trail_to_close_always": True,  # Variant B: trail to prev_close every bar (18yr PF 2.01→3.27)
+        "milestone_lock_pts": 30.0,     # at MFE ≥ 30pt, lock stop at (MFE-10). 18yr PF 2.28→2.43
+        "milestone_giveback_pts": 10.0,
+        "fade_on_trail_win": False,  # Fade canary — disabled on DAX until US30 validates 30 days
+        "fade_stop_pts": 50.0,       # stop distance for fade position
         "trail_min_move": 3.0,
         "add_trigger": 25.0,
         "add_max": 0,  # disabled — backtest shows no_adds nearly matches add_self_be with lower DD
+        "reverse_reentry": "never",  # 18yr: DAX opp re-entries PF 0.86, -5k pts
         "s1_open_hour": 9, "s1_open_minute": 0,
         "s2_open_hour": 14, "s2_open_minute": 0,
         "session_end_hour": 17, "session_end_minute": 30,
@@ -81,13 +87,20 @@ INSTRUMENTS = {
         "max_bar_range": 300,
         "max_spread": 10.0,
         "max_slippage_pct": 0.5,
-        "disaster_stop_pts": 1000,
+        "disaster_stop_pts": 1000,  # raised from 500 to clear IG volatility-adjusted min GS distance (2026-04-19 after Friday S3 ATTACHED_ORDER_LEVEL_ERROR)
         "breakeven_pts": 20.0,
         "be_buffer_pts": 5.0,    # BE stop offset below entry to absorb tick noise
         "tight_threshold": 80.0,
+        "trail_to_close_always": True,  # Variant B: trail to prev_close every bar (18yr PF 2.48→3.76)
+        "milestone_lock_pts": 30.0,     # at MFE ≥ 30pt, lock stop at (MFE-10)
+        "milestone_giveback_pts": 10.0,
+        "fade_on_trail_win": True,   # CANARY — US30 first (2026-04-20). 18yr post-spread PF 1.64, 0 losing years
+        "fade_stop_pts": 50.0,
+        "fade_min_winner_pts": 20.0,  # skip fade after winners <20pt (removes 45% of losing fades)
         "trail_min_move": 5.0,
         "add_trigger": 30.0,
         "add_max": 0,  # disabled — backtest shows no_adds nearly matches add_self_be with lower DD
+        "reverse_reentry": "never",  # 18yr: US30 opp re-entries PF 0.81, -21k pts
         "s1_open_hour": 9, "s1_open_minute": 30,
         "s2_open_hour": 11, "s2_open_minute": 0,
         "s3_open_hour": 13, "s3_open_minute": 0,
@@ -108,13 +121,19 @@ INSTRUMENTS = {
         "max_bar_range": 250,
         "max_spread": 50.0,
         "max_slippage_pct": 0.5,
-        "disaster_stop_pts": 1000,
+        "disaster_stop_pts": 500,
         "breakeven_pts": 50.0,
         "be_buffer_pts": 10.0,   # NIY has wider 10pt spreads → bigger BE buffer
         "tight_threshold": 300.0,
+        "trail_to_close_always": True,  # Variant B: trail to prev_close every bar (18yr PF 3.69→5.62)
+        "milestone_lock_pts": 30.0,     # at MFE ≥ 30pt, lock stop at (MFE-10)
+        "milestone_giveback_pts": 10.0,
+        "fade_on_trail_win": False,  # Disabled until NIKKEI watchlist clears AND US30/DAX fade validated
+        "fade_stop_pts": 50.0,
         "trail_min_move": 5.0,
         "add_trigger": 80.0,
         "add_max": 0,  # disabled — backtest shows no_adds nearly matches add_self_be with lower DD
+        "reverse_reentry": "after_loss",  # 18yr: first_WON→opposite PF 0.70 (-7k); first_LOST→opposite PF 2.38 (+33k)
         "s1_open_hour": 10, "s1_open_minute": 0,
         "s2_open_hour": 12, "s2_open_minute": 0,
         "s3_open_hour": 13, "s3_open_minute": 0,

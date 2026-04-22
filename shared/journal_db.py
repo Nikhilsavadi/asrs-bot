@@ -140,6 +140,11 @@ def init_db():
         ("day_of_week", "INTEGER DEFAULT 0"),       # 0=Mon, 4=Fri
         ("hour_of_entry", "INTEGER DEFAULT 0"),
         ("ig_spread_at_entry", "REAL DEFAULT 0"),
+        # TCA: microstructure at trigger moment (from broker tick callback)
+        ("trigger_bid", "REAL DEFAULT 0"),
+        ("trigger_ofr", "REAL DEFAULT 0"),
+        ("trigger_spread", "REAL DEFAULT 0"),
+        ("trigger_last", "REAL DEFAULT 0"),
         # Tick data summary
         ("tick_count_during_trade", "INTEGER DEFAULT 0"),
         ("avg_tick_interval_ms", "REAL DEFAULT 0"),
@@ -274,7 +279,8 @@ def insert_trade(instrument: str, trade: dict, state=None) -> int:
             tp1_filled, tp2_filled, tp1_slippage, tp2_slippage,
             mfe, bar_range, range_flag, bar_type,
             signal_bar, bar5_rule, gap_dir, overnight_bias,
-            exit_reason, stake_per_point, cumulative_pnl, mode
+            exit_reason, stake_per_point, cumulative_pnl, mode,
+            trigger_bid, trigger_ofr, trigger_spread, trigger_last
         ) VALUES (
             ?, ?, ?, ?,
             ?, ?, ?, ?,
@@ -282,6 +288,7 @@ def insert_trade(instrument: str, trade: dict, state=None) -> int:
             ?, ?, ?, ?,
             ?, ?,
             ?, ?, ?,
+            ?, ?, ?, ?,
             ?, ?, ?, ?,
             ?, ?, ?, ?,
             ?, ?, ?, ?,
@@ -323,6 +330,10 @@ def insert_trade(instrument: str, trade: dict, state=None) -> int:
         trade.get("stake_per_point", trade.get("stake", 1)),
         cum_pnl,
         _trade_mode_label(),
+        trade.get("trigger_bid", 0),
+        trade.get("trigger_ofr", 0),
+        trade.get("trigger_spread", 0),
+        trade.get("trigger_last", 0),
     ))
     conn.commit()
 
