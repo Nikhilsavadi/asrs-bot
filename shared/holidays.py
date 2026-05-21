@@ -25,6 +25,14 @@ _US_FIXED = {
     (1, 1), (7, 4), (12, 25),
 }
 
+# XAUUSD (gold spot) — COMEX holidays. Gold trades 23h/day except weekends + US holidays.
+# Conservative set: only fixed US holidays where COMEX is closed.
+_XAUUSD_FIXED = {
+    (1, 1),    # New Year
+    (7, 4),    # US Independence Day (COMEX closed)
+    (12, 25),  # Christmas
+}
+
 # Nikkei-specific (TSE) — many holidays
 _NIKKEI_FIXED = {
     (1, 1), (1, 2), (1, 3),  # New Year
@@ -95,6 +103,8 @@ def is_holiday(d: date, instrument: str = "DAX") -> bool:
     if inst == "US30" and month_day in _US_FIXED:
         return True
     if inst in ("NIKKEI", "JAPAN") and month_day in _NIKKEI_FIXED:
+        return True
+    if inst in ("XAUUSD", "GOLD") and month_day in _XAUUSD_FIXED:
         return True
 
     # Global fixed

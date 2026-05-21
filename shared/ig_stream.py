@@ -34,7 +34,8 @@ class _TickListener(SubscriptionListener):
                  loop: asyncio.AbstractEventLoop,
                  tick_bars: dict = None, candle_bars: dict = None,
                  candle_callbacks: dict = None, bar_emit_times: dict = None,
-                 last_real_bar_time: dict = None, tick_bar_lock=None):
+                 last_real_bar_time: dict = None, tick_bar_lock=None,
+                 dedup_state: dict = None):
         self._epic = epic
         self._prices = prices
         self._events = events
@@ -46,6 +47,11 @@ class _TickListener(SubscriptionListener):
         self._bar_emit_times = bar_emit_times if bar_emit_times is not None else {}
         self._last_real_bar_time = last_real_bar_time if last_real_bar_time is not None else {}
         self._tick_bar_lock = tick_bar_lock
+        # Shared with _CandleListener + wall-clock finalizer. Prevents
+        # double-fire when tick-bar emits first and CONS_END arrives later
+        # (or vice versa) for the same bar. Without this, both paths fire
+        # callbacks with different OHLC for the same start_time.
+        self._dedup = dedup_state if dedup_state is not None else {}
 
     def onItemUpdate(self, update):
         try:
@@ -169,12 +175,19 @@ class _TickListener(SubscriptionListener):
                 }
                 end_time = current["time"] + timedelta(minutes=5)
 
-                # Store in same bar store as CONS_END bars (dedup by time)
+                # Store in same bar store as CONS_END bars (dedup by time).
+                # The deque "already" check stops a duplicate APPEND, but the
+                # _dedup check stops a duplicate CALLBACK FIRE — both are needed
+                # because CONS_END uses _dedup independently. Both must be set
+                # together so the other path skips its callback for this bar.
                 epic_bars = self._candle_bars.setdefault(self._epic, deque(maxlen=300))
-                # Only add if not already there from CONS_END
-                already = any(b["time"] == completed["time"] for b in epic_bars)
+                already = (
+                    any(b["time"] == completed["time"] for b in epic_bars)
+                    or self._dedup.get(self._epic) == completed["time"]
+                )
                 if not already:
                     epic_bars.append(completed)
+                    self._dedup[self._epic] = completed["time"]
                     self._bar_emit_times[self._epic] = datetime.now(CET)
                     # Track last REAL bar time for synth gap-fill freshness check
                     self._last_real_bar_time[self._epic] = completed["time"]
@@ -444,6 +457,7 @@ class IGStreamManager:
             candle_callbacks=self._candle_callbacks, bar_emit_times=self._last_bar_emit,
             last_real_bar_time=self._last_real_bar_time,
             tick_bar_lock=self._tick_bar_lock,
+            dedup_state=self._candle_dedup,  # unified dedup with CONS_END + wall-clock paths
         )
         sub.addListener(listener)
         self._session.stream.subscribe(sub)
@@ -489,9 +503,14 @@ class IGStreamManager:
                             "Close": current["Close"],
                         }
                         epic_bars = self._candle_bars.setdefault(epic, deque(maxlen=300))
-                        already = any(b["time"] == completed["time"] for b in epic_bars)
+                        # Unified dedup with tick-bar + CONS_END paths
+                        already = (
+                            any(b["time"] == completed["time"] for b in epic_bars)
+                            or self._candle_dedup.get(epic) == completed["time"]
+                        )
                         if not already:
                             epic_bars.append(completed)
+                            self._candle_dedup[epic] = completed["time"]
                             self._last_bar_emit[epic] = now
                             self._last_real_bar_time[epic] = completed["time"]
                             logger.info(

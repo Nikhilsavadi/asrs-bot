@@ -264,7 +264,11 @@ async def check_stream_health_all(shared_session, stream_mgr, tg_send, signals=N
             inst_keys.setdefault(sig.instrument, sig.broker.epic)
 
     for inst_name, inst_cfg in config.INSTRUMENTS.items():
-        epic = inst_keys.get(inst_name) or inst_cfg.get("epic", "")
+        # Skip instruments without active signals (e.g. disabled via
+        # DISABLE_INSTRUMENTS). Previously we fell back to inst_cfg["epic"],
+        # which caused stream-stale spam for disabled instruments because the
+        # stream was never subscribed after startup.
+        epic = inst_keys.get(inst_name)
         if not epic:
             continue
 
@@ -518,8 +522,8 @@ async def main():
         if inst_name.upper() in DISABLED_INSTRUMENTS:
             logger.info(f"Skipping {inst_name} (in DISABLE_INSTRUMENTS)")
             continue
-        # Determine how many sessions (2 or 3) based on config
-        max_session = 3 if f"s3_open_hour" in inst_cfg else 2
+        # Determine how many sessions (1, 2, or 3) based on config
+        max_session = 3 if "s3_open_hour" in inst_cfg else (2 if "s2_open_hour" in inst_cfg else 1)
         inst_signals = []
 
         # One broker PER SIGNAL (not per epic) so each signal tracks its
@@ -576,7 +580,7 @@ async def main():
             now_inst = _dt.now(inst_tz)
             if now_inst.weekday() >= 5:
                 continue  # weekend
-            max_session = 3 if "s3_open_hour" in inst_cfg else 2
+            max_session = 3 if "s3_open_hour" in inst_cfg else (2 if "s2_open_hour" in inst_cfg else 1)
             for sn in range(1, max_session + 1):
                 open_h = inst_cfg[f"s{sn}_open_hour"]
                 open_m = inst_cfg[f"s{sn}_open_minute"]
@@ -619,7 +623,7 @@ async def main():
             continue
         sched_tz = ZoneInfo(inst_cfg["scheduler_timezone"])
         prefix = inst_name.lower()
-        max_session = 3 if "s3_open_hour" in inst_cfg else 2
+        max_session = 3 if "s3_open_hour" in inst_cfg else (2 if "s2_open_hour" in inst_cfg else 1)
         inst_sigs = [signals[f"{inst_name}_S{sn}"] for sn in range(1, max_session + 1)]
 
         # -- Morning routines + failsafes for each session --------------------
@@ -1186,8 +1190,9 @@ async def main():
             ytd_trades = ytd_row["trades"] if ytd_row else 0
 
             # Per instrument this week
+            # NIKKEI dropped 2026-05-03; XAUUSD added 2026-05-06
             inst_lines = []
-            for inst in ["DAX", "US30", "NIKKEI"]:
+            for inst in ["DAX", "US30", "XAUUSD"]:
                 iw = get_weekly_pnl(inst)
                 if iw["trades"] > 0:
                     p = iw["pnl_gbp"]

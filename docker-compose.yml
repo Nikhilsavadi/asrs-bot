@@ -54,7 +54,7 @@ services:
       CONSECUTIVE_LOSS_KILL: "9999"
       RISK_PCT_PER_TRADE: "0.5"
       MAX_CONTRACTS: "10"
-      DISABLE_INSTRUMENTS: ""
+      DISABLE_INSTRUMENTS: "NIKKEI"    # disabled 2026-04-23 — watchlist, review May 17
       # ── Runtime / log directories (host-visible via volumes) ────────
       ASRS_RUNTIME_DIR: /var/run/asrs
       LOG_DIR: /var/run/asrs/logs

@@ -280,7 +280,8 @@ def insert_trade(instrument: str, trade: dict, state=None) -> int:
             mfe, bar_range, range_flag, bar_type,
             signal_bar, bar5_rule, gap_dir, overnight_bias,
             exit_reason, stake_per_point, cumulative_pnl, mode,
-            trigger_bid, trigger_ofr, trigger_spread, trigger_last
+            trigger_bid, trigger_ofr, trigger_spread, trigger_last,
+            signal_type, session
         ) VALUES (
             ?, ?, ?, ?,
             ?, ?, ?, ?,
@@ -292,7 +293,8 @@ def insert_trade(instrument: str, trade: dict, state=None) -> int:
             ?, ?, ?, ?,
             ?, ?, ?, ?,
             ?, ?, ?, ?,
-            ?, ?, ?, ?
+            ?, ?, ?, ?,
+            ?, ?
         )
     """, (
         instrument,
@@ -334,6 +336,8 @@ def insert_trade(instrument: str, trade: dict, state=None) -> int:
         trade.get("trigger_ofr", 0),
         trade.get("trigger_spread", 0),
         trade.get("trigger_last", 0),
+        trade.get("signal_type", "BRACKET"),
+        trade.get("session", ""),
     ))
     conn.commit()
 

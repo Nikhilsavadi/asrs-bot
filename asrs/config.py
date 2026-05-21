@@ -60,9 +60,10 @@ INSTRUMENTS = {
         "be_buffer_pts": 5.0,    # BE stop offset below entry to absorb tick noise
         "tight_threshold": 100.0,
         "trail_to_close_always": True,  # Variant B: trail to prev_close every bar (18yr PF 2.01→3.27)
-        "milestone_lock_pts": 30.0,     # at MFE ≥ 30pt, lock stop at (MFE-10). 18yr PF 2.28→2.43
-        "milestone_giveback_pts": 10.0,
-        "fade_on_trail_win": False,  # Fade canary — disabled on DAX until US30 validates 30 days
+        "milestone_lock_pts": 20.0,     # tightened 30→20 on Apr 28 — TEST PF 2.11→2.21 (1-min); +£1k/yr at flat stake
+        "milestone_giveback_pts": 5.0,  # tightened 10→5
+        "skip_first_entry": True,       # SKIP DAX 1st entries below £10k equity (auto-revert above). +0.40 PF, MaxDD -50%
+        "fade_on_trail_win": True,   # Enabled May 2 (early canary; user override). Inherits 20/5 fade milestone + GS-on-fade protection shipped same day.
         "fade_stop_pts": 50.0,       # stop distance for fade position
         "trail_min_move": 3.0,
         "add_trigger": 25.0,
@@ -92,8 +93,8 @@ INSTRUMENTS = {
         "be_buffer_pts": 5.0,    # BE stop offset below entry to absorb tick noise
         "tight_threshold": 80.0,
         "trail_to_close_always": True,  # Variant B: trail to prev_close every bar (18yr PF 2.48→3.76)
-        "milestone_lock_pts": 30.0,     # at MFE ≥ 30pt, lock stop at (MFE-10)
-        "milestone_giveback_pts": 10.0,
+        "milestone_lock_pts": 20.0,     # tightened 30→20 on Apr 28 — TEST PF 2.34→2.71 (1-min); +£900/yr at flat
+        "milestone_giveback_pts": 5.0,  # tightened 10→5
         "fade_on_trail_win": True,   # CANARY — US30 first (2026-04-20). 18yr post-spread PF 1.64, 0 losing years
         "fade_stop_pts": 50.0,
         "fade_min_winner_pts": 20.0,  # skip fade after winners <20pt (removes 45% of losing fades)
@@ -126,8 +127,8 @@ INSTRUMENTS = {
         "be_buffer_pts": 10.0,   # NIY has wider 10pt spreads → bigger BE buffer
         "tight_threshold": 300.0,
         "trail_to_close_always": True,  # Variant B: trail to prev_close every bar (18yr PF 3.69→5.62)
-        "milestone_lock_pts": 30.0,     # at MFE ≥ 30pt, lock stop at (MFE-10)
-        "milestone_giveback_pts": 10.0,
+        "milestone_lock_pts": 20.0,     # tightened 30→20 on Apr 28 (NIKKEI parked but consistent config)
+        "milestone_giveback_pts": 5.0,
         "fade_on_trail_win": False,  # Disabled until NIKKEI watchlist clears AND US30/DAX fade validated
         "fade_stop_pts": 50.0,
         "trail_min_move": 5.0,
@@ -140,6 +141,45 @@ INSTRUMENTS = {
         "session_end_hour": 15, "session_end_minute": 0,
         "timezone": "Asia/Tokyo",
         "scheduler_timezone": "Asia/Tokyo",
+    },
+    "XAUUSD": {
+        # Gold spot ORB single-entry. Backtest 2020-26: PF 1.72 train / 1.45 test.
+        # Fires 249 trades/year (98.8% of trading days). Single session at 13:00 UK
+        # (NY pre-open / COMEX active). Variant B prev-bar trail. No re-entries.
+        # Ref: project_new_instruments_research_2026_04_15.md, project_xauusd_ship_diffs.md
+        # SHIPPED 2026-05-06.
+        # NB: thresholds 2x backtest era because gold is now ~$4685 vs $2000-2400 in 2020-24.
+        "epic": "CS.D.USCGC.TODAY.IP",  # IG Spot Gold DFB (verified via search 2026-05-06)
+        "currency": "GBP",
+        "label": "Gold Spot",
+        "gbp_per_pt": 1.0,
+        # Auto-scaled thresholds (R for current $4685 regime ≈ 2-3pt vs backtest's 1pt)
+        "buffer": 0.5,
+        "narrow_range": 2.0,
+        "wide_range": 6.0,
+        "max_risk_gbp": 25.0,           # half DAX/US30 budget — new instrument on probation
+        "max_entries": 1,               # ORB single-entry, no re-entries
+        "max_bar_range": 12.0,
+        "max_spread": 1.0,              # gold spread typically 0.3-0.5pt
+        "max_slippage_pct": 0.5,
+        "disaster_stop_pts": 60,
+        "breakeven_pts": 6.0,
+        "be_buffer_pts": 1.0,
+        "tight_threshold": 999.0,       # disable tight-trail mode
+        "trail_to_close_always": True,  # Variant B: trail to prev-close every bar
+        "milestone_lock_pts": 0,        # disable milestone (ORB uses pure trail)
+        "milestone_giveback_pts": 0,
+        "fade_on_trail_win": False,     # no fade on gold
+        "fade_stop_pts": 0,
+        "trail_min_move": 1.0,
+        "add_trigger": 9999,
+        "add_max": 0,                   # no scale-ins
+        "reverse_reentry": "always",    # not relevant (max_entries=1)
+        "skip_first_entry": False,      # not relevant (single entry)
+        "s1_open_hour": 13, "s1_open_minute": 0,
+        "session_end_hour": 21, "session_end_minute": 0,
+        "timezone": "Europe/London",
+        "scheduler_timezone": "Europe/London",
     },
 }
 

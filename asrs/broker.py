@@ -343,6 +343,9 @@ class IGBroker:
                     # First breach — start timer
                     self._stop_breach_since = _time.time()
                     logger.debug(f"Stop breach started ({self.epic}): {sm['direction']} stop={stop}")
+                    hit = False  # wait for confirmation on next tick — without this assignment,
+                                 # the `if hit:` check below raises UnboundLocalError
+                                 # (149 errors/day in tick callback before this fix).
                 elif (_time.time() - self._stop_breach_since) >= self.STOP_CONFIRM_SECS:
                     # Breach persisted for confirmation period — execute exit
                     logger.info(
@@ -456,6 +459,36 @@ class IGBroker:
         # Latency tracking
         import time as _time
         t_trigger = _time.time()
+
+        # SKIP no-arm path: bracket flagged as soft. Don't place an order;
+        # synthesize a trigger callback so strategy.py can update state
+        # (entries_used=1, first_direction). No round-trip cost paid.
+        if bracket.get("soft_arm"):
+            audit_log.trigger_fired(
+                signal=getattr(self, "_signal_name", self.epic),
+                epic=self.epic, direction=direction,
+                price=price, slippage=0.0,
+            )
+            logger.info(
+                f"[{self.epic}] SOFT-ARM trigger: {direction} @ {price:.1f} "
+                f"(no order placed — SKIP no-arm path)"
+            )
+            trigger_result = {
+                "direction": "LONG" if direction == "BUY" else "SHORT",
+                "fill_price": price,
+                "order_id": "",
+                "soft_arm": True,
+                "exec_latency_ms": 0,
+                "slippage_pts": 0,
+            }
+            for cb in self._on_trigger_callbacks:
+                try:
+                    await cb(trigger_result)
+                except Exception as e:
+                    logger.error(f"Trigger callback error (soft): {e}", exc_info=True)
+            self._tick_trigger_active = False
+            return
+
         try:
             await lock.acquire()
             # Pre-entry safety: no existing position (final safety net — tick path
@@ -542,16 +575,24 @@ class IGBroker:
 
     async def place_oca_bracket(
         self, buy_price: float, sell_price: float, qty: int, oca_group: str,
+        soft_arm: bool = False,
     ) -> dict:
         """
         Simulate OCA bracket. IG rejects working orders near market,
         so we store levels locally and trigger via _on_tick / check_trigger_levels.
+
+        soft_arm=True (used for SKIP-1st-entry no-arm path): when triggered,
+        DO NOT place market order — just notify strategy via callback so it can
+        update state (entries_used=1, first_direction). Saves the round-trip
+        spread cost (~£0.30-£1.75/skip) that the original SKIP path paid.
         """
         self._pending_bracket = {
             "buy_price": buy_price, "sell_price": sell_price,
             "qty": qty, "oca_group": oca_group, "active": True,
+            "soft_arm": soft_arm,
         }
-        logger.info(f"OCA bracket ({self.epic}): BUY@{buy_price} / SELL@{sell_price}")
+        suffix = " [soft-arm]" if soft_arm else ""
+        logger.info(f"OCA bracket ({self.epic}): BUY@{buy_price} / SELL@{sell_price}{suffix}")
         audit_log.arm_success(signal=getattr(self, "_signal_name", oca_group),
                               epic=self.epic, buy=buy_price, sell=sell_price, qty=qty)
         return {"buy_order_id": f"pending_buy_{oca_group}",
@@ -624,19 +665,33 @@ class IGBroker:
             "order_id": result.get("order_id", ""),
         }
 
-    async def place_market_order(self, action: str, qty: int) -> dict:
-        """Place a market order with disaster stop."""
+    async def place_market_order(self, action: str, qty: int,
+                                  guaranteed_stop: bool = False,
+                                  stop_distance_pts: float | None = None) -> dict:
+        """Place a market order with disaster stop.
+
+        guaranteed_stop=True + stop_distance_pts=N is used by fade orders to
+        place a SERVER-SIDE guaranteed stop at the actual fade stop level (50pt),
+        not the disaster_stop_pts (1000pt) which is too far to protect against
+        the fade's tight stop. Without this, May 4 US30_S2 fade slipped 15pt
+        past local stop fire (-£32 vs -£25 expected). With server-side GS at
+        50pt, IG executes exactly at level — no slippage possible.
+
+        Bracket entries call without stop_distance_pts → defaults to disaster_stop_pts
+        with guaranteed_stop=False (large 200-1000pt disaster stop, software trail).
+        """
         if not await self.ensure_connected():
             return {"error": "Not connected"}
         try:
             direction = "BUY" if action == "BUY" else "SELL"
+            stop_dist = stop_distance_pts if stop_distance_pts is not None else self._disaster_stop_pts
             result = await self._shared.rest_call(
                 self._shared.ig.create_open_position,
                 currency_code=self.currency, direction=direction,
                 epic=self.epic, expiry="DFB", force_open=True,
-                guaranteed_stop=True, level=None, limit_distance=None,
+                guaranteed_stop=guaranteed_stop, level=None, limit_distance=None,
                 limit_level=None, order_type="MARKET", quote_id=None,
-                size=qty, stop_distance=self._disaster_stop_pts, stop_level=None,
+                size=qty, stop_distance=stop_dist, stop_level=None,
                 trailing_stop=False, trailing_stop_increment=None,
             )
 
@@ -649,6 +704,10 @@ class IGBroker:
                 logger.error(
                     f"Order REJECTED: {reason} "
                     f"(consecutive errors: {self._consecutive_order_errors}/{self._max_consecutive_order_errors})"
+                )
+                # Log full IG response so future "UNKNOWN" rejections are diagnosable
+                logger.error(
+                    f"Full IG confirm response: {confirm}"
                 )
                 try:
                     from asrs.alerts import send as _tg_send
@@ -697,12 +756,20 @@ class IGBroker:
     async def place_stop_order(
         self, action: str, qty: int, stop_price: float,
     ) -> dict:
-        """Set or update stop on all open position deals."""
+        """Set or update stop on all open position deals.
+
+        Self-heal: if IG returns 'position.details.null.error' for a deal_id, it
+        means the position closed externally (server-side stop, manual close,
+        etc) and we never got the callback to prune it. Drop it from
+        _position_deal_ids so subsequent updates don't waste API calls and
+        so new positions on this epic don't carry phantom stops.
+        """
         if not await self.ensure_connected():
             return {"error": "Not connected"}
         try:
             if self._position_deal_ids:
                 updated = []
+                dead = []
                 for deal_id in list(self._position_deal_ids.keys()):
                     try:
                         await self._shared.rest_call(
@@ -711,7 +778,23 @@ class IGBroker:
                         )
                         updated.append(deal_id)
                     except Exception as e:
-                        logger.error(f"Stop set failed on {deal_id}: {e}")
+                        err = str(e)
+                        if "position.details.null" in err or "DEAL_NOT_FOUND" in err:
+                            dead.append(deal_id)
+                            logger.warning(
+                                f"Stop set: pruning stale deal {deal_id} ({self.epic}) "
+                                f"— position closed externally"
+                            )
+                        else:
+                            logger.error(f"Stop set failed on {deal_id}: {e}")
+                # Prune stale IDs so they don't keep failing on every trail update
+                for did in dead:
+                    self._position_deal_ids.pop(did, None)
+                if not self._position_deal_ids:
+                    # All deals were dead = epic is actually flat. Sync flags.
+                    self._local_in_position = False
+                    for sb in self._sibling_brokers:
+                        sb._local_in_position = False
                 if updated:
                     return {"order_id": f"stop_{updated[0]}"}
                 return {"error": "Failed to set stop on any deal"}
@@ -822,6 +905,10 @@ class IGBroker:
 
     async def close_position(self) -> bool:
         """Close all open positions for this epic."""
+        # Invalidate stale fills from prior trades — ALWAYS, before early returns.
+        # Bug fired 2026-05-07: stale fills from a winner 40min ago were used
+        # as fallback exit price for a later loser, recording a phantom win.
+        self._last_close_fills = []
         if not await self.ensure_connected():
             return False
         try:
@@ -832,6 +919,19 @@ class IGBroker:
             pos_list = (positions if isinstance(positions, list)
                         else positions.to_dict("records") if hasattr(positions, "to_dict")
                         else [])
+
+            # If IG shows zero positions on our epic but we still track deal IDs,
+            # they all closed externally without us pruning them. Prune everything
+            # — otherwise place_stop_order keeps hitting 'position.details.null.error'
+            # for dead IDs (saw 12 dead IDs at once on 2026-05-20 16:33).
+            live_epic_deals = {pos.get("dealId") for pos in pos_list if pos.get("epic") == self.epic}
+            if not live_epic_deals and self._position_deal_ids:
+                stale_count = len(self._position_deal_ids)
+                self._position_deal_ids.clear()
+                logger.warning(
+                    f"close_position ({self.epic}): pruned {stale_count} stale "
+                    f"deal IDs (IG shows no positions on epic)"
+                )
 
             closed = []
             fill_levels = []
@@ -924,6 +1024,62 @@ class IGBroker:
         except Exception as e:
             logger.error(f"get_position failed: {e}")
             return {"position": 0, "avg_cost": 0, "direction": "FLAT"}
+
+    async def get_recent_close_price(self, max_age_seconds: int = 300) -> float | None:
+        """
+        Query IG transaction history for the most recent close on this epic.
+        Used by fallback exit when bot's local stop monitor missed the close
+        callback (IG fired server-side stop before bot's tick monitor caught it).
+
+        Without this, fallback exit logs the bot's local trail level instead of
+        IG's actual fill price — under-reporting losses by 10-25pt per trade
+        when the disaster stop hits before the local trail can move down.
+        """
+        if not await self.ensure_connected():
+            return None
+        try:
+            from datetime import datetime, timedelta, timezone
+            now = datetime.now(timezone.utc)
+            from_dt = now - timedelta(seconds=max_age_seconds + 60)
+            from_iso = from_dt.strftime("%Y-%m-%dT%H:%M:%S")
+            df = await self._shared.rest_call(
+                self._shared.ig.fetch_transaction_history_by_type_and_period,
+                trans_type="ALL_DEAL",
+                period=f"{max_age_seconds + 60}S",
+            )
+            if df is None or len(df) == 0:
+                return None
+            # df has columns including: instrumentName, openLevel, closeLevel,
+            # date, dateUtc, transactionType, profitAndLoss, size, period
+            # We want the most recent close that matches our epic's instrument.
+            # IG's transaction history exposes instrumentName (e.g. "Germany 40")
+            # not epic, so we cache the name from connect.
+            inst_name = getattr(self, "_instrument_name", None)
+            if not inst_name:
+                try:
+                    market = await self._shared.rest_call(
+                        self._shared.ig.fetch_market_by_epic, self.epic
+                    )
+                    inst_name = market.get("instrument", {}).get("name")
+                    self._instrument_name = inst_name
+                except Exception:
+                    pass
+            rows = df.to_dict("records") if hasattr(df, "to_dict") else list(df)
+            # Sort by date DESC, take most recent matching row
+            for row in sorted(rows, key=lambda r: r.get("dateUtc") or r.get("date", ""), reverse=True):
+                if inst_name and row.get("instrumentName") != inst_name:
+                    continue
+                close_level = row.get("closeLevel")
+                if close_level in (None, "", "0"):
+                    continue
+                try:
+                    return float(close_level)
+                except (ValueError, TypeError):
+                    continue
+            return None
+        except Exception as e:
+            logger.error(f"get_recent_close_price failed ({self.epic}): {e}")
+            return None
 
     # -- Internal helpers -----------------------------------------------------
 

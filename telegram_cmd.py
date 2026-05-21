@@ -195,6 +195,11 @@ async def handle_status(dax_broker, **kwargs):
                 pos = "FLAT"
                 if state.direction:
                     pos = f"{state.direction} @ {state.entry_price}"
+                # Show fade position too — was previously invisible because state.direction
+                # tracks bracket only, not fade lifecycle
+                if getattr(state, "fade_active", False):
+                    fade_info = f"FADE {state.fade_direction} @ {state.fade_entry_price}"
+                    pos = f"{pos} | {fade_info}" if state.direction else fade_info
                 # P&L: in-memory trades first, fall back to journal DB
                 pnl_str = "N/A"
                 if state.trades:
@@ -246,7 +251,9 @@ async def handle_status(dax_broker, **kwargs):
 
 
 async def handle_positions(dax_broker, **kwargs):
-    """Show all open trades with entry, current price, stop, unrealised P&L."""
+    """Show all open trades with entry, current price, stop, unrealised P&L.
+    Includes BASE bracket trades AND active FADE trades (fade was previously
+    invisible because state.phase only tracks bracket lifecycle)."""
     lines = ["📈 <b>OPEN POSITIONS</b>\n━━━━━━━━━━━━━━━━━━━━━━"]
     found = False
 
@@ -255,28 +262,50 @@ async def handle_positions(dax_broker, **kwargs):
         from asrs.strategy import Phase
         for signal in ALL_SIGNALS:
             s = signal.state
-            if s.phase not in (Phase.LONG, Phase.SHORT):
-                continue
             price = await signal.broker.get_current_price()
-            unrealised = ""
-            if price:
-                if s.direction == "LONG":
-                    ur = round(price - s.entry_price, 1)
-                else:
-                    ur = round(s.entry_price - price, 1)
-                unrealised = f"{'+' if ur >= 0 else ''}{ur} pts"
 
-            add_max = signal.cfg.get("add_max", 2)
-            lines.append(
-                f"\n<b>{signal.name} {s.direction}</b>\n"
-                f"  Entry: {s.entry_price}\n"
-                f"  Current: {price or 'N/A'}\n"
-                f"  Stop: {s.trailing_stop}\n"
-                f"  Adds: {s.adds_used}/{add_max}\n"
-                f"  BE: {'Yes' if s.breakeven_hit else 'No'}\n"
-                f"  Unrealised: {unrealised or 'N/A'}"
-            )
-            found = True
+            # BASE bracket position (in LONG/SHORT phase)
+            if s.phase in (Phase.LONG, Phase.SHORT):
+                unrealised = ""
+                if price:
+                    if s.direction == "LONG":
+                        ur = round(price - s.entry_price, 1)
+                    else:
+                        ur = round(s.entry_price - price, 1)
+                    unrealised = f"{'+' if ur >= 0 else ''}{ur} pts"
+                add_max = signal.cfg.get("add_max", 2)
+                lines.append(
+                    f"\n<b>{signal.name} {s.direction}</b> [BRACKET]\n"
+                    f"  Entry: {s.entry_price}\n"
+                    f"  Current: {price or 'N/A'}\n"
+                    f"  Stop: {s.trailing_stop}\n"
+                    f"  Adds: {s.adds_used}/{add_max}\n"
+                    f"  BE: {'Yes' if s.breakeven_hit else 'No'}\n"
+                    f"  Unrealised: {unrealised or 'N/A'}"
+                )
+                found = True
+
+            # FADE position (separate from bracket lifecycle)
+            if getattr(s, "fade_active", False):
+                fd = s.fade_direction
+                fe = s.fade_entry_price
+                f_unrealised = ""
+                if price and fd:
+                    if fd == "LONG":
+                        ur = round(price - fe, 1)
+                    else:
+                        ur = round(fe - price, 1)
+                    f_unrealised = f"{'+' if ur >= 0 else ''}{ur} pts"
+                lines.append(
+                    f"\n<b>{signal.name} {fd}</b> [FADE]\n"
+                    f"  Entry: {fe}\n"
+                    f"  Current: {price or 'N/A'}\n"
+                    f"  Stop: {s.fade_stop_level}\n"
+                    f"  Target: {s.fade_target_level}\n"
+                    f"  Target hit: {'Yes' if getattr(s, 'fade_target_hit', False) else 'No'}\n"
+                    f"  Unrealised: {f_unrealised or 'N/A'}"
+                )
+                found = True
     except Exception as e:
         lines.append(f"\nError: {e}")
 
@@ -723,7 +752,8 @@ async def handle_pnl():
         day_trades = 0
         day_wins = 0
 
-        for inst in ["DAX", "US30", "NIKKEI"]:
+        # NIKKEI dropped 2026-05-03; XAUUSD added 2026-05-06
+        for inst in ["DAX", "US30", "XAUUSD"]:
             inst_trades = journal_db.get_trades_for_date(today, instrument=inst)
             if inst_trades:
                 inst_pnl = sum(t.get("pnl_pts", 0) for t in inst_trades)

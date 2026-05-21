@@ -75,14 +75,16 @@ def _journal_sum(since_date: str | None = None) -> float:
     try:
         from shared.journal_db import _get_conn
         conn = _get_conn()
+        # Filter by mode='live' so replay/backtest (paper) trades can't poison
+        # the equity calc when they share the journal DB.
         if since_date:
             row = conn.execute(
-                "SELECT COALESCE(SUM(pnl_gbp),0) FROM trades WHERE date >= ?",
+                "SELECT COALESCE(SUM(pnl_gbp),0) FROM trades WHERE date >= ? AND mode='live'",
                 (since_date,),
             ).fetchone()
         else:
             row = conn.execute(
-                "SELECT COALESCE(SUM(pnl_gbp),0) FROM trades"
+                "SELECT COALESCE(SUM(pnl_gbp),0) FROM trades WHERE mode='live'"
             ).fetchone()
         return float(row[0] or 0)
     except Exception as e:
@@ -90,8 +92,48 @@ def _journal_sum(since_date: str | None = None) -> float:
         return 0.0
 
 
+# IG-direct equity cache. Refreshed at most once per 60s to avoid rate limits.
+_ig_equity_cache: dict = {"value": None, "ts": 0.0}
+
+
+def _fetch_ig_equity() -> float | None:
+    """Query IG /accounts directly for the live preferred-account balance.
+    Returns None on any failure (caller falls back to journal-based calc).
+    Cached for 60s."""
+    import time as _time
+    now = _time.time()
+    if _ig_equity_cache["value"] is not None and (now - _ig_equity_cache["ts"]) < 60:
+        return _ig_equity_cache["value"]
+    try:
+        # Use the bot's existing IG session if available — avoids creating
+        # parallel sessions which would burn through the IG concurrent-session limit.
+        from shared.ig_session import IGSharedSession
+        sess = IGSharedSession.get_instance()
+        if sess is None or not getattr(sess, "ig", None):
+            return None
+        acct = sess.ig.fetch_accounts()
+        if hasattr(acct, "iloc"):
+            for _, a in acct.iterrows():
+                if a.get("preferred"):
+                    bal = float(a.get("balance", 0))
+                    _ig_equity_cache.update({"value": bal, "ts": now})
+                    return bal
+    except Exception as e:
+        logger.warning(f"IG equity query failed, falling back to journal: {e}")
+    return None
+
+
 def current_equity_gbp() -> float:
-    """STARTING_EQUITY + cumulative realised P&L from journal (since start_date if set)."""
+    """Live IG balance if available (preferred), else journal-based fallback.
+
+    Apr 28 2026 change: query IG /accounts directly via cached call. Eliminates
+    journal-vs-IG drift from accumulated slippage/fees + any phantom journal
+    entries (e.g. id=130 stake error). Falls back to journal sum on IG failure.
+    """
+    ig_balance = _fetch_ig_equity()
+    if ig_balance is not None and ig_balance > 0:
+        return ig_balance
+    # Fallback: starting equity + journal sum (unchanged legacy logic)
     return CFG.starting_equity_gbp + _journal_sum(CFG.start_date or None)
 
 

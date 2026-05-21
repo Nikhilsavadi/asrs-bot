@@ -789,6 +789,8 @@ class IBBroker:
 
     async def close_position(self) -> bool:
         """Close all open positions for this contract at market."""
+        # Invalidate stale fills from prior trades — see broker.py for full bug context (2026-05-07).
+        self._last_close_fills = []
         if not await self.ensure_connected():
             return False
         if self.contract is None:

@@ -91,6 +91,7 @@ class SignalState:
     fade_deal_id:      str = ""
     fade_entry_time:   str = ""
     fade_target_hit:   bool = False    # once target hit, switch to trailing (TRAIL_TARGET mode)
+    fade_max_favourable: float = 0.0   # MFE for milestone-lock floor (20/5 fade ship May 2)
     fade_trades:       list = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -149,8 +150,11 @@ class Signal:
         # instead of waiting up to 60s for monitor_cycle.
         self._rearm_pending = False
         self.broker.register_tick_rearm_callback(self._on_tick_rearm)
-        self._state_dir = os.path.join(
-            os.path.dirname(__file__), "..", "data", "state"
+        # Allow override via env var (used by replay scripts to avoid
+        # contaminating live bot state via docker bind mount).
+        self._state_dir = os.environ.get(
+            "ASRS_STATE_DIR",
+            os.path.join(os.path.dirname(__file__), "..", "data", "state"),
         )
         os.makedirs(self._state_dir, exist_ok=True)
 
@@ -224,6 +228,16 @@ class Signal:
             logger.error(f"[{self.name}] State load error: {e}")
         self.state = SignalState(date=today)
         self._bar4_triggered = False
+        # Clear bar caches ONCE per day rollover, not every call. load_state
+        # gets called multiple times in a morning_routine flow (boot, bar 4
+        # callback, _morning_routine_inner, re-arm, etc) — clearing on every
+        # call would erase today's bar 4 that was just freshly populated by
+        # the callback's pre-lock cache write (line 264-272).
+        last_clear = getattr(self, '_cache_clear_date', None)
+        if last_clear != today:
+            self._bar_cache = {}
+            self._bar4_from_callback = None
+            self._cache_clear_date = today
 
     # -- Bar numbering --------------------------------------------------------
 
@@ -709,11 +723,22 @@ class Signal:
                           f"locked to {self.state.first_direction}")
                 logger.info(f"[{self.name}] Reverse-reentry blocked: {reason}")
 
+        # SKIP no-arm: when configured + this is the 1st entry, arm a SOFT
+        # bracket — broker tracks levels but won't place an actual order on
+        # trigger. Strategy still gets the callback (with soft_arm flag) and
+        # updates state to entries_used=1 + first_direction, then re-arms
+        # normally for entries 2/3. Eliminates the round-trip spread cost
+        # (~£0.30-£1.75/skip) that the original SKIP-then-close path paid.
+        soft_arm = (
+            self.state.entries_used == 0
+            and self.cfg.get("skip_first_entry", False)
+        )
         result = await self.broker.place_oca_bracket(
             buy_price=buy_px,
             sell_price=sell_px,
             qty=qty,
             oca_group=f"ASRS_{self.name}_{self.state.date}_{self.state.entries_used + 1}",
+            soft_arm=soft_arm,
         )
         if "error" in result:
             from asrs import audit_log
@@ -761,6 +786,71 @@ class Signal:
         direction = trigger["direction"]    # "LONG" or "SHORT"
         fill_price = trigger["fill_price"]
         deal_id = trigger.get("order_id", "")
+
+        # SKIP no-arm path: bracket was soft-armed, broker did not place an order.
+        # Just record state for re-entry. No close needed, no spread cost paid.
+        if trigger.get("soft_arm"):
+            logger.info(
+                f"[{self.name}] 1st entry SKIPPED (no-arm) @ {fill_price:.1f}. "
+                f"Direction would have been {direction}."
+            )
+            self.state.entries_used = 1
+            self.state.first_direction = direction
+            self.state.phase = Phase.LEVELS_SET
+            self.save_state()
+            await self.alert(
+                f"[{self.name}] 1st SKIPPED ({direction}) @ {fill_price:.1f} "
+                f"[no-arm — no spread cost]\n"
+                f"Waiting for re-entry pattern."
+            )
+            # Clear _rearm_pending so the existing tick-level re-entry gate
+            # (_on_tick_rearm) fires on the next tick when mid is back inside
+            # the range. That's what arms entry #2 with reverse-reentry filter.
+            self._rearm_pending = False
+            return
+
+        # SKIP 1st entry — DEFENSIVE FALLBACK (legacy path).
+        # If we ever get here with entries_used==0 + skip_first_entry, it means
+        # broker placed a real order despite skip config (race condition or bug).
+        # Close the orphan position to avoid bleed.
+        if (self.state.entries_used == 0
+                and self.cfg.get("skip_first_entry", False)):
+            logger.info(
+                f"[{self.name}] 1st entry SKIPPED (skip_first_entry=True). "
+                f"Direction would have been {direction}."
+            )
+            # CRITICAL: by the time we get here, IG's server-side OCA has ALREADY
+            # filled the order. We must close the position immediately, not just
+            # bail out — bailing leaves an orphan tracked only by IG's disaster stop.
+            # First learned 2026-04-28 13:25 BST when DAX_S2 SKIP left orphan SHORT.
+            close_ok = False
+            try:
+                close_ok = await self.broker.close_position()
+                logger.info(f"[{self.name}] SKIP: closed IG position (result={close_ok})")
+            except Exception as _e:
+                logger.error(f"[{self.name}] SKIP close_position FAILED: {_e}", exc_info=True)
+            # Cancel residual OCA orders (the unfilled side of the bracket)
+            try:
+                await self.broker.cancel_all_orders()
+            except Exception as _e:
+                logger.warning(f"[{self.name}] cancel_all_orders on skip failed: {_e}")
+            # Deactivate bracket monitor (sync method — DO NOT await)
+            try:
+                self.broker.deactivate_bracket(reason="skip_first_entry")
+            except Exception as _e:
+                logger.warning(f"[{self.name}] deactivate_bracket on skip failed: {_e}")
+            # Mark 1st as consumed; wait for re-entry pattern
+            self.state.entries_used = 1
+            self.state.first_direction = direction
+            self.state.phase = Phase.LEVELS_SET
+            self.save_state()
+            await self.alert(
+                f"[{self.name}] 1st entry SKIPPED ({direction}) @ {fill_price}\n"
+                f"  skip_first_entry=True (always-skip mode)\n"
+                f"  Position {'CLOSED ✓' if close_ok else 'CLOSE FAILED ⚠️ — check IG manually'}\n"
+                f"  Waiting for re-entry pattern."
+            )
+            return
 
         logger.info(f"[{self.name}] Tick trigger: {direction} @ {fill_price}")
 
@@ -816,6 +906,10 @@ class Signal:
 
     def _process_fill(self, direction: str, fill_price: float, deal_id: str = "", trigger: dict | None = None):
         """Update state for a new entry fill."""
+        # Clear any stale close fills from previous trades — defence against the
+        # 2026-05-07 stale-fill bug where a fallback exit grabbed a 40-min-old fill.
+        if hasattr(self.broker, "_last_close_fills"):
+            self.broker._last_close_fills = []
         self.state.direction = direction
         self.state.entry_price = fill_price
         self.state.entries_used += 1
@@ -982,12 +1076,29 @@ class Signal:
                 return  # callback handled it — actual fill captured properly
 
             # Callback didn't fire — fallback. Use actual fill from broker if available.
+            # Priority: (1) bot's _last_close_fills (set if bot initiated close),
+            # (2) IG transaction history (set if IG closed server-side and bot missed it),
+            # (3) bot's local trail level as last resort (always wrong by ≥10pt
+            # when initial stop hit, but better than nothing).
             logger.warning(
                 f"[{self.name}] Position FLAT but callback didn't fire — fallback exit"
             )
             intended = self.state.trailing_stop
             fills = getattr(self.broker, "_last_close_fills", [])
-            actual = (sum(fills) / len(fills)) if fills else intended
+            if fills:
+                actual = sum(fills) / len(fills)
+                logger.info(f"[{self.name}] fallback fill from _last_close_fills: {actual:.1f}")
+            else:
+                ig_close = await self.broker.get_recent_close_price(max_age_seconds=300)
+                if ig_close is not None:
+                    actual = ig_close
+                    logger.info(f"[{self.name}] fallback fill from IG transaction history: {actual:.1f}")
+                else:
+                    actual = intended
+                    logger.warning(
+                        f"[{self.name}] fallback fill UNAVAILABLE from broker AND IG — "
+                        f"using local trail level {intended:.1f} (LIKELY UNDER-REPORTS LOSS)"
+                    )
             await self._process_exit(actual, exit_intended=intended)
             return
 
@@ -1025,17 +1136,20 @@ class Signal:
             )
 
         # R14 + R15: Candle trail
-        await self._update_candle_trail()
+        await self._update_candle_trail(current_price=price)
 
         # R16: Add to winners
         await self._check_add(price)
 
         self.save_state()
 
-    async def _update_candle_trail(self):
+    async def _update_candle_trail(self, current_price: float | None = None):
         """
         R14: Ratchet stop to previous bar's low (LONG) or high (SHORT).
         R15: Switch to previous bar's CLOSE when profit >= tight_threshold.
+
+        current_price is passed by the tick handler. If absent (older callers),
+        the side-of-price sanity check is skipped.
         """
         df = self.broker.get_streaming_bars_df()
         if df is None or df.empty:
@@ -1059,6 +1173,10 @@ class Signal:
         # 18yr PF 2.28 → 2.43 (+£39k / 8.7% lift). Acts as a floor under the trail.
         m_target = float(self.cfg.get("milestone_lock_pts", 0))
         m_giveback = float(self.cfg.get("milestone_giveback_pts", 10))
+        # Side-of-price sanity check uses current_price passed by the tick handler.
+        # If a re-entry happens after a rebound, prev_close can be on the wrong side
+        # of price (e.g. SHORT entry at 49782 with prev_close 49721) — IG will then
+        # reject or constrain the stop server-side, producing REDUCED_STOP exits.
         if self.state.direction == "LONG":
             if trail_close_always:
                 new_stop = prev_close  # Variant B
@@ -1066,6 +1184,9 @@ class Signal:
                 profit = prev_close - self.state.entry_price
                 use_tight = profit >= self.cfg["tight_threshold"]  # R15
                 new_stop = prev_close if use_tight else prev_low   # R14
+            # Refuse a stop that's on the profit side of current price (LONG: above).
+            if current_price is not None and new_stop >= current_price:
+                new_stop = self.state.trailing_stop
             if new_stop > self.state.trailing_stop:
                 self.state.trailing_stop = round(new_stop, 1)
             # Milestone floor
@@ -1082,6 +1203,9 @@ class Signal:
                 profit = self.state.entry_price - prev_close
                 use_tight = profit >= self.cfg["tight_threshold"]
                 new_stop = prev_close if use_tight else prev_high
+            # Refuse a stop that's on the profit side of current price (SHORT: below).
+            if current_price is not None and new_stop <= current_price:
+                new_stop = self.state.trailing_stop
             if new_stop < self.state.trailing_stop:
                 self.state.trailing_stop = round(new_stop, 1)
             # Milestone floor
@@ -1104,8 +1228,14 @@ class Signal:
                     label = "TIGHT" if (self.state.direction == "LONG" and prev_close - self.state.entry_price >= self.cfg["tight_threshold"]) or \
                                        (self.state.direction == "SHORT" and self.state.entry_price - prev_close >= self.cfg["tight_threshold"]) else "TRAIL"
                 # Before breakeven: show risk reduction. After: show locked profit.
+                # Also flip to "Locked" if the stop has crossed entry into profit
+                # territory (catches re-entries where breakeven_hit hasn't flipped yet).
                 risk_pts = abs(self.state.trailing_stop - self.state.entry_price)
-                if self.state.breakeven_hit:
+                crossed_into_profit = (
+                    (self.state.direction == "LONG" and self.state.trailing_stop > self.state.entry_price)
+                    or (self.state.direction == "SHORT" and self.state.trailing_stop < self.state.entry_price)
+                )
+                if self.state.breakeven_hit or crossed_into_profit:
                     risk_line = f"Locked: {risk_pts:.1f}pts"
                 else:
                     old_risk = abs(old_stop - self.state.entry_price)
@@ -1322,7 +1452,16 @@ class Signal:
         qty = float(getattr(self.state, "stake_per_point", 0.5))
         if qty < 0.5:
             qty = 0.5  # IG minimum for indices
-        result = await self.broker.place_market_order(action=action, qty=qty)
+        # GS=True + stop_distance_pts=fade_stop_pts: server-side GS at the
+        # actual fade stop level (50pt), not disaster_stop (1000pt). Eliminates
+        # slippage entirely — IG executes at exactly the level. May 4 incident
+        # showed our prior implementation (GS=True at disaster distance) didn't
+        # protect against software-trail slippage.
+        fade_stop_pts = float(self.cfg.get("fade_stop_pts", 50.0))
+        result = await self.broker.place_market_order(
+            action=action, qty=qty, guaranteed_stop=True,
+            stop_distance_pts=fade_stop_pts,
+        )
         if "error" in result:
             logger.error(f"[{self.name}] FADE order failed: {result['error']}")
             return
@@ -1361,9 +1500,11 @@ class Signal:
         """
         Check fade stop/target on each monitor cycle. Close if hit.
 
-        TRAIL_TARGET mode (18yr backtest: +5% vs FIXED_TARGET):
-          - Pre-target: exit on target hit OR stop hit (same as fixed)
-          - Post-target: stop trails prev_close — captures continued reversal
+        Milestone 20/5 applies in BOTH phases — once MFE crosses 20pt, enforce
+        floor at (entry ± (MFE - 5)) regardless of whether target was hit.
+        Fix May 5 — DAX_S1 fade had MFE 35pt without target hit (target was 96pt
+        away), reversed all the way to stop = -£26 loss. Pre-fix milestone only
+        applied in Phase 2 (after target hit). Now applies whenever MFE ≥ 20.
         """
         if not self.state.fade_active:
             return
@@ -1372,9 +1513,21 @@ class Signal:
 
         ig_pos = await self.broker.get_position()
         if ig_pos["direction"] == "FLAT":
-            logger.warning(f"[{self.name}] FADE position FLAT on broker — clearing state")
-            price = await self.broker.get_current_price()
-            await self._close_fade(price or self.state.fade_entry_price, "UNKNOWN")
+            # Position closed by something else (server-side GS, manual, IG event).
+            # Query IG transaction history for actual close price — local market
+            # price is wrong (off by ticks-to-seconds depending on monitor delay).
+            logger.warning(f"[{self.name}] FADE position FLAT on broker — querying IG for actual close")
+            ig_close = await self.broker.get_recent_close_price(max_age_seconds=300)
+            if ig_close is not None:
+                logger.info(f"[{self.name}] FADE close from IG history: {ig_close:.1f}")
+                await self._close_fade(ig_close, "UNKNOWN")
+            else:
+                price = await self.broker.get_current_price()
+                logger.warning(
+                    f"[{self.name}] FADE close UNAVAILABLE from IG history — "
+                    f"fallback to current market {price} (may misreport actual fill)"
+                )
+                await self._close_fade(price or self.state.fade_entry_price, "UNKNOWN")
             return
 
         price = await self.broker.get_current_price()
@@ -1385,6 +1538,32 @@ class Signal:
         target = self.state.fade_target_level
         stop = self.state.fade_stop_level
         target_hit = self.state.fade_target_hit
+        entry = self.state.fade_entry_price
+
+        # ── MFE tracking + milestone-lock — applies in BOTH phases ─────────
+        # MFE updated every tick. Once ≥ milestone_lock_pts, enforce floor at
+        # (entry ± (MFE - giveback)) so favorable excursion isn't given back.
+        if fade_dir == "LONG":
+            cur_profit = price - entry
+        else:
+            cur_profit = entry - price
+        if cur_profit > self.state.fade_max_favourable:
+            self.state.fade_max_favourable = round(cur_profit, 1)
+
+        m_target = float(self.cfg.get("milestone_lock_pts", 0))
+        m_giveback = float(self.cfg.get("milestone_giveback_pts", 10))
+        if m_target > 0 and self.state.fade_max_favourable >= m_target:
+            mfe = self.state.fade_max_favourable
+            if fade_dir == "LONG":
+                floor = entry + (mfe - m_giveback)
+                if floor > stop:
+                    self.state.fade_stop_level = round(floor, 1)
+                    stop = self.state.fade_stop_level
+            else:
+                floor = entry - (mfe - m_giveback)
+                if floor < stop:
+                    self.state.fade_stop_level = round(floor, 1)
+                    stop = self.state.fade_stop_level
 
         # Phase 1: before target hit — detect target OR stop
         if not target_hit:
@@ -1393,27 +1572,28 @@ class Signal:
             hit_stop = (fade_dir == "LONG" and price <= stop) or \
                        (fade_dir == "SHORT" and price >= stop)
             if at_target:
-                # Switch to trailing mode — don't exit yet
                 self.state.fade_target_hit = True
-                # Tighten stop: move to breakeven + small buffer
-                if fade_dir == "LONG":
-                    new_stop = self.state.fade_entry_price
-                else:
-                    new_stop = self.state.fade_entry_price
-                self.state.fade_stop_level = new_stop
+                new_stop = self.state.fade_entry_price
+                # Only tighten BE move if it improves on milestone-locked stop
+                if fade_dir == "LONG" and new_stop > stop:
+                    self.state.fade_stop_level = new_stop
+                elif fade_dir == "SHORT" and new_stop < stop:
+                    self.state.fade_stop_level = new_stop
                 self.save_state()
                 await self.alert(
                     f"[{self.name}] FADE target hit — switching to TRAIL\n"
-                    f"Stop moved to BE: {new_stop:.1f}"
+                    f"Stop: {self.state.fade_stop_level:.1f}"
                 )
-                logger.info(f"[{self.name}] FADE target hit @ {price:.1f}, trailing from BE")
+                logger.info(f"[{self.name}] FADE target hit @ {price:.1f}, trailing from BE/milestone")
                 return
             if hit_stop:
+                self.save_state()
                 await self._close_fade(price, "STOP")
+                return
+            self.save_state()
             return
 
-        # Phase 2: after target hit — trail prev_close
-        # Get last completed 5-min bar
+        # Phase 2: after target hit — also trail prev_close (in addition to milestone)
         df = self.broker.get_streaming_bars_df()
         if df is not None and not df.empty:
             today = datetime.now(self.tz).date()
@@ -1423,13 +1603,11 @@ class Signal:
                 if fade_dir == "LONG":
                     if prev_close > stop:
                         self.state.fade_stop_level = round(prev_close, 1)
-                        self.save_state()
                 else:
                     if prev_close < stop:
                         self.state.fade_stop_level = round(prev_close, 1)
-                        self.save_state()
+        self.save_state()
 
-        # Check updated stop
         stop = self.state.fade_stop_level
         hit_stop = (fade_dir == "LONG" and price <= stop) or \
                    (fade_dir == "SHORT" and price >= stop)
@@ -1470,6 +1648,9 @@ class Signal:
             "exit_reason": f"FADE_{reason}",
             "target_level": self.state.fade_target_level,
             "stop_level": self.state.fade_stop_level,
+            # Carry through actual stake so journal's pnl_gbp = pnl_pts * stake
+            # (was defaulting to 1.0, overstating fade pnl_gbp by 2x at £0.5 stake)
+            "stake_per_point": getattr(self.state, "stake_per_point", 0.5),
         }
         self.state.fade_trades.append(fade_trade)
 
@@ -1569,20 +1750,33 @@ class Signal:
             await self.broker.cancel_all_orders()
             self.state.phase = Phase.DONE
             self.save_state()
-            await self.alert(f"[{self.name}] EOD: bracket cancelled, no fill today")
+            # Only alert "bracket cancelled" if NO trades happened today.
+            # Otherwise it contradicts the day summary that follows.
+            had_trades = bool(self.state.trades) or bool(getattr(self.state, "fade_trades", []))
+            if not had_trades:
+                await self.alert(f"[{self.name}] EOD: bracket cancelled, no fill today")
+            else:
+                await self.alert(f"[{self.name}] EOD: bracket cancelled (no further fill); day summary follows")
 
         elif self.state.phase in (Phase.IDLE, Phase.LEVELS_SET):
             self.state.phase = Phase.DONE
             self.save_state()
 
-        # Day summary
-        total_pnl = sum(t.get("pnl_pts", 0) for t in self.state.trades)
-        n_trades = len([t for t in self.state.trades if "exit" in t])
-        if n_trades > 0:
-            await self.alert(
-                f"<b>{self.name} DAY SUMMARY</b>\n"
-                f"Trades: {n_trades} | P&L: {total_pnl:+.1f}pts"
-            )
+        # Day summary — includes BRACKET trades AND FADE trades
+        bracket_trades = [t for t in self.state.trades if "exit" in t]
+        fade_trades = [t for t in getattr(self.state, "fade_trades", []) if "exit" in t]
+        bracket_pnl = sum(t.get("pnl_pts", 0) for t in bracket_trades)
+        fade_pnl = sum(t.get("pnl_pts", 0) for t in fade_trades)
+        total_pnl = bracket_pnl + fade_pnl
+        n_total = len(bracket_trades) + len(fade_trades)
+        if n_total > 0:
+            lines = [f"<b>{self.name} DAY SUMMARY</b>"]
+            if bracket_trades:
+                lines.append(f"Bracket: {len(bracket_trades)} | {bracket_pnl:+.1f}pts")
+            if fade_trades:
+                lines.append(f"Fade:    {len(fade_trades)} | {fade_pnl:+.1f}pts")
+            lines.append(f"<b>Total:</b> {n_total} trades | <b>{total_pnl:+.1f}pts</b>")
+            await self.alert("\n".join(lines))
 
         # Reset for tomorrow
         self._bar4_triggered = False

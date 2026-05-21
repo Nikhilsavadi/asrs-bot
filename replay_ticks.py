@@ -29,6 +29,11 @@ sys.path.insert(0, os.path.dirname(__file__))
 from asrs.strategy import Signal, Phase
 from asrs import config
 
+# Bypass risk gate in replay (it reads live journal DB and blocks trigger
+# if live has hit daily limit — irrelevant for a clean backtest).
+from asrs import risk_gate as _rg
+_rg.check_entry_allowed = lambda *_a, **_kw: (True, "")
+
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %(name)s -- %(message)s")
 # Show strategy INFO for trade signals
 logging.getLogger("asrs.strategy").setLevel(logging.INFO)
@@ -98,7 +103,8 @@ class ReplayBroker:
     async def get_position(self):
         return dict(self._position)
 
-    async def place_market_order(self, action, qty):
+    async def place_market_order(self, action, qty, guaranteed_stop=False, stop_distance_pts=None):
+        # guaranteed_stop + stop_distance_pts ignored in replay (no real broker)
         fill = self._ofr if action == "BUY" else self._bid
         direction = "BUY" if action == "BUY" else "SELL"
         self._position = {"direction": direction, "avg_cost": fill, "size": qty}
@@ -112,10 +118,12 @@ class ReplayBroker:
         self._position_deal_ids.clear()
         return True
 
-    async def place_oca_bracket(self, buy_price, sell_price, qty, oca_group):
+    async def place_oca_bracket(self, buy_price, sell_price, qty, oca_group,
+                                  soft_arm=False):
         self._pending_bracket = {
             "buy_price": buy_price, "sell_price": sell_price,
             "qty": qty, "active": True, "oca_group": oca_group,
+            "soft_arm": soft_arm,
         }
         return {"buy_id": "REPLAY_BUY", "sell_id": "REPLAY_SELL"}
 
@@ -205,10 +213,15 @@ async def replay_session(inst_name, sn, cfg, ticks_df, date_str):
 
     signal = Signal(inst_name, sn, broker, None, alert)
     signal._replay_date = date.fromisoformat(date_str)
+    # Register trigger callback (live main.py does this — was missing in replay).
+    # Without this, broker._on_trigger_callbacks is empty and tick triggers
+    # never invoke the Signal's on_tick_trigger → state.trades stays empty.
+    broker.register_trigger_callback(signal.on_tick_trigger)
 
     # Process ticks with proper async task scheduling
     pending_tasks = []
-    YIELD_EVERY = 200  # yield to event loop every N ticks
+    YIELD_EVERY = 10  # yield to event loop every N ticks (was 200 — too slow for
+                       # morning_routine to complete before bar 5, missing triggers)
 
     for i, (_, tick) in enumerate(session_ticks.iterrows()):
         bid, ofr, mid_p = float(tick["bid"]), float(tick["ofr"]), float(tick["mid"])
@@ -222,15 +235,13 @@ async def replay_session(inst_name, sn, cfg, ticks_df, date_str):
             task = asyncio.create_task(signal.on_bar_complete(completed_bar))
             pending_tasks.append(task)
 
-            # After BAR 5: wait for all pending tasks to complete.
-            # This lets the bar 4 task (morning_routine waiting for bar 5 event)
-            # and bar 5 task (which sets the event) resolve together.
-            # Then bracket is armed before we process trading ticks.
+            # Gather pending tasks at bar 4 AND bar 5 so morning_routine
+            # completes (and bracket arms) BEFORE processing the next tick.
+            # Otherwise the 2-sec sleep in on_bar_complete lets the main
+            # loop race past bar 5 ticks without an armed bracket → no entries.
             bn = signal._bar_number(completed_bar["time"])
-            if bn >= 5:
-                # Brief yield so bar 5 task can set the event
+            if bn >= 4:
                 await asyncio.sleep(0.1)
-                # Gather all — bar 4 + bar 5 tasks complete together
                 if pending_tasks:
                     await asyncio.gather(*pending_tasks, return_exceptions=True)
                     pending_tasks.clear()
@@ -279,6 +290,22 @@ async def replay_session(inst_name, sn, cfg, ticks_df, date_str):
                     if triggered_dir:
                         broker._tick_trigger_active = True
                         bracket["active"] = False
+                        # SKIP no-arm path: don't place order, just notify
+                        if bracket.get("soft_arm"):
+                            trigger_price = ofr if triggered_dir == "BUY" else bid
+                            trigger_result = {
+                                "direction": "LONG" if triggered_dir == "BUY" else "SHORT",
+                                "fill_price": trigger_price,
+                                "order_id": "",
+                                "soft_arm": True,
+                                "trigger_bid": bid,
+                                "trigger_ofr": ofr,
+                                "trigger_spread": round(spread, 2),
+                            }
+                            for cb in broker._on_trigger_callbacks:
+                                await cb(trigger_result)
+                            broker._tick_trigger_active = False
+                            continue
                         lock = broker._get_entry_lock(broker.epic)
                         try:
                             await lock.acquire()
