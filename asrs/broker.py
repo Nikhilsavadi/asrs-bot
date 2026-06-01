@@ -1038,14 +1038,20 @@ class IGBroker:
         if not await self.ensure_connected():
             return None
         try:
-            from datetime import datetime, timedelta, timezone
-            now = datetime.now(timezone.utc)
-            from_dt = now - timedelta(seconds=max_age_seconds + 60)
-            from_iso = from_dt.strftime("%Y-%m-%dT%H:%M:%S")
+            # fetch_transaction_history_by_type_and_period takes positional
+            # (milliseconds, trans_type) — NOT a `period=` kwarg. The old call
+            # passed period=... and threw on every invocation (since ~2026-05-28),
+            # so this fallback silently logged the local trail level instead of
+            # the real IG fill, over-crediting DAX P&L (caught by the 2026-06-01
+            # IG reconcile: DAX journal +£30 vs IG −£9.55). The relative-period
+            # endpoint is the right tool here ("deals in the last N ms"): no
+            # datetime/timezone parsing, and it returns instrumentName +
+            # closeLevel (verified). Tight window keeps us from picking up a
+            # stale close from a prior trade.
             df = await self._shared.rest_call(
                 self._shared.ig.fetch_transaction_history_by_type_and_period,
-                trans_type="ALL_DEAL",
-                period=f"{max_age_seconds + 60}S",
+                (max_age_seconds + 60) * 1000,  # milliseconds (positional)
+                "ALL_DEAL",                      # trans_type (positional)
             )
             if df is None or len(df) == 0:
                 return None
