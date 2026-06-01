@@ -166,7 +166,7 @@ class IGSharedSession:
 
         # REST dead — trigger full reconnect (includes stream resubscribe via callbacks)
         logger.warning("Keepalive: session expired, reconnecting...")
-        return await self.ensure_connected()
+        return await self.ensure_connected(force_stream=True)
 
     async def check_stream_health(self, stream_mgr, epic: str) -> bool:
         """Check if Lightstreamer is delivering ticks AND bars. Resubscribe if stale.
@@ -202,7 +202,7 @@ class IGSharedSession:
                 f"— escalating to full reconnect"
             )
             self._resub_attempts = 0
-            return await self.ensure_connected()
+            return await self.ensure_connected(force_stream=True)
 
         # Check if Lightstreamer client is still connected
         if self.stream and self.stream.ls_client:
@@ -212,16 +212,16 @@ class IGSharedSession:
                 if "DISCONNECTED" in str(status).upper():
                     logger.warning("Lightstreamer disconnected — full reconnect needed")
                     self._resub_attempts = 0
-                    return await self.ensure_connected()
+                    return await self.ensure_connected(force_stream=True)
             except Exception as e:
                 logger.warning(f"Lightstreamer status check failed: {e}")
                 self._resub_attempts = 0
-                return await self.ensure_connected()
+                return await self.ensure_connected(force_stream=True)
         else:
             # No LS client at all — must do full reconnect
             logger.warning("No Lightstreamer client — full reconnect needed")
             self._resub_attempts = 0
-            return await self.ensure_connected()
+            return await self.ensure_connected(force_stream=True)
 
         # LS client exists but ticks stale — try resubscribe only
         try:
@@ -233,16 +233,33 @@ class IGSharedSession:
         except Exception as e:
             logger.error(f"Stream resubscribe failed: {e}")
             self._resub_attempts = 0
-            return await self.ensure_connected()
+            return await self.ensure_connected(force_stream=True)
 
-    async def ensure_connected(self) -> bool:
-        """Validate session, reconnect if expired. Thread-safe via lock."""
+    def _stream_dead(self) -> bool:
+        """True if the Lightstreamer client is missing or not connected."""
+        if not self.stream or not getattr(self.stream, "ls_client", None):
+            return True
+        try:
+            return "DISCONNECTED" in str(self.stream.ls_client.getStatus()).upper()
+        except Exception:
+            return True
+
+    async def ensure_connected(self, force_stream: bool = False) -> bool:
+        """Validate session, reconnect if expired. Thread-safe via lock.
+
+        force_stream=True (used by the stream-health/keepalive paths) also
+        requires a LIVE Lightstreamer connection: a healthy REST session is
+        NOT sufficient. Without this, a dead streaming socket on an otherwise
+        valid REST session short-circuits to True here and the "full reconnect"
+        escalation becomes a no-op — the bug that left the stream stale for
+        ~64h on 2026-06-01 while REST keepalive kept reporting "alive".
+        """
         async with self._lock:
             if self.connected and self.ig:
                 try:
                     loop = asyncio.get_event_loop()
                     accounts = await loop.run_in_executor(None, self.ig.fetch_accounts)
-                    if accounts is not None:
+                    if accounts is not None and not (force_stream and self._stream_dead()):
                         return True
                 except Exception:
                     pass

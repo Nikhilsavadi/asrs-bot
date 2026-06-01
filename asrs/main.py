@@ -251,6 +251,48 @@ def _is_market_open(inst_name: str) -> bool:
     return (s1_open - 30) <= cur <= (eod + 30)
 
 
+# Data-watchdog thresholds. Liquid index/gold ticks are sub-second in session,
+# so sustained silence is unambiguously a broken stream, never a lull.
+_DATA_STALE_TICK_AGE = 300.0      # tick age (s) mid-session that counts as "blind"
+_DATA_BLIND_RESTART_SECS = 600.0  # sustained-blind duration before forced restart
+
+
+def _data_fresh_during_session(stream_mgr, signals) -> bool:
+    """True unless an ACTIVE instrument is well inside its trading session yet
+    its tick feed has gone silent (> _DATA_STALE_TICK_AGE). Markets-closed and
+    the first 5 min after open are always 'fresh' (no ticks expected / first
+    ticks still arriving), so this never false-trips at the open boundary.
+
+    Backs the data watchdog that force-restarts an alive-but-blind process —
+    the failure mode behind the 2026-06-01 64h stale-stream outage.
+    """
+    from datetime import datetime
+    if not signals:
+        return True
+    inst_keys: dict[str, str] = {}
+    for s in signals.values():
+        inst_keys.setdefault(s.instrument, s.broker.epic)
+    for inst_name, epic in inst_keys.items():
+        cfg = config.INSTRUMENTS.get(inst_name)
+        if not cfg:
+            continue
+        now = datetime.now(ZoneInfo(cfg["timezone"]))
+        if now.weekday() >= 5:
+            continue
+        # CORE session only, +5 min past first open so opening ticks can arrive.
+        start = cfg["s1_open_hour"] * 60 + cfg["s1_open_minute"] + 5
+        end = cfg["session_end_hour"] * 60 + cfg["session_end_minute"]
+        cur = now.hour * 60 + now.minute
+        if not (start <= cur <= end):
+            continue
+        try:
+            if stream_mgr.get_tick_age(epic) > _DATA_STALE_TICK_AGE:
+                return False
+        except Exception:
+            continue
+    return True
+
+
 async def check_stream_health_all(shared_session, stream_mgr, tg_send, signals=None):
     """
     Check stream health for all instruments. Send Telegram alerts on staleness.
@@ -770,6 +812,40 @@ async def main():
     scheduler.add_job(_write_heartbeat, "interval", seconds=60,
         id="heartbeat_writer", misfire_grace_time=30)
     write_heartbeat()  # Write immediately on startup
+
+    # -- Data watchdog: force a clean restart if the feed goes blind mid-session.
+    # The in-process force_stream reconnect (ig_session) is the first line of
+    # defence; this is the backstop for when that ALSO fails — the 2026-06-01
+    # outage stayed blind 64h because nothing escalated past resubscribe. On
+    # os._exit, `restart: unless-stopped` brings the bot back with a fresh IG
+    # session (exactly the manual recovery used on 2026-06-01).
+    _wd = {"blind_since": None}
+
+    async def _data_watchdog():
+        if _data_fresh_during_session(stream_mgr, signals):
+            if _wd["blind_since"] is not None:
+                logger.info("Data watchdog: feed recovered — restart timer cleared")
+                _wd["blind_since"] = None
+            return
+        now = time.time()
+        if _wd["blind_since"] is None:
+            _wd["blind_since"] = now
+            logger.warning("Data watchdog: feed stale mid-session — arming restart "
+                           f"timer ({_DATA_BLIND_RESTART_SECS:.0f}s)")
+            return
+        blind_for = now - _wd["blind_since"]
+        if blind_for >= _DATA_BLIND_RESTART_SECS:
+            logger.error(f"Data watchdog: feed blind {blind_for:.0f}s mid-session and "
+                         "in-process reconnect failed — forcing container restart")
+            try:
+                await tg_send(f"⚠️ ASRS feed blind {blind_for:.0f}s mid-session — "
+                              "auto-restarting container")
+            except Exception:
+                pass
+            os._exit(1)
+
+    scheduler.add_job(_data_watchdog, "interval", seconds=60,
+        id="data_watchdog", misfire_grace_time=30)
 
     # -- Stream health check (every 5 minutes, with Telegram alerts) ---------
     async def _stream_health():

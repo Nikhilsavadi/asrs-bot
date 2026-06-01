@@ -63,7 +63,7 @@ INSTRUMENTS = {
         "milestone_lock_pts": 20.0,     # tightened 30→20 on Apr 28 — TEST PF 2.11→2.21 (1-min); +£1k/yr at flat stake
         "milestone_giveback_pts": 5.0,  # tightened 10→5
         "skip_first_entry": True,       # SKIP DAX 1st entries below £10k equity (auto-revert above). +0.40 PF, MaxDD -50%
-        "fade_on_trail_win": True,   # Enabled May 2 (early canary; user override). Inherits 20/5 fade milestone + GS-on-fade protection shipped same day.
+        "fade_on_trail_win": False,  # PAUSED 2026-06-01: live PF 0.46 over 28 trades since May4 (lifetime +£230 was a 13-trade pre-May4 streak, PF 4.92). Reversible pause pending clean post-fix IG-reconciled data. Was: Enabled May 2 (early canary; user override). Inherits 20/5 fade milestone + GS-on-fade protection.
         "fade_stop_pts": 50.0,       # stop distance for fade position
         "trail_min_move": 3.0,
         "add_trigger": 25.0,
@@ -95,7 +95,7 @@ INSTRUMENTS = {
         "trail_to_close_always": True,  # Variant B: trail to prev_close every bar (18yr PF 2.48→3.76)
         "milestone_lock_pts": 20.0,     # tightened 30→20 on Apr 28 — TEST PF 2.34→2.71 (1-min); +£900/yr at flat
         "milestone_giveback_pts": 5.0,  # tightened 10→5
-        "fade_on_trail_win": True,   # CANARY — US30 first (2026-04-20). 18yr post-spread PF 1.64, 0 losing years
+        "fade_on_trail_win": False,  # PAUSED 2026-06-01: live PF 0.46 over 28 trades since May4 (loss mechanism = fade stops hit, market kept trending). Reversible pending clean IG-reconciled data. Was: CANARY US30 first (2026-04-20), 18yr post-spread PF 1.64, 0 losing years.
         "fade_stop_pts": 50.0,
         "fade_min_winner_pts": 20.0,  # skip fade after winners <20pt (removes 45% of losing fades)
         "trail_min_move": 5.0,
